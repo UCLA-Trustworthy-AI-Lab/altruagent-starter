@@ -1,30 +1,40 @@
 """Synchronous control-plane client for the AltruAgent competition platform.
 
 Handles configuration, API-key -> JWT login, and the platform's one-retry-
-after-401 convention. This wraps exactly two endpoints for now:
+after-401 convention. Wraps the control-plane auth endpoints directly:
 
 - ``POST /auth/agent/login`` (Agent_ACP backend/src/index.ts:133,
   services/agentService.ts:81 ``loginAgent``)
 - ``GET /auth/agent/me`` (index.ts:223)
+
+...and exposes a small reusable authenticated-request helper (``request``)
+that ``GameSession`` (see ``game.py``) builds on to talk to a GameAPI
+``game_server_url`` using the *same* JWT and the *same* one-retry-after-401
+behavior — there is only ever one authentication system, not one per host.
 
 The platform issues no refresh token (verified against
 Agent_ACP/backend/src/middleware/auth.ts and agentService.ts — login always
 mints a brand new JWT from the API key, and that's the only recovery path
 after a 401). So the client's retry policy is exactly that: on 401, log in
 again once and retry the request once. See backend/skill/02-auth.md for the
-agent-facing description of the same convention.
+agent-facing description of the same convention, confirmed identical on the
+GameAPI side by gameapi/src/gameapi/auth/jwt_validator.py (same Supabase
+JWT, validated independently via JWKS).
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from dotenv import load_dotenv
 
 from .errors import AuthenticationError, ConfigurationError, PlatformError
 from .models import Agent
+
+if TYPE_CHECKING:
+    from .game import GameSession
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
@@ -118,22 +128,50 @@ class AltruAgentClient:
 
     def me(self) -> Agent:
         """``GET /auth/agent/me`` — the authenticated agent's profile."""
-        data = self._authenticated_request("GET", "/auth/agent/me")
+        data = self.request("GET", "/auth/agent/me")
         return Agent.from_dict(data if isinstance(data, dict) else {})
 
-    # -- internals --------------------------------------------------------
+    def game(self, session_id: str, game_server_url: str) -> "GameSession":
+        """Open a handle to one already-known GameAPI match.
 
-    def _authenticated_request(self, method: str, path: str, **kwargs: Any) -> Any:
+        Both ``session_id`` and ``game_server_url`` must be supplied
+        explicitly — this milestone does not discover them (that's the
+        control plane's ``/competitions``/``/tournaments`` job, not yet
+        implemented here). ``game_server_url`` is accepted with or without a
+        scheme: the real control plane hands it back as a bare host (see
+        Agent_ACP/backend/src/services/gameAPIService.ts's
+        ``getGameAPIServerUrl``), so ``http://`` is prepended automatically
+        if missing, matching the platform's own documented normalization
+        rule (backend/skill/03-competitions.md).
+        """
+        from .game import GameSession  # local import: game.py imports this module
+
+        return GameSession(self, session_id=session_id, game_server_url=game_server_url)
+
+    def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        """Send an authenticated request using this agent's JWT.
+
+        ``url`` may be a path relative to the control plane (e.g.
+        ``"/auth/agent/me"``) or a full absolute URL on a different host
+        (e.g. a GameAPI ``game_server_url``) — httpx uses an absolute URL
+        as-is regardless of this client's configured base URL. Either way,
+        the same JWT and the same one-retry-after-401 behavior apply: there
+        is only one authentication system for this client, not one per host.
+
+        Returns the parsed JSON response body. Raises ``AuthenticationError``
+        if the request is still unauthenticated after one re-login, or
+        ``PlatformError`` for any other non-2xx response or network failure.
+        """
         if self._access_token is None:
             self.login()
 
-        response = self._send(method, path, **kwargs)
+        response = self._send(method, url, **kwargs)
 
         if response.status_code == 401:
             # No refresh tokens exist on this platform: re-login with the API
             # key once and retry once. If that still fails, stop — do not loop.
             self.login()
-            response = self._send(method, path, **kwargs)
+            response = self._send(method, url, **kwargs)
 
         if response.status_code == 401:
             parsed = _parse_error_body(response)
@@ -161,16 +199,15 @@ class AltruAgentClient:
 
         return _parse_json_body(response)
 
-    def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    # -- internals --------------------------------------------------------
+
+    def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         headers = dict(kwargs.pop("headers", None) or {})
         headers["Authorization"] = f"Bearer {self._access_token}"
         try:
-            return self._http.request(method, path, headers=headers, **kwargs)
+            return self._http.request(method, url, headers=headers, **kwargs)
         except httpx.RequestError as exc:
-            raise PlatformError(
-                f"Could not reach the control plane at {self.control_url}: {exc}",
-                status_code=None,
-            ) from exc
+            raise PlatformError(f"Could not reach {url}: {exc}", status_code=None) from exc
 
 
 def _parse_json_body(response: httpx.Response) -> Any:
