@@ -9,20 +9,28 @@ Milestone 1: configuration + agent authentication
 
 Milestone 2: single-match GameAPI gameplay for an already-known
 ``session_id`` + ``game_server_url`` (state / step / resign via
-``GameSession``). Competition/tournament/queue discovery, messaging, and
-multi-match orchestration are not implemented yet.
+``GameSession``).
+
+Milestone 3A: assigned-match discovery — ``client.sessions()`` lists this
+agent's competition memberships (standalone and tournament-spawned alike)
+grouped into waiting/active/completed; ``match.game()`` lazily resolves a
+specific match into a ``GameSession`` only when actually needed. Tournament
+joining/creation, queues, polling, and multi-match execution are not
+implemented yet.
 """
 
 from .client import AltruAgentClient
 from .errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from .game import GameSession
-from .models import Agent, GameState, NextAction, PlayerRef
+from .models import Agent, AgentSessions, GameState, Match, NextAction, PlayerRef
 
 __all__ = [
     "AltruAgentClient",
     "Agent",
+    "AgentSessions",
     "GameSession",
     "GameState",
+    "Match",
     "NextAction",
     "PlayerRef",
     "AltruAgentError",

@@ -31,7 +31,7 @@ import httpx
 from dotenv import load_dotenv
 
 from .errors import AuthenticationError, ConfigurationError, PlatformError
-from .models import Agent
+from .models import Agent, AgentSessions
 
 if TYPE_CHECKING:
     from .game import GameSession
@@ -130,6 +130,22 @@ class AltruAgentClient:
         """``GET /auth/agent/me`` — the authenticated agent's profile."""
         data = self.request("GET", "/auth/agent/me")
         return Agent.from_dict(data if isinstance(data, dict) else {})
+
+    def sessions(self) -> AgentSessions:
+        """``GET /agents/me/sessions`` — this agent's competition memberships,
+        grouped into waiting/active/completed (see Agent_ACP
+        backend/src/index.ts:253, ``listAgentSessions``).
+
+        Exactly one control-plane request. Deliberately does **not** resolve
+        ``game_server_url`` for any match, and makes no GameAPI calls — that
+        endpoint doesn't carry it (it's not a stored column anywhere), and
+        resolving it eagerly for every returned match would turn a cheap
+        discovery call into N+1 requests. Call ``match.game()`` on whichever
+        specific match you actually want to play; it resolves lazily and
+        only then.
+        """
+        data = self.request("GET", "/agents/me/sessions")
+        return AgentSessions.from_dict(data if isinstance(data, dict) else {}, client=self)
 
     def game(self, session_id: str, game_server_url: str) -> "GameSession":
         """Open a handle to one already-known GameAPI match.

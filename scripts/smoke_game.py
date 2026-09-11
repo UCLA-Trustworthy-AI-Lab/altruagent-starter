@@ -1,4 +1,4 @@
-"""Milestone 2 LIVE end-to-end smoke test — developer/manual tool only.
+"""Milestone 2 + 3A LIVE end-to-end smoke test — developer/manual tool only.
 
 Proves the starter SDK can play a real match against the REAL deployed
 AltruAgent platform (Agent_ACP), not a mock. This is not contestant-facing
@@ -17,10 +17,17 @@ What it does, in order (see `main()`):
 4. Joins both agents (`POST /competitions/{id}/join`) and polls
    `GET /competitions/{id}` (bounded timeout) until it reports
    `status=in_progress` with a `game_server_url`.
-5. Opens a `GameSession` per agent through the starter SDK, fetches the
-   initial state, determines whose turn it is from `next_actions`, and
-   submits exactly one real legal move.
-6. Verifies `move_count` increased, then resigns via the normal participant
+5. Milestone 3A check: calls `primary.sessions()` (`GET /agents/me/sessions`),
+   confirms the new competition shows up in `.active` with the right
+   `status`/`game_type`, and confirms its `game_server_url` starts out
+   unresolved (this endpoint never includes it). Then opens the primary's
+   `GameSession` via `discovered_match.game()` — the lazy-resolution path
+   (`GET /competitions/{id}` -> cache on the `Match` -> `GameSession`) —
+   instead of `client.game(...)` directly, and confirms the URL is now
+   cached and normalized.
+6. Fetches the initial state, determines whose turn it is from
+   `next_actions`, and submits exactly one real legal move.
+7. Verifies `move_count` increased, then resigns via the normal participant
    `POST /games/{id}/resign` endpoint (never the unauthenticated
    `/games/{id}/cancel`) to leave the human's hosting slot free again.
 
@@ -172,7 +179,7 @@ def wait_for_in_progress(
 
 
 def main() -> int:
-    print("=== Milestone 2 LIVE smoke test ===")
+    print("=== Milestone 2 + 3A LIVE smoke test ===")
     print("This calls the REAL deployed AltruAgent platform. It is a developer")
     print("diagnostic tool, not contestant-facing functionality.\n")
 
@@ -226,7 +233,43 @@ def main() -> int:
         game_server_url = competition["game_server_url"]
         _checkpoint(f"GameAPI session started (game_server_url={game_server_url})")
 
-        primary_session = primary.game(session_id=session_id, game_server_url=game_server_url)
+        # Milestone 3A: verify discovery finds this same match before doing
+        # anything else with GameAPI for the primary agent.
+        discovered = primary.sessions()
+        discovered_match = next(
+            (m for m in discovered.active if m.session_id == session_id), None
+        )
+        if discovered_match is None:
+            _fail(
+                f"client.sessions() did not list session_id={session_id!r} in "
+                "active_sessions after the competition started."
+            )
+        if discovered_match.status != "in_progress" or discovered_match.game_type != COMPETITION_GAME_TYPE:
+            _fail(
+                "Discovered match has unexpected fields (status="
+                f"{discovered_match.status!r}, game_type={discovered_match.game_type!r})."
+            )
+        if discovered_match.game_server_url is not None:
+            _fail(
+                "Expected the freshly discovered Match to have no resolved "
+                f"game_server_url yet, but got {discovered_match.game_server_url!r} — "
+                "GET /agents/me/sessions is not expected to include one."
+            )
+        _checkpoint("active match discovered via client.sessions()")
+
+        # Lazy-resolution path: Match.game() -> GET /competitions/{id} ->
+        # game_server_url -> GameSession. Deliberately NOT client.game(...)
+        # directly for the primary agent — that's the thing this step proves.
+        primary_session = discovered_match.game()
+        if not discovered_match.game_server_url:
+            _fail("discovered_match.game_server_url was not populated after match.game().")
+        if not primary_session.game_server_url.startswith(("http://", "https://")):
+            _fail(
+                "GameSession.game_server_url is not a normalized URL: "
+                f"{primary_session.game_server_url!r}"
+            )
+        _checkpoint("GameAPI URL resolved lazily via match.game()")
+
         opponent_session = opponent.game(session_id=session_id, game_server_url=game_server_url)
 
         primary_state = primary_session.state()
@@ -268,7 +311,7 @@ def main() -> int:
         try:
             if not refreshed_state.is_terminal:
                 primary_session.resign()
-            print("[OK] cleanup: match ended via POST /games/{session_id}/resign")
+            print("[OK] cleanup: match ended via resign")
         except AltruAgentError as exc:
             print(f"[WARN] cleanup resign failed (non-fatal): {exc}")
         cleaned_up = True
@@ -278,7 +321,7 @@ def main() -> int:
             "has no safe agent-deletion endpoint, so it was not deleted."
         )
 
-        print("\nMILESTONE 2 LIVE SMOKE TEST PASSED")
+        print("\nMILESTONE 3A LIVE SMOKE TEST PASSED")
         return 0
 
     except (SmokeTestError, AltruAgentError) as exc:

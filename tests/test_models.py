@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from altruagent.models import Agent, GameState, NextAction
+import pytest
+
+from altruagent.models import Agent, AgentSessions, GameState, Match, NextAction
 
 
 def test_agent_parsing_excludes_sensitive_hash_fields():
@@ -140,6 +142,86 @@ def test_game_state_preserves_unknown_game_specific_extra_fields():
     assert state.raw["avalon_leader"] == "Bob"
     assert state.raw["round_history"] == [{"round": 1, "actions": {}}]
     assert state.raw["cumulative_scores"] == {"Alice": 2.0}
+
+
+def test_match_from_dict_basic_fields():
+    match = Match.from_dict(
+        {
+            "session_id": "session-1",
+            "game_type": "tic_tac_toe",
+            "status": "waiting",
+            "tournament_id": None,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    )
+
+    assert match.session_id == "session-1"
+    assert match.game_type == "tic_tac_toe"
+    assert match.status == "waiting"
+    assert match.tournament_id is None
+    assert match.game_server_url is None  # never present on this endpoint's rows
+
+
+def test_match_preserves_unknown_extra_fields_in_raw():
+    match = Match.from_dict(
+        {
+            "session_id": "session-1",
+            "status": "waiting",
+            "winner_agent_id": None,
+            "results": None,
+            "runtime_adapter": "openspiel",
+        }
+    )
+
+    assert match.raw["runtime_adapter"] == "openspiel"
+    assert "winner_agent_id" in match.raw
+
+
+def test_match_tolerates_missing_optional_fields():
+    match = Match.from_dict({"session_id": "session-1", "status": "in_progress"})
+
+    assert match.game_type is None
+    assert match.tournament_id is None
+    assert match.created_at is None
+    assert match.started_at is None
+    assert match.completed_at is None
+
+
+def test_match_tournament_id_preserved_for_child_matches():
+    match = Match.from_dict(
+        {"session_id": "session-1", "status": "waiting", "tournament_id": "tournament-9"}
+    )
+
+    assert match.tournament_id == "tournament-9"
+
+
+def test_match_game_without_client_raises_value_error():
+    match = Match.from_dict({"session_id": "session-1", "status": "in_progress"})
+
+    with pytest.raises(ValueError):
+        match.game()
+
+
+def test_agent_sessions_maps_server_groups_to_waiting_active_completed():
+    sessions = AgentSessions.from_dict(
+        {
+            "joined_sessions": [{"session_id": "s-waiting", "status": "waiting"}],
+            "active_sessions": [{"session_id": "s-active", "status": "in_progress"}],
+            "completed_sessions": [{"session_id": "s-done", "status": "completed"}],
+        }
+    )
+
+    assert [m.session_id for m in sessions.waiting] == ["s-waiting"]
+    assert [m.session_id for m in sessions.active] == ["s-active"]
+    assert [m.session_id for m in sessions.completed] == ["s-done"]
+
+
+def test_agent_sessions_tolerates_missing_groups():
+    sessions = AgentSessions.from_dict({})
+
+    assert sessions.waiting == []
+    assert sessions.active == []
+    assert sessions.completed == []
 
 
 def test_game_state_terminal_with_returns():

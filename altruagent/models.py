@@ -10,6 +10,11 @@ attribute, with one exception: fields the SDK never surfaces at all (see
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .client import AltruAgentClient
+    from .game import GameSession
 
 # The real GET /auth/agent/me and POST /auth/human/claim responses currently
 # include these (they're the agent's raw DB row — see
@@ -144,5 +149,128 @@ class GameState:
             messaging_enabled=bool(data.get("messaging_enabled", False)),
             phase=data.get("phase", "moving"),
             next_actions=next_actions,
+            raw=data,
+        )
+
+
+@dataclass
+class Match:
+    """A contestant-facing view over one Competition row, as returned by
+    ``GET /agents/me/sessions`` (verified against Agent_ACP
+    backend/src/db/competitions.ts's ``getCompetitionsForAgent`` and
+    services/competitionService.ts's ``listAgentSessions``). Called "Match",
+    not "Assignment" — the backend has no such concept; this simply wraps a
+    raw ``competitions`` table row.
+
+    ``game_server_url`` is never present on this endpoint's rows (confirmed —
+    it is not a stored column anywhere; it's computed only by
+    ``GET /competitions/{id}`` and ``GET /tournaments/{id}``). It starts
+    ``None`` here and is resolved lazily, only when ``game()`` is actually
+    called — see ``game()`` below.
+    """
+
+    session_id: str
+    status: str
+    game_type: str | None = None
+    tournament_id: str | None = None
+    created_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    game_server_url: str | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+    _client: Any = field(default=None, repr=False, compare=False, init=False)
+
+    @classmethod
+    def from_dict(cls, data: dict, *, client: "AltruAgentClient | None" = None) -> "Match":
+        match = cls(
+            session_id=data.get("session_id", ""),
+            status=data.get("status", "unknown"),
+            game_type=data.get("game_type"),
+            tournament_id=data.get("tournament_id"),
+            created_at=data.get("created_at"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            raw=data,
+        )
+        match._client = client
+        return match
+
+    def game(self) -> "GameSession":
+        """Return a playable ``GameSession`` for this match, resolving
+        ``game_server_url`` lazily if it isn't already known.
+
+        - If ``game_server_url`` was already resolved (cached from a prior
+          call on this same ``Match`` instance), this makes no network
+          request at all.
+        - If not, and ``status == "in_progress"``, this makes exactly one
+          request — ``GET /competitions/{session_id}`` (the same endpoint
+          that computes ``game_server_url`` for a single competition) — and
+          caches the result on this instance so repeated calls don't repeat
+          the lookup.
+        - A ``waiting`` match has no GameAPI session to open yet, and a
+          ``completed`` one no longer has a playable one; both raise
+          ``ValueError`` immediately, with no network request.
+        """
+        if self._client is None:
+            raise ValueError(
+                "This Match has no client attached (it wasn't returned by "
+                "AltruAgentClient.sessions()), so game_server_url cannot be resolved."
+            )
+
+        if self.game_server_url:
+            return self._client.game(session_id=self.session_id, game_server_url=self.game_server_url)
+
+        if self.status != "in_progress":
+            raise ValueError(
+                f"Match {self.session_id!r} is {self.status!r}, not 'in_progress' — "
+                "it has no playable GameAPI session right now."
+            )
+
+        data = self._client.request("GET", f"/competitions/{self.session_id}")
+        if isinstance(data, dict) and data.get("session_id") not in (None, self.session_id):
+            raise ValueError(
+                f"GET /competitions/{self.session_id} returned session_id "
+                f"{data.get('session_id')!r}, which does not match."
+            )
+        game_server_url = data.get("game_server_url") if isinstance(data, dict) else None
+        if not game_server_url:
+            raise ValueError(
+                f"GET /competitions/{self.session_id} did not include a game_server_url "
+                "even though the match is in_progress."
+            )
+
+        self.game_server_url = game_server_url
+        return self._client.game(session_id=self.session_id, game_server_url=game_server_url)
+
+
+@dataclass
+class AgentSessions:
+    """This agent's competition memberships, as returned by
+    ``GET /agents/me/sessions``, grouped exactly as the server groups them:
+    ``joined_sessions`` -> ``waiting``, ``active_sessions`` -> ``active``,
+    ``completed_sessions`` -> ``completed``. Includes both standalone
+    competitions and tournament-created child matches (the endpoint does not
+    distinguish at the query level — see ``Match.tournament_id``).
+
+    The backend caps this at the 50 most recently joined memberships in
+    total, not per group (``getCompetitionsForAgent``'s ``.limit(50)``) — a
+    long-lived agent's oldest completed matches can silently drop off before
+    its current ones would.
+    """
+
+    waiting: list[Match] = field(default_factory=list)
+    active: list[Match] = field(default_factory=list)
+    completed: list[Match] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: dict, *, client: "AltruAgentClient | None" = None) -> "AgentSessions":
+        def _matches(key: str) -> list[Match]:
+            return [Match.from_dict(m, client=client) for m in (data.get(key) or [])]
+
+        return cls(
+            waiting=_matches("joined_sessions"),
+            active=_matches("active_sessions"),
+            completed=_matches("completed_sessions"),
             raw=data,
         )
