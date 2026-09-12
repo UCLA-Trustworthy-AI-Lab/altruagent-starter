@@ -20,9 +20,16 @@ Milestone 3B: minimal tournament registration/status —
 ``client.tournaments()``/``client.tournament(id)`` for discovery/inspection,
 ``client.join_tournament(id)``/``client.leave_tournament(id)`` for
 registration. Tournament support ends there; assigned child matches are
-still discovered exclusively through ``client.sessions()``. Queues,
-automatic tournament selection, polling, and multi-match execution are not
-implemented yet.
+still discovered exclusively through ``client.sessions()``.
+
+Milestone 4A: the contestant decision contract and a single-match execution
+primitive — ``run_match``/``run_game`` (see ``altruagent.runner``) own the
+state -> decide -> submit loop for one already-known match, calling
+contestant-supplied decision logic (a plain ``choose_action(state, context)``
+function, or an object exposing one — no base class) only when
+``next_actions`` says a move is actually needed. Automatic assigned-match
+discovery, polling/backoff, and multi-match concurrency are not implemented
+yet — this milestone plays exactly one match, to completion, on request.
 """
 
 from .client import AltruAgentClient
@@ -31,6 +38,7 @@ from .game import GameSession
 from .models import (
     Agent,
     AgentSessions,
+    DecisionContext,
     GameState,
     Match,
     NextAction,
@@ -38,11 +46,20 @@ from .models import (
     Tournament,
     TournamentViewer,
 )
+from .runner import (
+    RESIGN,
+    DecisionError,
+    RunnerError,
+    UnsupportedGameFlowError,
+    run_game,
+    run_match,
+)
 
 __all__ = [
     "AltruAgentClient",
     "Agent",
     "AgentSessions",
+    "DecisionContext",
     "GameSession",
     "GameState",
     "Match",
@@ -54,4 +71,10 @@ __all__ = [
     "ConfigurationError",
     "AuthenticationError",
     "PlatformError",
+    "RESIGN",
+    "RunnerError",
+    "DecisionError",
+    "UnsupportedGameFlowError",
+    "run_game",
+    "run_match",
 ]

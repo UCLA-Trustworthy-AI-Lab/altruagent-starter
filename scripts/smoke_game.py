@@ -1,4 +1,4 @@
-"""Milestone 2 + 3A/3B LIVE end-to-end smoke test — developer/manual tool only.
+"""Milestone 2 + 3A/3B/4A LIVE end-to-end smoke test — developer/manual tool only.
 
 Proves the starter SDK can play a real match against the REAL deployed
 AltruAgent platform (Agent_ACP), not a mock. This is not contestant-facing
@@ -27,11 +27,20 @@ Two modes, sharing all of their setup/cleanup machinery:
    (`GET /competitions/{id}` -> cache on the `Match` -> `GameSession`) —
    instead of `client.game(...)` directly, and confirms the URL is now
    cached and normalized.
-6. Fetches the initial state, determines whose turn it is from
-   `next_actions`, and submits exactly one real legal move.
-7. Verifies `move_count` increased, then resigns via the normal participant
-   `POST /games/{id}/resign` endpoint (never the unauthenticated
-   `/games/{id}/cancel`) to leave the human's hosting slot free again.
+6. Fetches the initial state and determines whose turn it is from
+   `next_actions`.
+7. Milestone 4A check: hands the mover's `GameSession` to the production
+   `altruagent.runner.run_game()` with a `choose_action` that always returns
+   `RESIGN`, instead of calling `.step()`/`.resign()` directly. RESIGN is
+   deliberate — it's the one decision guaranteed to end the match in exactly
+   one `run_game` iteration without needing the *other* agent to keep moving
+   too (which would require real multi-agent scheduling, out of scope until
+   a later milestone). This exercises the real
+   state -> next_actions -> choose_action -> submit path — including
+   `DecisionContext` and the `RESIGN` sentinel — against the real platform,
+   and (never the unauthenticated `/games/{id}/cancel`) leaves the human's
+   hosting slot free again. Ordinary move submission was already proven live
+   in Milestones 2/3A and isn't re-proven here.
 
 **`--tournament` (Milestone 3B):** identical agent setup (steps 1-3 above,
 substituting `POST /admin/tournaments/create` for the competition create
@@ -44,7 +53,7 @@ call), then:
    `tournament_id` (not by an already-known `session_id` — that's the thing
    this mode proves that the default mode doesn't), then resolves it via
    `match.game()` exactly as before.
-6-7. Same play-one-move / verify / resign as the default mode.
+6-7. Same state-fetch / run_game()-driven-RESIGN as the default mode.
 8. Best-effort (single, non-looping) check of the tournament's final status
    after cleanup — not a fragile polling loop.
 
@@ -73,6 +82,8 @@ import httpx  # noqa: E402
 
 from altruagent.client import AltruAgentClient  # noqa: E402
 from altruagent.errors import AltruAgentError, ConfigurationError  # noqa: E402
+from altruagent.models import DecisionContext  # noqa: E402
+from altruagent.runner import RESIGN, run_game  # noqa: E402
 
 COMPETITION_GAME_TYPE = "tic_tac_toe"
 DEFAULT_POLL_TIMEOUT_SECONDS = 60.0
@@ -431,9 +442,13 @@ def main() -> int:
         )
 
         if mover_name == primary_agent.name:
-            mover_session, mover_state = primary_session, primary_state
+            mover_session, mover_state, mover_agent_id = primary_session, primary_state, primary_agent.id
         elif mover_name == opponent_agent.name:
-            mover_session, mover_state = opponent_session, opponent_session.state()
+            mover_session, mover_state, mover_agent_id = (
+                opponent_session,
+                opponent_session.state(),
+                opponent_agent.id,
+            )
         else:
             _fail(f"Could not determine which agent should move (current_player={mover_name!r}).")
 
@@ -445,25 +460,30 @@ def main() -> int:
                 f"legal_actions={mover_state.legal_actions})."
             )
 
-        action = mover_state.legal_actions[0]
-        before_move_count = mover_state.move_count
-        mover_session.step(action)
-        _checkpoint(f"legal move submitted (action={action} by {mover_name})")
-
-        refreshed_state = primary_session.state()
-        if refreshed_state.move_count <= before_move_count:
-            _fail(
-                "move_count did not increase after the step "
-                f"(before={before_move_count}, after={refreshed_state.move_count})."
-            )
-        _checkpoint(f"updated state fetched (move_count={refreshed_state.move_count})")
-
-        try:
-            if not refreshed_state.is_terminal:
-                primary_session.resign()
-            print("[OK] cleanup: match ended via resign")
-        except AltruAgentError as exc:
-            print(f"[WARN] cleanup resign failed (non-fatal): {exc}")
+        # Milestone 4A: exercise the production run_game() (the same
+        # single-match execution primitive contestants use) instead of
+        # calling mover_session.step(...) directly. The decision function
+        # deliberately always returns RESIGN: it's the one decision
+        # guaranteed to end the match in exactly one run_game iteration
+        # without needing the *other* agent to also keep moving — driving
+        # both agents to a natural finish would require real multi-agent
+        # scheduling, which stays out of scope until a later milestone. This
+        # still exercises the full
+        # state -> next_actions -> choose_action -> submit path, including
+        # the DecisionContext/RESIGN contract, against the real platform;
+        # ordinary move submission was already proven live in Milestones
+        # 2/3A and isn't re-proven here.
+        mover_context = DecisionContext(
+            session_id=session_id,
+            tournament_id=tournament_id if args.tournament else None,
+            game_type=COMPETITION_GAME_TYPE,
+            agent_id=mover_agent_id,
+        )
+        final_state = run_game(mover_session, mover_context, lambda state, context: RESIGN)
+        if not final_state.is_terminal:
+            _fail("run_game() returned a non-terminal state after a RESIGN decision.")
+        _checkpoint(f"decision submitted via run_game() (RESIGN, by {mover_name})")
+        print("[OK] cleanup: match ended via runner-driven resign")
         cleaned_up = True
 
         if args.tournament:
@@ -483,9 +503,9 @@ def main() -> int:
         )
 
         if args.tournament:
-            print("\nMILESTONE 3B LIVE TOURNAMENT SMOKE TEST PASSED")
+            print("\nMILESTONE 3B + 4A LIVE TOURNAMENT SMOKE TEST PASSED")
         else:
-            print("\nMILESTONE 3A LIVE SMOKE TEST PASSED")
+            print("\nMILESTONE 3A + 4A LIVE SMOKE TEST PASSED")
         return 0
 
     except (SmokeTestError, AltruAgentError) as exc:

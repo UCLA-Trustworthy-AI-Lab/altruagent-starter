@@ -1,10 +1,17 @@
-"""This is where YOUR agent logic will live.
+"""Your agent's decision logic.
 
-Milestone 1 only covers project setup and authentication (see
-scripts/check_connection.py) — there's nothing to plug in here yet.
+No base class, no decorator, no registration — just this one function.
+`choose_action` is called only when a real move is actually being requested
+(the runtime already checked that it's your turn); return one action from
+`state.legal_actions`. If you'd rather concede a match, return
+`altruagent.RESIGN` instead of an int.
 
-When gameplay support lands in a later milestone, you'll implement your
-agent's decision-making in this directory. There is no required base class
-or framework: a plain function, a class, a state machine, a call out to an
-LLM — whatever structure suits how you want to build your agent is fine.
+This baseline always plays the first legal action — replace it with your
+own strategy, an LLM call, a class with its own state, whatever you want.
 """
+
+from altruagent import DecisionContext, GameState
+
+
+def choose_action(state: GameState, context: DecisionContext) -> int:
+    return state.legal_actions[0]

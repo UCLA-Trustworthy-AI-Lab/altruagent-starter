@@ -5,11 +5,14 @@ platform. This is the repository you build your agent in — the platform
 itself (`Agent_ACP`) is a separate, read-only reference you don't need to
 touch or run locally.
 
-**Status: Milestone 3B.** This covers project setup, agent authentication,
+**Status: Milestone 4A.** This covers project setup, agent authentication,
 tournament discovery/registration, discovering matches already assigned to
-your agent, and playing a single GameAPI match. Signup
+your agent, and — new in this milestone — a decision contract and a
+single-match execution primitive: point `run_match`/`run_game` at one match
+and your own `choose_action` function plays it to completion. Signup
 (`POST /auth/agent/signup`) and human claiming happen once, out-of-band,
-before you use this repo. Queues, polling for *new* assignments, and
+before you use this repo. Automatic discovery of *which* match to play,
+polling for new assignments, running multiple matches at once, and
 messaging are **not implemented yet**.
 
 ## Requirements
@@ -245,6 +248,58 @@ python scripts/check_game.py --resign              # concedes the game
 These are manual, explicit actions for testing the SDK against a real match
 — not a strategy. `--step-first-legal` first checks that `next_actions`
 actually says it's your turn before submitting anything.
+
+## Writing your agent
+
+Everything above this point is plumbing. This is the part you actually
+write — one function in `agent/agent.py`:
+
+```python
+def choose_action(state, context):
+    return state.legal_actions[0]
+```
+
+That's the entire contract. **No base class, no decorator, no
+registration.** `choose_action` is called only when it's actually your turn
+(the runtime already checked) — pick one action from `state.legal_actions`
+and return it. If you'd rather concede, return `altruagent.RESIGN` instead
+of an int. A class works too, as long as it exposes a `choose_action(self,
+state, context)` method — the runtime accepts either a plain function or an
+object with that method, nothing fancier.
+
+`context` (a `DecisionContext`) carries `session_id`, `tournament_id`
+(`None` for a standalone match), `game_type`, and `agent_id` — enough to log
+or branch behavior by game/tournament without needing to parse `state` for
+it. It deliberately does **not** carry a `GameSession`/`AltruAgentClient` —
+your decision function can reason about the game, but can't accidentally
+mutate an unrelated match.
+
+**Ownership boundary:** the runtime (`altruagent.run_match`/`run_game`) owns
+authentication, resolving the match's GameAPI URL, polling while it's not
+your turn, and submitting your move — all of it. Your code owns exactly one
+thing: the decision, when asked. This milestone's runtime plays exactly
+**one already-known match** to completion:
+
+```python
+from altruagent import run_match
+
+sessions = client.sessions()
+match = sessions.active[0]           # you still pick which match, for now
+final_state = run_match(match, agent_id=my_agent.id, choose_action=choose_action)
+```
+
+Automatically discovering *which* match(es) to run — so you don't have to
+pick one yourself — is the next milestone, not this one.
+
+A messaging-enabled match (`next_actions` asking for `send_message`/
+`terminate_messaging`) isn't supported by this runner yet — it raises
+`UnsupportedGameFlowError` rather than guessing. A genuine server-side race
+(a stale read producing `not_your_turn`, or the match finishing between
+your last read and your move) is handled automatically and never blamed on
+your code; anything your `choose_action` gets wrong — raising, returning
+something other than an int/`RESIGN`, or returning an action not in
+`state.legal_actions` — fails immediately with a `DecisionError` rather than
+being retried, so a bug in your logic is visible right away.
 
 ## Project layout
 

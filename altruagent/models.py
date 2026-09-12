@@ -348,3 +348,23 @@ class Tournament:
             viewer=TournamentViewer.from_dict(viewer) if isinstance(viewer, dict) else None,
             raw=data,
         )
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    """The minimal identifying information handed to contestant decision
+    logic alongside a ``GameState`` (see ``altruagent.runner``).
+
+    Deliberately carries no client/session object — a decision function
+    should be able to reason about the game without being handed enough
+    power to mutate an unrelated match. ``session_id``/``game_type`` are
+    also available on ``GameState`` itself (as ``session_id``/``game_name``)
+    but are repeated here so contestant code doesn't need to thread
+    ``state`` through just to log/key by them; ``tournament_id``/
+    ``agent_id`` are not available anywhere else.
+    """
+
+    session_id: str
+    tournament_id: str | None
+    game_type: str | None
+    agent_id: str
