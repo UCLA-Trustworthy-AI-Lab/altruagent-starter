@@ -1,12 +1,17 @@
-"""Milestone 2 + 3A/3B/4A/4B LIVE end-to-end smoke test — developer/manual tool only.
+"""Milestone 2 + 3A/3B/4A/4B/4C LIVE end-to-end smoke test — developer/manual tool only.
 
 Proves the starter SDK can play a real match against the REAL deployed
 AltruAgent platform (Agent_ACP), not a mock. This is not contestant-facing
 functionality — it's an integration check for people working on the SDK
-itself. It creates real, if disposable, platform state: a temporary second
-agent and a temporary two-player competition or tournament.
+itself. It creates real, if disposable, platform state: one or two
+temporary second agents and one or two temporary competitions/tournaments.
 
-Two modes, sharing all of their setup/cleanup machinery:
+Three modes. The default and `--tournament` share all of their setup/
+cleanup machinery; `--concurrent` (Milestone 4C) is a self-contained,
+separate check with its own two-competition setup (see
+`run_concurrent_check`) — it doesn't fit the single-match mover/RESIGN
+shape the other two modes share, since its whole point is proving *two*
+matches run at once.
 
 **Default (standalone competition, Milestones 2 + 3A):**
 
@@ -60,12 +65,25 @@ call), then:
 8. Best-effort (single, non-looping) check of the tournament's final status
    after cleanup — not a fragile polling loop.
 
-The temporary agent is left claimed — the current backend has no safe
+**`--concurrent` (Milestone 4C):** see `run_concurrent_check`'s own
+docstring for the full flow — in short: two independent standalone
+competitions, one shared temporary opponent, confirms both matches are
+simultaneously `active` via `client.sessions()`, temporarily swaps
+`agent/agent.py`'s contents for a hardcoded deterministic-RESIGN
+`create_agent()` (backed up and always restored — see below), calls the
+production `run_once_concurrent()` directly to prove it starts two
+distinct real worker *processes* (verified via distinct OS PIDs), then
+waits (bounded) for **both workers to exit on their own** after each
+independently reaches `run_match()` and resigns its own match — the
+complete production path, not a parent-driven shortcut.
+
+The temporary agent(s) are left claimed — the current backend has no safe
 agent-deletion endpoint, so this script does not invent one.
 
 Run:
     python scripts/smoke_game.py
     python scripts/smoke_game.py --tournament
+    python scripts/smoke_game.py --concurrent
 """
 
 from __future__ import annotations
@@ -289,6 +307,229 @@ def wait_for_tournament_in_progress(
     )
 
 
+# -- Milestone 4C: temporary deterministic-RESIGN contestant swap ---------
+#
+# Every spawned worker process reimports agent/agent.py fresh from disk —
+# that's simply what Windows `spawn` does, and it's the ONLY mechanism
+# proven (empirically, during this milestone's implementation) to reliably
+# reach every worker: neither monkeypatching altruagent.worker's imports
+# nor sys.path/PYTHONPATH tricks aimed at shadowing the `agent` package
+# work here, because this project's editable install registers its own
+# meta-path finder that resolves `agent.agent` to the real installed file
+# regardless of sys.path ordering (confirmed directly against a real
+# multiprocessing.get_context("spawn").Process — a PYTHONPATH-inserted
+# decoy package was never picked up by any spawned child). The filesystem
+# is therefore the one channel every worker reliably observes.
+#
+# So: temporarily replace agent/agent.py's *contents* with a hardcoded,
+# deterministic create_agent() that always resigns, run the real
+# supervisor, then restore the original file — no changes to
+# altruagent/worker.py, altruagent/supervisor.py, or altruagent/runner.py,
+# and no change to what create_agent() means for a real contestant (this
+# only ever touches the file during this one function's own run, and only
+# ever with a real backup in place first).
+AGENT_FILE = Path(__file__).resolve().parent.parent / "agent" / "agent.py"
+AGENT_FILE_BACKUP = AGENT_FILE.with_suffix(".py.smoke_test_backup")
+
+_DETERMINISTIC_RESIGN_AGENT_SOURCE = '''"""TEMPORARY FILE — written by scripts/smoke_game.py --concurrent for the
+duration of the Milestone 4C concurrency check, and restored automatically
+when it finishes. If you are reading this and did not just run that check,
+something went wrong: restore agent/agent.py.smoke_test_backup over this
+file (scripts/smoke_game.py --concurrent also does this automatically the
+next time it runs, before doing anything else).
+"""
+
+from altruagent import RESIGN
+
+
+def create_agent():
+    return lambda state, context: RESIGN
+'''
+
+
+def _install_deterministic_resign_agent() -> None:
+    """Back up the real agent/agent.py, then replace it with a hardcoded
+    create_agent() that always returns RESIGN. Self-healing: if a backup
+    from a previous, abnormally-terminated run is already present, restores
+    the real file from it first rather than risking clobbering an
+    already-swapped file.
+    """
+    if AGENT_FILE_BACKUP.exists():
+        print(
+            "[WARN] Found a leftover agent.py.smoke_test_backup from a previous "
+            "run that didn't finish cleanly — restoring the real agent.py from "
+            "it before continuing."
+        )
+        AGENT_FILE_BACKUP.replace(AGENT_FILE)
+
+    AGENT_FILE_BACKUP.write_text(AGENT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    AGENT_FILE.write_text(_DETERMINISTIC_RESIGN_AGENT_SOURCE, encoding="utf-8")
+
+
+def _restore_real_agent() -> None:
+    """Undo _install_deterministic_resign_agent(). Safe to call even if
+    installation never happened (no backup present -> no-op).
+    """
+    if AGENT_FILE_BACKUP.exists():
+        AGENT_FILE_BACKUP.replace(AGENT_FILE)
+
+
+WORKER_COMPLETION_TIMEOUT_SECONDS = 30.0
+WORKER_REAP_POLL_INTERVAL_SECONDS = 1.0
+
+
+def run_concurrent_check(primary: AltruAgentClient, http: httpx.Client, control_url: str) -> int:
+    """Milestone 4C LIVE verification: prove the complete production
+    concurrent-execution path, end to end, for two real simultaneous matches.
+
+    1. Creates two independent standalone tic_tac_toe competitions and
+       joins the primary agent plus ONE shared temporary opponent to both.
+    2. Confirms both are `active` for the primary agent at the same time
+       (`client.sessions()`), and resolves each into a `GameSession` *now*
+       (while still `in_progress` — `game_server_url` stops being served
+       once a competition completes, so this can't be deferred).
+    3. Installs the temporary deterministic-RESIGN `agent/agent.py` (see
+       above), then calls the production `run_once_concurrent()` directly
+       — not `run_forever_concurrent()`, which doesn't expose its internal
+       worker registry for inspection afterward.
+    4. Confirms two distinct real worker PIDs were started for the two
+       session_ids.
+    5. Polls (bounded) for the supervisor's own registry to report both
+       workers reaped — proving each one independently built its own
+       client, called the (real, file-based) `create_agent()` exactly
+       once, reached `run_match()`, resigned, and exited on its own. No
+       manual termination of a still-running worker on the success path.
+    6. Confirms both server-side matches are actually terminal (via the
+       `GameSession`s resolved in step 2), and that no worker remains.
+
+    Always restores the real `agent/agent.py` in a `finally`, and still
+    terminates any not-yet-exited workers there too (only relevant on a
+    failure/timeout — the success path never needs to).
+    """
+    from altruagent.supervisor import WorkerRegistry, run_once_concurrent
+
+    opponent: AltruAgentClient | None = None
+    registry: WorkerRegistry | None = None
+    agent_file_swapped = False
+    try:
+        primary_agent = primary.me()
+        if not primary_agent.is_claimed:
+            _fail(
+                f"Primary agent '{primary_agent.name}' is not claimed "
+                f"(status={primary_agent.status}). Claim it before running this test."
+            )
+        _checkpoint(f"primary agent authenticated ({primary_agent.name})")
+
+        opp_name, opp_api_key, opp_claim_token = signup_temporary_agent(http, control_url)
+        human_token = getpass.getpass(
+            "Human/admin bearer token (used only for this run — never stored, "
+            "logged, or echoed): "
+        )
+        if not human_token:
+            _fail("A human/admin bearer token is required to claim the temporary agent.")
+
+        claim_temporary_agent(http, control_url, opp_claim_token, human_token)
+        opponent = AltruAgentClient(control_url=control_url, api_key=opp_api_key)
+        opponent_agent = opponent.me()
+        if not opponent_agent.is_claimed:
+            _fail(f"Temporary agent '{opp_name}' was not claimed successfully.")
+        _checkpoint(f"temporary opponent created and claimed ({opp_name})")
+
+        session_ids: list[str] = []
+        for i in range(2):
+            session_id = create_competition(http, control_url, human_token)
+            join_competition(primary, session_id)
+            join_competition(opponent, session_id)
+            wait_for_in_progress(
+                lambda sid=session_id: primary.request("GET", f"/competitions/{sid}")
+            )
+            session_ids.append(session_id)
+            _checkpoint(f"competition {i + 1}/2 created and active (session_id={session_id})")
+
+        sessions = primary.sessions()
+        matches_by_id = {m.session_id: m for m in sessions.active if m.session_id in session_ids}
+        if set(matches_by_id) != set(session_ids):
+            _fail(
+                f"Expected both {session_ids} in client.sessions().active, found "
+                f"{sorted(m.session_id for m in sessions.active)}."
+            )
+        _checkpoint("both matches confirmed simultaneously active via client.sessions()")
+
+        # Resolve game_server_url now, while still in_progress — the control
+        # plane stops serving it once a competition completes, so this can't
+        # be deferred to after the workers finish.
+        game_sessions_by_id = {sid: matches_by_id[sid].game() for sid in session_ids}
+        _checkpoint("game_server_url resolved for both matches ahead of time")
+
+        _install_deterministic_resign_agent()
+        agent_file_swapped = True
+        _checkpoint(
+            "temporary deterministic-RESIGN agent/agent.py installed "
+            "(restored automatically at the end of this run)"
+        )
+
+        registry = WorkerRegistry()
+        run_once_concurrent(primary, registry=registry, failed_until={}, agent_id=primary_agent.id)
+        pids = registry.pids()
+        if set(pids) != set(session_ids):
+            _fail(f"Expected a worker for each of {session_ids}, got {pids}.")
+        if len(set(pids.values())) != 2:
+            _fail(f"Expected two DISTINCT process PIDs, got {pids}.")
+        _checkpoint(f"two distinct worker processes started concurrently (pids={pids})")
+
+        # Bounded wait for both workers to finish ON THEIR OWN — each one
+        # independently builds its client, calls create_agent() once, reaches
+        # run_match(), resigns, and exits; nothing here terminates a worker
+        # that's still legitimately running its match.
+        deadline = time.monotonic() + WORKER_COMPLETION_TIMEOUT_SECONDS
+        reaped: dict[str, int] = {}
+        while len(reaped) < 2 and time.monotonic() < deadline:
+            reaped.update(registry.reap_finished())
+            if len(reaped) < 2:
+                time.sleep(WORKER_REAP_POLL_INTERVAL_SECONDS)
+
+        if len(reaped) < 2:
+            _fail(
+                f"Only {len(reaped)}/2 workers exited naturally within "
+                f"{WORKER_COMPLETION_TIMEOUT_SECONDS:.0f}s (reaped so far: {reaped})."
+            )
+        if any(exitcode != 0 for exitcode in reaped.values()):
+            _fail(f"One or more workers exited with a non-success code: {reaped}")
+        _checkpoint(f"both workers exited naturally after resigning (exit codes={reaped})")
+
+        if len(registry) != 0:
+            _fail(f"Expected the registry to be empty after reaping both workers, still tracking {len(registry)}.")
+        _checkpoint("supervisor registry confirms both workers reaped — none remaining")
+
+        for session_id, game in game_sessions_by_id.items():
+            final_state = game.state()
+            if not final_state.is_terminal:
+                _fail(
+                    f"session_id={session_id} is not terminal after its worker "
+                    f"exited (status={final_state.status!r})."
+                )
+        _checkpoint("both server-side matches confirmed terminal")
+
+        print(
+            f"\n[NOTE] Temporary agent '{opp_name}' remains claimed — the current "
+            "backend has no safe agent-deletion endpoint, so it was not deleted."
+        )
+        print("\nMILESTONE 4C LIVE CONCURRENCY SMOKE TEST PASSED")
+        return 0
+    except (SmokeTestError, AltruAgentError) as exc:
+        print(f"\nSMOKE TEST FAILED: {exc}")
+        return 1
+    finally:
+        if registry is not None and len(registry) > 0:
+            print(f"[WARN] cleanup: terminating {len(registry)} still-running worker(s)")
+            registry.terminate_all(timeout=10.0)
+        if agent_file_swapped:
+            _restore_real_agent()
+            print("[OK] cleanup: real agent/agent.py restored")
+        if opponent is not None:
+            opponent.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -299,7 +540,37 @@ def main() -> int:
             "of the default standalone-competition one (Milestones 2 + 3A)."
         ),
     )
+    parser.add_argument(
+        "--concurrent",
+        action="store_true",
+        help=(
+            "Run the Milestone 4C concurrency check instead: two independent "
+            "standalone competitions, proving the supervisor runs two real "
+            "worker processes for them at once. Mutually exclusive with "
+            "--tournament."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.concurrent and args.tournament:
+        print("--concurrent and --tournament cannot be combined.")
+        return 1
+
+    if args.concurrent:
+        print("=== Milestone 4C LIVE concurrency smoke test ===")
+        print("This calls the REAL deployed AltruAgent platform. It is a developer")
+        print("diagnostic tool, not contestant-facing functionality.\n")
+        try:
+            primary = AltruAgentClient()
+        except ConfigurationError as exc:
+            print(f"Configuration error: {exc}")
+            return 1
+        http = httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)
+        try:
+            return run_concurrent_check(primary, http, primary.control_url)
+        finally:
+            primary.close()
+            http.close()
 
     mode_label = "tournament" if args.tournament else "standalone competition"
     print(f"=== Milestone 2 + 3A/3B LIVE smoke test ({mode_label} mode) ===")

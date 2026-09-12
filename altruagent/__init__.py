@@ -31,9 +31,19 @@ function, or an object exposing one — no base class) only when
 
 Milestone 4B: sequential local discovery + execution — ``run_forever`` (see
 ``altruagent.runtime``) repeatedly discovers assigned matches via
-``client.sessions()`` and feeds them into ``run_match`` one at a time; this
-is what ``python -m agent`` runs. Still sequential — only one match plays at
-a time; running several concurrently is a later milestone.
+``client.sessions()`` and feeds them into ``run_match`` one at a time.
+Kept available as a simple sequential/bounded primitive; superseded as the
+normal ``python -m agent`` path by Milestone 4C below.
+
+Milestone 4C: concurrent multi-match execution — ``run_forever_concurrent``
+(see ``altruagent.supervisor``) is what ``python -m agent`` actually runs
+now. It discovers active matches the same way, but instead of playing them
+itself, starts one independent worker *process* per active match (see
+``altruagent.worker``), each with its own fresh ``AltruAgentClient`` and its
+own ``agent.agent.create_agent()`` call — so simultaneous matches get
+genuinely isolated contestant instances (and module-level state), not a
+single shared one. The parent only manages worker lifecycle and
+failed-match cooldowns; it never plays a match itself.
 """
 
 from .client import AltruAgentClient
@@ -59,6 +69,7 @@ from .runner import (
     run_match,
 )
 from .runtime import run_forever, run_once
+from .supervisor import run_forever_concurrent, run_once_concurrent
 
 __all__ = [
     "AltruAgentClient",
@@ -84,4 +95,6 @@ __all__ = [
     "run_match",
     "run_forever",
     "run_once",
+    "run_forever_concurrent",
+    "run_once_concurrent",
 ]

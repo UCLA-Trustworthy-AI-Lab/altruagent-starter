@@ -1,14 +1,22 @@
 """Entry point for `python -m agent`.
 
 Authenticates using the existing `.env`/environment configuration,
-discovers matches assigned to this agent, and plays them one at a time
-through `agent.agent.choose_action` via the committed runtime
-(`altruagent.runtime.run_forever`). Sequential only — see the README for
-why. Stops cleanly on Ctrl+C; does not resign or otherwise touch any match
-on shutdown.
+discovers matches assigned to this agent, and plays them CONCURRENTLY — one
+independent worker process per active match — through
+`agent.agent.create_agent()` via the committed supervisor
+(`altruagent.supervisor.run_forever_concurrent`). Stops cleanly on Ctrl+C;
+does not resign or otherwise touch any match on shutdown.
 
-This file is deliberately thin — the actual discovery/execution loop lives
-in `altruagent.runtime`, and match play itself in `altruagent.runner`.
+This file is deliberately thin — discovery/worker lifecycle lives in
+`altruagent.supervisor`, one match's play loop in `altruagent.runner`, and
+each worker's own setup in `altruagent.worker`.
+
+IMPORTANT (Windows multiprocessing): the `if __name__ == "__main__":` guard
+at the bottom of this file is not just style — `multiprocessing`'s `spawn`
+start method (required on Windows, used here unconditionally so behavior is
+identical everywhere) re-imports this exact module in every worker process.
+Without the guard, each freshly-spawned worker would re-run `main()` itself
+and spawn further workers recursively.
 """
 
 from __future__ import annotations
@@ -17,28 +25,31 @@ from typing import Callable
 
 from altruagent.client import AltruAgentClient
 from altruagent.errors import AltruAgentError, ConfigurationError
-from altruagent.runtime import run_forever
+from altruagent.supervisor import run_forever_concurrent
 
 from . import agent as agent_module
 
 
-def _resolve_choose_action(module: object) -> Callable:
-    """Look up ``choose_action`` on the given agent module. Fails clearly
-    (no fallback, no signature inspection, no alternate names) if it's
-    missing or not callable.
+def _resolve_create_agent(module: object) -> Callable:
+    """Look up ``create_agent`` on the given agent module. Fails clearly
+    (no fallback name, no signature inspection) if it's missing or not
+    callable. Deliberately does NOT call it here — construction happens
+    once per match, inside that match's own worker process, not once in
+    the parent (see altruagent.worker.run_worker).
     """
-    choose_action = getattr(module, "choose_action", None)
-    if not callable(choose_action):
+    create_agent = getattr(module, "create_agent", None)
+    if not callable(create_agent):
         raise ValueError(
-            "agent/agent.py must define a callable choose_action(state, context) "
-            "function."
+            "agent/agent.py must define a callable create_agent() function "
+            "that returns your decision logic (a function, or an object "
+            "exposing choose_action(state, context))."
         )
-    return choose_action
+    return create_agent
 
 
 def main() -> int:
     try:
-        choose_action = _resolve_choose_action(agent_module)
+        _resolve_create_agent(agent_module)  # validated eagerly; not invoked here
     except ValueError as exc:
         print(f"Startup error: {exc}")
         return 1
@@ -66,10 +77,13 @@ def main() -> int:
         return 1
 
     print(f"Authenticated as agent '{me.name}' ({me.id}).")
-    print("Watching for assigned matches — one at a time. Press Ctrl+C to stop.\n")
+    print(
+        "Watching for assigned matches — each gets its own process. "
+        "Press Ctrl+C to stop.\n"
+    )
 
     try:
-        run_forever(client, choose_action, agent_id=me.id)
+        run_forever_concurrent(client, agent_id=me.id)
         return 0
     except KeyboardInterrupt:
         print("\nStopped.")
