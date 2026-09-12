@@ -6,8 +6,10 @@ This never joins, steps, resigns, or otherwise mutates anything.
 Run:
     python scripts/check_sessions.py
 
-With --inspect-active, additionally fetches (read-only) GameAPI state for
-each active match via match.game().state() — still no moves are submitted:
+With --inspect-active, additionally fetches (read-only) state for each
+active match through MCP (the same production gameplay transport
+python -m agent uses) via match.game().get_state() — still no moves are
+submitted:
     python scripts/check_sessions.py --inspect-active
 """
 
@@ -38,8 +40,8 @@ def main() -> int:
         "--inspect-active",
         action="store_true",
         help=(
-            "Also fetch GameAPI state for each active match via "
-            "match.game().state() — read-only, submits no moves."
+            "Also fetch state for each active match through MCP via "
+            "match.game().get_state() — read-only, submits no moves."
         ),
     )
     args = parser.parse_args()
@@ -71,14 +73,20 @@ def main() -> int:
                 _print_match(m)
 
         if args.inspect_active and sessions.active:
-            print("\nInspecting active matches (read-only — fetches state, submits no moves):")
+            print("\nInspecting active matches via MCP (read-only — fetches state, submits no moves):")
             for m in sessions.active:
                 try:
-                    state = m.game().state()
-                    mover = state.current_player.name if state.current_player else None
+                    game = m.game()
+                    state = game.get_state()
+                    # get_game_state alone never carries legal_actions (a
+                    # separate MCP tool) — only fetch it when there's
+                    # actually something to enumerate, same as the runner.
+                    action_ids: list[str] = []
+                    if state.is_current_actor:
+                        action_ids = [a["action_id"] for a in game.get_legal_actions().get("actions", [])]
                     print(
                         f"  session_id={m.session_id} phase={state.phase} "
-                        f"current_player={mover} legal_actions={state.legal_actions}"
+                        f"is_current_actor={state.is_current_actor} legal_actions={action_ids}"
                     )
                 except AltruAgentError as exc:
                     print(f"  session_id={m.session_id}: failed to inspect ({exc})")

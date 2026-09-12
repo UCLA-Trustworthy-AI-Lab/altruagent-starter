@@ -6,6 +6,17 @@ functionality — it's an integration check for people working on the SDK
 itself. It creates real, if disposable, platform state: one or two
 temporary second agents and one or two temporary competitions/tournaments.
 
+Milestone 6 note: since `Match.game()` now builds an `MCPGameSession` (MCP
+is the production path — see `altruagent.runner`), this script's own direct
+state-inspection calls use `match.rest_game()` instead, deliberately keeping
+their REST-shaped assertions (`next_actions`, `.state()`) exactly as
+originally written. The actual play/resign these checks exercise still goes
+through the real production path (`run_once`/`run_once_concurrent`, which
+call `run_match` -> `match.game()` -> MCP) regardless — so this script now
+incidentally proves REST and MCP reads agree on the same underlying session,
+in addition to its original purpose. `scripts/acceptance_test.py --mcp` is
+the dedicated, purpose-built MCP proof (see its own docstring).
+
 Three modes. The default and `--tournament` share all of their setup/
 cleanup machinery; `--concurrent` (Milestone 4C) is a self-contained,
 separate check with its own two-competition setup (see
@@ -458,7 +469,14 @@ def run_concurrent_check(primary: AltruAgentClient, http: httpx.Client, control_
         # Resolve game_server_url now, while still in_progress — the control
         # plane stops serving it once a competition completes, so this can't
         # be deferred to after the workers finish.
-        game_sessions_by_id = {sid: matches_by_id[sid].game() for sid in session_ids}
+        # rest_game(), deliberately — this check's own verification reads
+        # state directly over REST; the actual play/resign the workers
+        # perform (via the production run_once_concurrent() below) goes
+        # through MCP regardless (match.game() is MCP now — see
+        # altruagent.models.Match). Reading the same session through both
+        # transports and getting consistent results is itself a useful
+        # cross-transport sanity check, not a bug.
+        game_sessions_by_id = {sid: matches_by_id[sid].rest_game() for sid in session_ids}
         _checkpoint("game_server_url resolved for both matches ahead of time")
 
         _install_deterministic_resign_agent()
@@ -645,8 +663,11 @@ def main() -> int:
                 f"active match discovered via client.sessions() (session_id={session_id})"
             )
 
-            primary_session = discovered_match.game()
-            _checkpoint("GameAPI URL resolved lazily via match.game()")
+            # rest_game(), deliberately — see the concurrent-mode comment
+            # above: this check's own state reads go over REST directly;
+            # match.game() (MCP) is what the production runner uses below.
+            primary_session = discovered_match.rest_game()
+            _checkpoint("GameAPI URL resolved lazily via match.rest_game()")
 
             # The opponent reuses the already-resolved, normalized URL rather
             # than repeating its own sessions()+game() lookup purely for its
@@ -692,18 +713,21 @@ def main() -> int:
                 )
             _checkpoint("active match discovered via client.sessions()")
 
-            # Lazy-resolution path: Match.game() -> GET /competitions/{id} ->
-            # game_server_url -> GameSession. Deliberately NOT client.game(...)
-            # directly for the primary agent — that's the thing this step proves.
-            primary_session = discovered_match.game()
+            # Lazy-resolution path: Match.rest_game() -> GET /competitions/{id}
+            # -> game_server_url -> GameSession. Deliberately NOT
+            # client.game(...) directly for the primary agent — that's the
+            # thing this step proves. rest_game() (not game()/MCP) so this
+            # check's own state read stays over REST — see the concurrent-
+            # mode comment above for why that's deliberate, not a fallback.
+            primary_session = discovered_match.rest_game()
             if not discovered_match.game_server_url:
-                _fail("discovered_match.game_server_url was not populated after match.game().")
+                _fail("discovered_match.game_server_url was not populated after match.rest_game().")
             if not primary_session.game_server_url.startswith(("http://", "https://")):
                 _fail(
                     "GameSession.game_server_url is not a normalized URL: "
                     f"{primary_session.game_server_url!r}"
                 )
-            _checkpoint("GameAPI URL resolved lazily via match.game()")
+            _checkpoint("GameAPI URL resolved lazily via match.rest_game()")
 
             opponent_session = opponent.game(session_id=session_id, game_server_url=game_server_url)
 

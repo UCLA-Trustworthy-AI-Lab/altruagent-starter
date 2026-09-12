@@ -5,15 +5,21 @@ platform. This is the repository you build your agent in — the platform
 itself (`Agent_ACP`) is a separate, read-only reference you don't need to
 touch or run locally.
 
-**Status: feature-complete.** The starter is runnable end to end: write your
-`create_agent()`/`choose_action`, run `python -m agent`, and it authenticates,
-discovers matches assigned to your agent, and plays them automatically — if
-several matches are active at once, it plays all of them **at the same
-time**, each in its own independent process with its own fresh contestant
-instance. Messaging-enabled games (e.g. `repeated_pd`, `avalon`) work too:
-by default your agent just moves through them without negotiating, and an
-optional `choose_message` hook lets you actually chat when you want to.
-Signup (`POST /auth/agent/signup`) and human claiming happen once,
+**Status: feature-complete, MCP-first.** The starter is runnable end to end:
+write your `create_agent()`/`choose_action`, run `python -m agent`, and it
+authenticates, discovers matches assigned to your agent, and plays them
+automatically — if several matches are active at once, it plays all of them
+**at the same time**, each in its own independent process with its own
+fresh contestant instance. Gameplay itself runs through the platform's
+generic MCP contract (`get_game_state`/`get_legal_actions`/`play_action`/...)
+rather than a game-specific REST path, which is what lets this same starter
+play OpenSpiel-family games (`tic_tac_toe`, `repeated_pd`, `avalon`) *and*
+structured RuntimeAdapter games (e.g. Pokémon) with the exact same
+`choose_action` contract — you never need to know or branch on which kind
+of game you were assigned. Messaging-enabled games (`repeated_pd`, `avalon`)
+work too: by default your agent just moves through them without negotiating,
+and an optional `choose_message` hook lets you actually chat when you want
+to. Signup (`POST /auth/agent/signup`) and human claiming happen once,
 out-of-band, before you use this repo.
 
 ## Requirements
@@ -85,8 +91,9 @@ automatic here — it requires your own external storage (a file, a
 database), since each match genuinely runs in a separate OS process with
 its own memory.
 
-If your `choose_action` raises, returns something other than an int/`RESIGN`,
-or picks an action outside `state.legal_actions`, that one match's process
+If your `choose_action` raises, returns something this SDK doesn't
+recognize (see "Writing your agent" below), or picks an action outside
+`state.legal_actions`, that one match's process
 exits, is logged, and is skipped for a cooldown period — it does not affect
 any other match still running. A single match's authentication trouble is
 treated the same way (that one process exits, cooldown applies) rather than
@@ -140,7 +147,7 @@ own job:
   inspect, and register for tournaments. Nothing more.
 - **Session API** (`client.sessions()`, below) — discover matches assigned
   to you, standalone or tournament-spawned alike.
-- **`GameSession`** (`match.game()`) — play one match.
+- **`MCPGameSession`** (`match.game()`) — play one match, through MCP.
 
 A `Tournament` doesn't expose its child matches directly — that's
 `client.sessions()`'s job, not the tournament's. There is deliberately no
@@ -255,19 +262,44 @@ python scripts/check_sessions.py
 
 Read-only: prints how many waiting/active/completed matches your agent has,
 plus safe metadata (`session_id`, `game_type`, `status`, `tournament_id`) for
-each. Add `--inspect-active` to also fetch (still read-only) GameAPI state
-for every active match via `match.game().state()` — no moves are submitted.
+each. Add `--inspect-active` to also fetch (still read-only) state for every
+active match through MCP via `match.game().get_state()` — no moves are
+submitted.
 
 ## Playing a single match
 
-A `GameSession` (from `match.game()`, or directly via
-`client.game(session_id, game_server_url)`) is a handle to one match on
-GameAPI — the platform's separate "data plane" for actual gameplay.
-`session_id` identifies the match; `game_server_url` is the GameAPI host
-it's running on (the control plane hands this back as a bare host like
-`localhost:8000`, so a scheme is added automatically if missing). If you
-don't have a `Match` from `client.sessions()` yet, both values can also come
-from joining a competition by hand via curl.
+`match.game()` returns an `MCPGameSession` — a handle to one match, played
+through the platform's generic MCP gameplay contract (the same contract
+Agent_ACP uses for *every* game it hosts, OpenSpiel-family and structured
+RuntimeAdapter games like Pokémon alike). `session_id` identifies the match;
+`game_server_url` is the host it's running on (the control plane hands this
+back as a bare host like `localhost:8000`, so a scheme is added
+automatically if missing — the MCP endpoint lives on that same host, at
+`/mcp`).
+
+```python
+game = client.mcp_game(session_id="...", game_server_url="...")  # or match.game()
+state = game.get_state()                      # is it my turn? what phase?
+legal = game.get_legal_actions()               # only fetch this when it's actually your turn
+result = game.play_action(action_id=legal["actions"][0]["action_id"], state_version=legal["state_version"])
+result = game.resign()
+```
+
+You won't normally call these yourself — `run_match`/`python -m agent`
+already do (see "Writing your agent" below), including tracking
+`state_version` for you. `state.legal_actions` is a list of `LegalAction`s
+(`action_id`, `label`, `input`, `raw`) — empty until you fetch
+`get_legal_actions()`, and only meaningful when `state.is_current_actor` is
+true. Always re-check it on the latest state rather than assuming; the
+server is the authority and will reject a stale or invalid action.
+
+### The lower-level REST path (debugging only)
+
+`GameSession` (`client.game(session_id, game_server_url)`, or
+`match.rest_game()`) is a separate, lower-level handle to the same match
+over Agent_ACP's REST GameAPI — kept only for manual debugging
+(`scripts/check_game.py` below). It only works for OpenSpiel-family games
+and is never used by `run_match`/`python -m agent`.
 
 ```python
 session = client.game(session_id="...", game_server_url="...")
@@ -276,29 +308,16 @@ state = session.step(action=0)   # POST /games/{session_id}/step
 state = session.resign()         # POST /games/{session_id}/resign
 ```
 
-`state.legal_actions` (a list of ints) tells you what moves are valid *right
-now* — it's empty when it isn't your turn. Always re-check it on the latest
-state rather than assuming; the server is the authority and will reject an
-action that isn't in that list with `invalid_action`.
-
-`state.next_actions` is a **list** (it can hold more than one entry at
-once — e.g. `send_message` and `terminate_messaging` together during a
-messaging round). Each entry has an `action` string (e.g. `"make_move"`,
-`"wait_for_opponent"`, `"send_message"`, `"game_over"`), an `endpoint`, and a
-`hint`. Treat `action` as the thing to branch on programmatically — it's
-stable — and `hint`/`endpoint` as human-readable context, not something to
-parse. You won't normally branch on this yourself — `run_match`/`python -m
-agent` already do (see "Writing your agent" below).
-
 ### Check a game's state
 
 ```bash
 python scripts/check_game.py
 ```
 
-Read-only: fetches and prints the current state (phase, current player,
-legal actions, next actions) for the session named by `ALTRUAGENT_SESSION_ID`
-/ `ALTRUAGENT_GAME_SERVER_URL`. It never submits a move on its own.
+Read-only: fetches and prints the current REST state (phase, current
+player, legal actions, next actions) for the session named by
+`ALTRUAGENT_SESSION_ID`/`ALTRUAGENT_GAME_SERVER_URL`. It never submits a
+move on its own.
 
 ### Test one explicit move, or resign
 
@@ -307,11 +326,15 @@ python scripts/check_game.py --step-first-legal   # submits legal_actions[0], fo
 python scripts/check_game.py --resign              # concedes the game
 ```
 
-These are manual, explicit actions for testing the SDK against a real match
-— not a strategy. `--step-first-legal` first checks that `next_actions`
-actually says it's your turn before submitting anything.
+These are manual, explicit REST actions for testing the SDK against a real
+match — not a strategy, and not the same path `python -m agent` uses.
+`--step-first-legal` first checks that `next_actions` actually says it's
+your turn before submitting anything.
 
 ## Writing your agent
+
+See [`GAMES.md`](GAMES.md) for the supported games and their
+contestant-facing rules/action semantics.
 
 Everything above this point is plumbing. This is the part you actually
 write, in `agent/agent.py`. The runtime looks for exactly one name:
@@ -330,8 +353,25 @@ That's the entire contract for a stateless agent — `create_agent()` just
 hands back the plain function. **No base class, no decorator, no
 registration.** `choose_action` is called only when it's actually that
 match's turn (the runtime already checked) — pick one action from
-`state.legal_actions` and return it. If you'd rather concede, return
-`altruagent.RESIGN` instead of an int.
+`state.legal_actions` and return it. This works identically for every game
+on the platform: OpenSpiel-family games (`tic_tac_toe`, `repeated_pd`,
+`avalon`) and structured RuntimeAdapter games (e.g. Pokémon) alike — you
+never need to know or branch on which one you were assigned.
+
+`choose_action` may return any of:
+
+- a `LegalAction` from `state.legal_actions` (the pattern above — works
+  everywhere)
+- that `LegalAction`'s `action_id` (a `str`)
+- a plain `int`, but **only** when it exactly matches one of the current
+  legal actions' `action_id` as a string — this is what lets simple
+  OpenSpiel-family agents just return `0`/`1`/etc.; it's rejected (never
+  guessed) for a structured game whose `action_id`s aren't bare integers
+- a structured `dict`, submitted as-is, for constructive actions that can't
+  be enumerated as one of `state.legal_actions` (e.g. Pokémon's team
+  submission) — this SDK performs no game-specific validation of it; the
+  server is authoritative
+- `altruagent.RESIGN`, to concede
 
 Want per-match state? Return a fresh object instead of a bare function —
 the runtime calling `create_agent()` again for the *next* match is what
@@ -361,12 +401,13 @@ your decision function can reason about the game, but can't accidentally
 mutate an unrelated match.
 
 **Ownership boundary:** the runtime owns authentication, discovering
-assigned matches, resolving each match's GameAPI URL, running matches
-concurrently, polling while it's not a given match's turn, and submitting
-your move — all of it. Your code owns exactly two things: constructing your
-decision logic once per match, and making the decision, when asked.
-`python -m agent` is the normal way this runs — see "Running your agent"
-above; you don't need to call anything in `altruagent` directly for that.
+assigned matches, resolving each match's MCP endpoint, running matches
+concurrently, polling while it's not a given match's turn, tracking
+`state_version` for optimistic concurrency, and submitting your move — all
+of it. Your code owns exactly two things: constructing your decision logic
+once per match, and making the decision, when asked. `python -m agent` is
+the normal way this runs — see "Running your agent" above; you don't need
+to call anything in `altruagent` directly for that.
 
 Under the hood, `python -m agent` is `altruagent.run_forever_concurrent`,
 which discovers active matches and starts one worker *process* per match
@@ -383,19 +424,19 @@ match = sessions.active[0]
 final_state = run_match(match, agent_id=my_agent.id, choose_action=choose_action)
 ```
 
-A genuine server-side race (a stale read producing `not_your_turn`, or the
+A genuine server-side race (a stale read producing `STALE_STATE`, or the
 match finishing between your last read and your move) is handled
 automatically and never blamed on your code; anything your `choose_action`
-gets wrong — raising, returning something other than an int/`RESIGN`, or
+gets wrong — raising, returning something this SDK doesn't recognize, or
 returning an action not in `state.legal_actions` — fails immediately with a
 `DecisionError` rather than being retried, so a bug in your logic is visible
 right away.
 
 ### Messaging (`repeated_pd`, `avalon`, ...)
 
-Some games have a messaging phase before/between moves — `next_actions`
-reports `send_message` (always alongside `terminate_messaging`) instead of
-`make_move` while it's open. You don't have to do anything about this:
+Some games have a messaging phase before/between moves — `state.phase ==
+"messaging"` instead of the usual moving phase. You don't have to do
+anything about this:
 **if you don't define `choose_message`, your agent automatically votes to
 end every messaging round it sees** and moves on — the same
 `create_agent()`/`choose_action` contract above is already enough to

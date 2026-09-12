@@ -48,22 +48,41 @@ failed-match cooldowns; it never plays a match itself.
 Milestone 5: messaging support — both launch games (``repeated_pd``,
 ``avalon``) default to ``messaging_enabled=True`` and block ``/step`` while
 in a MESSAGING phase, so a contestant needs *some* way through it.
-``GameSession.send_message``/``.terminate_messaging`` are the transport;
 ``choose_message`` (optional, alongside ``choose_action`` on whatever
 ``create_agent()`` returns) is the contestant hook — ``SendMessage(...)`` to
 chat, or ``TERMINATE_MESSAGING`` to vote the round closed. A contestant that
 never defines ``choose_message`` gets ``TERMINATE_MESSAGING`` automatically
 every round, so existing move-only agents keep working unchanged.
+
+Milestone 6: MCP-first gameplay. ``python -m agent``/``run_match``/
+``run_game`` now play exclusively through Agent_ACP's generic MCP gameplay
+contract (``MCPGameSession``, see ``altruagent.mcp_game``/
+``altruagent.mcp_transport``) rather than the REST GameAPI — this is what
+lets one runner drive every currently-registered adapter (OpenSpiel-family
+games *and* structured RuntimeAdapter games like Pokémon) with no
+per-game/per-adapter branching anywhere in this SDK. ``state.legal_actions``
+is now ``list[LegalAction]`` (``action_id``/``label``/``input``/``raw``) —
+the universal pattern ``return state.legal_actions[0]`` works unchanged for
+every game. ``choose_action`` may also return a matching ``action_id``
+string, a matching ``int`` (OpenSpiel-family only — rejected, never
+guessed, for a structured game), a structured ``dict`` (for constructive
+actions like Pokémon's team submission), or ``RESIGN``. The REST
+``GameSession`` (``altruagent.game``) is kept, unmodified, as a lower-level
+debug/manual-testing tool only (``scripts/check_game.py``) — it is never
+used by ``run_match``/``python -m agent``.
 """
 
 from .client import AltruAgentClient
 from .errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from .game import GameSession
+from .mcp_game import MCPGameSession
+from .mcp_transport import MCPToolError
 from .models import (
     Agent,
     AgentSessions,
     DecisionContext,
     GameState,
+    LegalAction,
     Match,
     Message,
     NextAction,
@@ -91,7 +110,10 @@ __all__ = [
     "DecisionContext",
     "GameSession",
     "GameState",
+    "LegalAction",
     "Match",
+    "MCPGameSession",
+    "MCPToolError",
     "Message",
     "NextAction",
     "PlayerRef",

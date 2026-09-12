@@ -11,6 +11,7 @@ import pytest
 from altruagent.client import AltruAgentClient
 from altruagent.errors import AuthenticationError, PlatformError
 from altruagent.game import GameSession
+from altruagent.mcp_game import MCPGameSession
 
 CONTROL_URL = "https://example.test"
 
@@ -148,7 +149,7 @@ def test_multiple_active_matches_remain_independent():
     assert sessions.active[1].game_server_url == "host-2:8000"
 
 
-def test_active_match_game_performs_competition_lookup_and_builds_gamesession():
+def test_active_match_game_performs_competition_lookup_and_builds_mcp_session():
     lookups = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -168,9 +169,67 @@ def test_active_match_game_performs_competition_lookup_and_builds_gamesession():
     game = match.game()
 
     assert lookups == ["/competitions/s-1"]
+    # match.game() is the production path (MCP) — see match.rest_game() below
+    # for the lower-level REST debug path.
+    assert isinstance(game, MCPGameSession)
+    assert game.session_id == "s-1"
+    assert game.game_server_url == "http://host:8000"
+
+
+def test_active_match_rest_game_performs_competition_lookup_and_builds_gamesession():
+    # rest_game() is the debug-only REST path (scripts/check_game.py) — kept
+    # separate from game() so run_match/python -m agent never touch it.
+    lookups = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/agent/login":
+            return login_ok(request)
+        if request.url.path == "/competitions/s-1":
+            lookups.append(request.url.path)
+            return httpx.Response(
+                200, json={"session_id": "s-1", "status": "in_progress", "game_server_url": "host:8000"}
+            )
+        return httpx.Response(
+            200, json=sessions_payload(active_sessions=[match_payload("s-1", "in_progress")])
+        )
+
+    client = make_client(handler)
+    match = client.sessions().active[0]
+    game = match.rest_game()
+
+    assert lookups == ["/competitions/s-1"]
     assert isinstance(game, GameSession)
     assert game.session_id == "s-1"
     assert game.game_server_url == "http://host:8000"
+
+
+def test_game_and_rest_game_share_the_same_cached_game_server_url():
+    # Both transports are resolved by the same _resolve_game_server_url —
+    # confirming one Match instance can hand out both without a second lookup.
+    lookups = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/agent/login":
+            return login_ok(request)
+        if request.url.path == "/competitions/s-1":
+            lookups.append(request.url.path)
+            return httpx.Response(
+                200, json={"session_id": "s-1", "status": "in_progress", "game_server_url": "host:8000"}
+            )
+        return httpx.Response(
+            200, json=sessions_payload(active_sessions=[match_payload("s-1", "in_progress")])
+        )
+
+    client = make_client(handler)
+    match = client.sessions().active[0]
+
+    mcp_game = match.game()
+    rest_game = match.rest_game()
+
+    assert lookups == ["/competitions/s-1"]  # exactly one lookup for both
+    assert isinstance(mcp_game, MCPGameSession)
+    assert isinstance(rest_game, GameSession)
+    assert mcp_game.game_server_url == rest_game.game_server_url == "http://host:8000"
 
 
 def test_resolved_game_server_url_is_cached_and_not_refetched():
@@ -307,7 +366,7 @@ def test_lazy_resolution_401_triggers_one_relogin_and_one_retry():
     match = client.sessions().active[0]
     game = match.game()
 
-    assert isinstance(game, GameSession)
+    assert isinstance(game, MCPGameSession)
     assert login_count == 2
     assert competition_auth_headers == ["Bearer jwt-1", "Bearer jwt-2"]
 

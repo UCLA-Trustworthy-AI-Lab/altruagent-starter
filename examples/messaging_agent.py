@@ -25,7 +25,7 @@ Run it as your agent with:
 (after copying this file's contents into agent/agent.py).
 """
 
-from altruagent import DecisionContext, GameState, SendMessage, TERMINATE_MESSAGING
+from altruagent import DecisionContext, GameState, LegalAction, SendMessage, TERMINATE_MESSAGING
 
 
 class RepeatedPDAgent:
@@ -35,9 +35,13 @@ class RepeatedPDAgent:
         # my one message for this move_count" is enough to avoid resending.
         self._messaged_for_move_count: int | None = None
 
-    def choose_action(self, state: GameState, context: DecisionContext) -> int:
-        # Always cooperate. Swap this for real strategy — e.g. mirror the
-        # opponent's last move from state.raw["round_history"] (tit-for-tat).
+    def choose_action(self, state: GameState, context: DecisionContext) -> LegalAction:
+        # Always cooperate. Swap this for real strategy — e.g. tit-for-tat
+        # based on what the opponent said last round (state.new_messages)
+        # or your own running record of state.legal_actions picked so far.
+        # Note: unlike the REST GameStateResponse this starter used to read,
+        # MCP's get_game_state does not expose repeated_pd's round_history/
+        # cumulative_scores — track your own history if you need it.
         return state.legal_actions[0]
 
     def choose_message(self, state: GameState, context: DecisionContext):

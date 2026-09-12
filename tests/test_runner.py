@@ -1,17 +1,18 @@
-"""Unit tests for altruagent.runner (run_game / run_match).
+"""Unit tests for altruagent.runner (run_game / run_match) — MCP-first.
 
-All gameplay is driven through a lightweight FakeGameSession test double —
-run_game only needs an object with state()/step()/resign(), so there is no
-need to mock HTTP for these; GameSession's own transport is already covered
-by tests/test_game.py.
+All gameplay is driven through a lightweight FakeMCPGameSession test double —
+run_game only needs an object exposing get_state()/get_legal_actions()/
+play_action()/send_message()/get_messages()/resign()/get_result(), so there
+is no need to mock HTTP for these; MCPGameSession's own transport is covered
+by tests/test_mcp_game.py and tests/test_mcp_transport.py.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from altruagent.errors import PlatformError
-from altruagent.models import DecisionContext, GameState, Match
+from altruagent.mcp_transport import MCPToolError
+from altruagent.models import DecisionContext, GameState, LegalAction, Match
 from altruagent.runner import (
     RESIGN,
     TERMINATE_MESSAGING,
@@ -25,108 +26,161 @@ from altruagent.runner import (
 SESSION_ID = "session-1"
 
 
-class FakeGameSession:
-    """Scripted stand-in for GameSession. Queue GameState objects (returned
-    in order by state()/step()/resign()/send_message()/terminate_messaging())
-    or exception instances (raised).
+class FakeMCPGameSession:
+    """Scripted stand-in for MCPGameSession. Queue return values (or
+    exception instances, raised) per method — each method pops its own
+    queue, so a test only needs to set up the calls it actually expects.
     """
 
     def __init__(self, session_id: str = SESSION_ID) -> None:
         self.session_id = session_id
         self.game_server_url = "http://fake:8000"
-        self._queue: list = []
-        self.state_calls = 0
-        self.step_calls: list[int] = []
+        self._state_queue: list = []
+        self._legal_actions_queue: list = []
+        self._play_action_queue: list = []
+        self._send_message_queue: list = []
+        self._resign_queue: list = []
+        self._result_queue: list = []
+        self.play_action_calls: list[dict] = []
+        self.send_message_calls: list[dict] = []
+        self.get_legal_actions_calls = 0
         self.resign_calls = 0
-        self.send_message_calls: list[tuple[str, list[int]]] = []
-        self.terminate_messaging_calls = 0
 
-    def queue(self, *items) -> "FakeGameSession":
-        self._queue.extend(items)
+    # -- queueing helpers (chainable) ----------------------------------
+
+    def queue_state(self, *items) -> "FakeMCPGameSession":
+        self._state_queue.extend(items)
         return self
 
-    def _next(self):
-        item = self._queue.pop(0)
+    def queue_legal_actions(self, *items) -> "FakeMCPGameSession":
+        self._legal_actions_queue.extend(items)
+        return self
+
+    def queue_play_action(self, *items) -> "FakeMCPGameSession":
+        self._play_action_queue.extend(items)
+        return self
+
+    def queue_send_message(self, *items) -> "FakeMCPGameSession":
+        self._send_message_queue.extend(items)
+        return self
+
+    def queue_resign(self, *items) -> "FakeMCPGameSession":
+        self._resign_queue.extend(items)
+        return self
+
+    def queue_result(self, *items) -> "FakeMCPGameSession":
+        self._result_queue.extend(items)
+        return self
+
+    @staticmethod
+    def _pop(queue: list):
+        item = queue.pop(0)
         if isinstance(item, BaseException):
             raise item
         return item
 
-    def state(self) -> GameState:
-        self.state_calls += 1
-        return self._next()
+    # -- MCPGameSession-shaped interface --------------------------------
 
-    def step(self, action: int) -> GameState:
-        self.step_calls.append(action)
-        return self._next()
+    def get_state(self) -> GameState:
+        return self._pop(self._state_queue)
 
-    def resign(self) -> GameState:
+    def get_legal_actions(self) -> dict:
+        self.get_legal_actions_calls += 1
+        return self._pop(self._legal_actions_queue)
+
+    def play_action(self, *, action_id=None, action=None, state_version) -> dict:
+        self.play_action_calls.append(
+            {"action_id": action_id, "action": action, "state_version": state_version}
+        )
+        return self._pop(self._play_action_queue)
+
+    def send_message(self, *, message_type: str, content=None, recipients=None) -> dict:
+        self.send_message_calls.append(
+            {"message_type": message_type, "content": content, "recipients": recipients}
+        )
+        return self._pop(self._send_message_queue)
+
+    def get_messages(self, *, since: int = -1) -> dict:
+        raise AssertionError("get_messages not exercised by these tests")
+
+    def resign(self) -> dict:
         self.resign_calls += 1
-        return self._next()
+        return self._pop(self._resign_queue)
 
-    def send_message(self, content: str, recipients: list[int] | None = None) -> GameState:
-        self.send_message_calls.append((content, list(recipients or [])))
-        return self._next()
-
-    def terminate_messaging(self) -> GameState:
-        self.terminate_messaging_calls += 1
-        return self._next()
+    def get_result(self) -> dict:
+        return self._pop(self._result_queue)
 
 
-def make_state(**overrides) -> GameState:
+def make_mcp_state(**overrides) -> GameState:
     payload = {
         "session_id": SESSION_ID,
-        "game_name": "tic_tac_toe",
-        "status": "active",
+        "game_type": "tic_tac_toe",
+        "status": "in_progress",
+        "state_version": 0,
         "observation": "...",
-        "current_player": {"name": "Me"},
-        "legal_actions": [0, 1, 2],
-        "legal_actions_str": ["a", "b", "c"],
-        "is_terminal": False,
-        "returns": None,
-        "move_count": 0,
-        "termination_reason": None,
-        "messaging_enabled": False,
         "phase": "moving",
-        "next_actions": [
-            {"action": "make_move", "endpoint": "POST /step", "hint": "Go.", "required_fields": ["action"]}
-        ],
+        "messaging_enabled": False,
+        "terminated_messaging": [],
+        "new_messages": [],
+        "current_actor": {"agent_id": "agent-1", "position": 0},
+        "is_current_actor": True,
+        "is_terminal": False,
     }
     payload.update(overrides)
-    return GameState.from_dict(payload)
+    return GameState.from_mcp_state(payload)
 
 
 def waiting_state(**overrides) -> GameState:
-    overrides.setdefault("legal_actions", [])
-    overrides.setdefault(
-        "next_actions", [{"action": "wait_for_opponent", "endpoint": "GET /games/x", "hint": "Wait."}]
-    )
-    return make_state(**overrides)
+    overrides.setdefault("is_current_actor", False)
+    overrides.setdefault("current_actor", {"agent_id": "opponent-1", "position": 1})
+    return make_mcp_state(**overrides)
 
 
 def terminal_state(**overrides) -> GameState:
     overrides.setdefault("is_terminal", True)
-    overrides.setdefault("legal_actions", [])
-    overrides.setdefault("current_player", None)
-    overrides.setdefault("returns", {"Me": 1.0, "Them": -1.0})
-    overrides.setdefault("next_actions", [{"action": "game_over", "hint": "Done."}])
-    return make_state(**overrides)
+    overrides.setdefault("is_current_actor", False)
+    return make_mcp_state(**overrides)
 
 
 def messaging_state(**overrides) -> GameState:
-    """A MESSAGING-phase state where this viewer has not yet terminated —
-    real GameAPI always pairs send_message + terminate_messaging together
-    here (see next_actions.py's compute_next_actions).
-    """
-    overrides.setdefault("messaging_enabled", True)
     overrides.setdefault("phase", "messaging")
-    overrides.setdefault(
-        "next_actions",
-        [
-            {"action": "send_message", "hint": "chat or terminate", "required_fields": ["type"]},
-            {"action": "terminate_messaging", "hint": "end round", "required_fields": ["type"]},
-        ],
+    overrides.setdefault("messaging_enabled", True)
+    return make_mcp_state(**overrides)
+
+
+def legal_actions_result(actions: list[dict], *, state_version: int = 0) -> dict:
+    return {"session_id": SESSION_ID, "state_version": state_version, "actions": actions}
+
+
+def int_actions(*ints, state_version: int = 0) -> dict:
+    return legal_actions_result(
+        [{"action_id": str(i), "label": str(i), "input": {}} for i in ints],
+        state_version=state_version,
     )
-    return make_state(**overrides)
+
+
+def structured_actions(*action_ids, state_version: int = 0) -> dict:
+    return legal_actions_result(
+        [{"action_id": aid, "label": aid, "input": {"type": "move"}} for aid in action_ids],
+        state_version=state_version,
+    )
+
+
+def play_action_result(*, status: str = "in_progress", state_version: int = 1) -> dict:
+    return {"accepted": True, "session_id": SESSION_ID, "state_version": state_version, "status": status}
+
+
+def result_dict(**overrides) -> dict:
+    payload = {
+        "session_id": SESSION_ID,
+        "is_terminal": True,
+        "status": "completed",
+        "returns": {"Me": 1.0, "Them": -1.0},
+        "your_return": 1.0,
+        "termination_reason": None,
+    }
+    payload.update(overrides)
+    return payload
 
 
 CONTEXT = DecisionContext(
@@ -141,12 +195,18 @@ def no_sleep(_seconds: float) -> None:
 # -- decision contract ------------------------------------------------------
 
 
-def test_plain_callable_decision_works():
-    game = FakeGameSession().queue(make_state(), terminal_state())
-    result = run_game(game, CONTEXT, lambda state, ctx: state.legal_actions[0], sleep=no_sleep)
+def test_universal_pattern_return_first_legal_action_works():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.step_calls == [0]
+    assert game.play_action_calls == [{"action_id": "0", "action": None, "state_version": 0}]
 
 
 def test_object_with_choose_action_method_works():
@@ -154,20 +214,132 @@ def test_object_with_choose_action_method_works():
         def choose_action(self, state, context):
             return state.legal_actions[-1]
 
-    game = FakeGameSession().queue(make_state(), terminal_state())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1, 2))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
     result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.step_calls == [2]
+    assert game.play_action_calls[0]["action_id"] == "2"
 
 
 def test_invalid_decision_object_fails_clearly():
-    game = FakeGameSession()  # empty queue: state() must never be called
+    game = FakeMCPGameSession()  # empty queues: get_state must never be called
 
     with pytest.raises(DecisionError):
         run_game(game, CONTEXT, 42, sleep=no_sleep)  # not callable, no .choose_action
 
-    assert game.state_calls == 0
+
+def test_action_id_string_decision_accepted():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: "1", sleep=no_sleep)
+
+    assert game.play_action_calls == [{"action_id": "1", "action": None, "state_version": 0}]
+
+
+def test_legal_action_object_decision_accepted():
+    def choose_action(state, context):
+        return next(a for a in state.legal_actions if a.action_id == "1")
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, choose_action, sleep=no_sleep)
+
+    assert game.play_action_calls == [{"action_id": "1", "action": None, "state_version": 0}]
+
+
+def test_structured_dict_decision_passed_through_verbatim():
+    payload = {"type": "submit_team", "team": ["a", "b", "c", "d", "e", "f"]}
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(structured_actions("submit_team", state_version=7))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: payload, sleep=no_sleep)
+
+    assert game.play_action_calls == [{"action_id": None, "action": payload, "state_version": 7}]
+
+
+def test_empty_dict_decision_rejected():
+    game = FakeMCPGameSession().queue_state(make_mcp_state()).queue_legal_actions(int_actions(0, 1))
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, lambda s, c: {}, sleep=no_sleep)
+
+    assert game.play_action_calls == []
+
+
+def test_int_accepted_only_when_it_matches_a_stringified_action_id():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: 1, sleep=no_sleep)
+
+    assert game.play_action_calls == [{"action_id": "1", "action": None, "state_version": 0}]
+
+
+def test_int_rejected_for_structured_game_never_guessed():
+    # Pokemon-shaped action_ids ("move:0") never match a bare int — this
+    # must fail clearly, not silently guess which action was meant.
+    game = FakeMCPGameSession().queue_state(make_mcp_state()).queue_legal_actions(
+        structured_actions("move:0", "switch:1")
+    )
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, lambda s, c: 0, sleep=no_sleep)
+
+    assert game.play_action_calls == []
+
+
+def test_non_matching_string_action_id_rejected():
+    game = FakeMCPGameSession().queue_state(make_mcp_state()).queue_legal_actions(int_actions(0, 1))
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, lambda s, c: "99", sleep=no_sleep)
+
+    assert game.play_action_calls == []
+
+
+def test_bool_decision_rejected_even_though_it_is_a_legal_action_value():
+    # isinstance(True, int) is True in Python, and True == 1 — without an
+    # explicit bool guard, returning True would silently be treated as
+    # legal action "1". It must not be.
+    game = FakeMCPGameSession().queue_state(make_mcp_state()).queue_legal_actions(int_actions(0, 1))
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, lambda s, c: True, sleep=no_sleep)
+
+    assert game.play_action_calls == []
+
+
+def test_unrecognized_type_decision_rejected():
+    game = FakeMCPGameSession().queue_state(make_mcp_state()).queue_legal_actions(int_actions(0, 1))
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, lambda s, c: 3.14, sleep=no_sleep)
+
+    assert game.play_action_calls == []
 
 
 # -- flow ---------------------------------------------------------------
@@ -180,34 +352,41 @@ def test_make_move_invokes_decision_exactly_once_for_that_state():
         calls.append(state)
         return state.legal_actions[0]
 
-    game = FakeGameSession().queue(make_state(), terminal_state())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
     run_game(game, CONTEXT, choose_action, sleep=no_sleep)
 
     assert len(calls) == 1
 
 
-def test_wait_for_opponent_does_not_invoke_decision():
+def test_wait_for_opponent_does_not_invoke_decision_or_fetch_legal_actions():
     def choose_action(state, context):
         raise AssertionError("choose_action should not be called while waiting")
 
     sleep_calls = []
-    game = FakeGameSession().queue(waiting_state(), terminal_state())
+    game = FakeMCPGameSession().queue_state(waiting_state(), terminal_state()).queue_result(result_dict())
     result = run_game(game, CONTEXT, choose_action, sleep=sleep_calls.append)
 
     assert result.is_terminal is True
     assert sleep_calls == [5.0]  # DEFAULT_WAIT_SECONDS
-    assert game.step_calls == []
+    assert game.get_legal_actions_calls == 0
 
 
-def test_terminal_state_exits_cleanly_without_any_decision():
+def test_terminal_state_exits_cleanly_and_fetches_result():
     def choose_action(state, context):
         raise AssertionError("choose_action should not be called on a terminal state")
 
-    game = FakeGameSession().queue(terminal_state())
+    game = FakeMCPGameSession().queue_state(terminal_state()).queue_result(result_dict())
     result = run_game(game, CONTEXT, choose_action, sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.step_calls == []
+    assert result.returns == {"Me": 1.0, "Them": -1.0}
+    assert game.get_legal_actions_calls == 0
 
 
 def test_repeated_wait_then_make_move_transition():
@@ -218,8 +397,12 @@ def test_repeated_wait_then_make_move_transition():
         return state.legal_actions[0]
 
     sleep_calls = []
-    game = FakeGameSession().queue(
-        waiting_state(), waiting_state(), make_state(), terminal_state()
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), waiting_state(), make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
     )
     result = run_game(game, CONTEXT, choose_action, sleep=sleep_calls.append)
 
@@ -228,99 +411,79 @@ def test_repeated_wait_then_make_move_transition():
     assert len(calls) == 1
 
 
-def test_make_move_to_terminal_in_one_step():
-    game = FakeGameSession().queue(make_state(), terminal_state())
-    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
-
-    assert result.is_terminal is True
-    assert result.returns == {"Me": 1.0, "Them": -1.0}
-
-
-# -- validation -----------------------------------------------------------
-
-
-def test_legal_int_accepted():
-    game = FakeGameSession().queue(make_state(legal_actions=[0, 1]), terminal_state())
-    result = run_game(game, CONTEXT, lambda s, c: 1, sleep=no_sleep)
-
-    assert result.is_terminal is True
-    assert game.step_calls == [1]
-
-
-def test_non_int_decision_rejected():
-    game = FakeGameSession().queue(make_state())
-
-    with pytest.raises(DecisionError):
-        run_game(game, CONTEXT, lambda s, c: "cooperate", sleep=no_sleep)
-
-    assert game.step_calls == []
-
-
-def test_illegal_int_decision_rejected():
-    game = FakeGameSession().queue(make_state(legal_actions=[0, 1]))
-
-    with pytest.raises(DecisionError):
-        run_game(game, CONTEXT, lambda s, c: 99, sleep=no_sleep)
-
-    assert game.step_calls == []
-
-
-def test_bool_decision_rejected_even_though_it_is_a_legal_action_value():
-    # isinstance(True, int) is True in Python, and True == 1 — without an
-    # explicit bool guard, returning True would silently be treated as
-    # legal action 1. It must not be.
-    game = FakeGameSession().queue(make_state(legal_actions=[0, 1]))
-
-    with pytest.raises(DecisionError):
-        run_game(game, CONTEXT, lambda s, c: True, sleep=no_sleep)
-
-    assert game.step_calls == []
-
-
 # -- resign -----------------------------------------------------------------
 
 
-def test_resign_calls_resign_not_step():
-    game = FakeGameSession().queue(make_state(), terminal_state(termination_reason="resignation"))
+def test_resign_calls_resign_not_play_action():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_resign(result_dict(termination_reason="resignation"))
+    )
     result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
 
     assert result.is_terminal is True
+    assert result.termination_reason == "resignation"
     assert game.resign_calls == 1
-    assert game.step_calls == []
+    assert game.play_action_calls == []
+
+
+def test_resign_still_works_when_choose_message_is_defined():
+    class Agent:
+        def choose_action(self, state, context):
+            return RESIGN
+
+        def choose_message(self, state, context):
+            return TERMINATE_MESSAGING
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_resign(result_dict(termination_reason="resignation"))
+    )
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.resign_calls == 1
 
 
 # -- messaging ----------------------------------------------------------
 
 
 def test_messaging_phase_never_invokes_choose_action():
-    # legal_actions non-empty on purpose: proves the runner defers to
-    # next_actions, not legal_actions, to decide whether to act.
     def choose_action(state, context):
         raise AssertionError("choose_action must not run during a messaging phase")
 
-    game = FakeGameSession().queue(
-        messaging_state(legal_actions=[0, 1]),
-        terminal_state(),
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "moving"})
+        .queue_result(result_dict())
     )
     result = run_game(game, CONTEXT, choose_action, sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.step_calls == []
+    assert game.play_action_calls == []
 
 
 def test_default_choose_message_auto_terminates_when_absent():
     # No choose_message defined anywhere (bare function choose_action) — the
-    # existing simple starter agent must still be able to finish a
-    # messaging-enabled match without any new code.
-    game = FakeGameSession().queue(
-        messaging_state(),
-        terminal_state(),
+    # existing simple starter agent must still finish a messaging-enabled
+    # match without any new code.
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "moving"})
+        .queue_result(result_dict())
     )
     result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.terminate_messaging_calls == 1
-    assert game.send_message_calls == []
+    assert game.send_message_calls == [
+        {"message_type": "terminate", "content": None, "recipients": None}
+    ]
 
 
 def test_default_choose_message_auto_terminates_for_object_without_it():
@@ -328,11 +491,16 @@ def test_default_choose_message_auto_terminates_for_object_without_it():
         def choose_action(self, state, context):
             return state.legal_actions[0]
 
-    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "moving"})
+        .queue_result(result_dict())
+    )
     result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.terminate_messaging_calls == 1
+    assert game.send_message_calls[0]["message_type"] == "terminate"
 
 
 def test_custom_choose_message_sends_chat():
@@ -343,12 +511,26 @@ def test_custom_choose_message_sends_chat():
         def choose_message(self, state, context):
             return SendMessage("let's cooperate", recipients=[1])
 
-    game = FakeGameSession().queue(messaging_state(), terminal_state())
-    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), messaging_state())
+        .queue_send_message({"accepted": True, "phase": "messaging"})
+    )
+    # Only run one iteration's worth by stopping after asserting the call —
+    # use a sleep spy that raises to short-circuit the (still-messaging) loop.
+    sleep_calls = []
 
-    assert result.is_terminal is True
-    assert game.send_message_calls == [("let's cooperate", [1])]
-    assert game.terminate_messaging_calls == 0
+    def stop_after_one(_seconds):
+        sleep_calls.append(_seconds)
+        raise SystemExit()
+
+    with pytest.raises(SystemExit):
+        run_game(game, CONTEXT, Agent(), sleep=stop_after_one)
+
+    assert game.send_message_calls == [
+        {"message_type": "chat", "content": "let's cooperate", "recipients": [1]}
+    ]
+    assert sleep_calls == [5.0]  # phase stayed "messaging" -> must not busy-poll
 
 
 def test_custom_choose_message_can_terminate_explicitly():
@@ -359,11 +541,16 @@ def test_custom_choose_message_can_terminate_explicitly():
         def choose_message(self, state, context):
             return TERMINATE_MESSAGING
 
-    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "moving"})
+        .queue_result(result_dict())
+    )
     result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.terminate_messaging_calls == 1
+    assert game.send_message_calls[0]["message_type"] == "terminate"
 
 
 def test_choose_message_resolved_off_original_object_not_bound_method():
@@ -382,15 +569,20 @@ def test_choose_message_resolved_off_original_object_not_bound_method():
             return TERMINATE_MESSAGING
 
     agent = Agent()
-    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "moving"})
+        .queue_result(result_dict())
+    )
     run_game(game, CONTEXT, agent, sleep=no_sleep)
 
     assert agent.messages_sent == 1
 
 
 def test_repeated_messaging_rounds_across_the_match():
-    # repeated_pd reopens messaging after every round (messaging_mode
-    # per_all_moves) — the loop must handle this more than once.
+    # repeated_pd reopens messaging after every round — the loop must
+    # handle this more than once.
     class Agent:
         def __init__(self):
             self.rounds_seen = 0
@@ -403,37 +595,37 @@ def test_repeated_messaging_rounds_across_the_match():
             return TERMINATE_MESSAGING
 
     agent = Agent()
-    game = FakeGameSession().queue(
-        messaging_state(),
-        make_state(),
-        messaging_state(),
-        terminal_state(),
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), make_mcp_state(), messaging_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_send_message(
+            {"accepted": True, "phase": "moving"}, {"accepted": True, "phase": "moving"}
+        )
+        .queue_result(result_dict())
     )
     result = run_game(game, CONTEXT, agent, sleep=no_sleep)
 
     assert result.is_terminal is True
     assert agent.rounds_seen == 2
-    assert game.terminate_messaging_calls == 2
-    assert game.step_calls == [0]
+    assert len(game.send_message_calls) == 2
+    assert len(game.play_action_calls) == 1
 
 
-def test_already_terminated_messaging_round_waits_without_calling_choose_message():
-    # This viewer already sent terminate this round: next_actions collapses
-    # to wait_for_opponent alone (no send_message/terminate_messaging) — the
-    # existing waiting branch handles this without any messaging-specific code.
-    def choose_message_never(state, context):
-        raise AssertionError("choose_message should not run while only waiting")
-
-    class Agent:
-        def choose_action(self, state, context):
-            return state.legal_actions[0]
-
-        def choose_message(self, state, context):
-            return choose_message_never(state, context)
-
+def test_messaging_still_open_after_terminate_sleeps_instead_of_busy_polling():
+    # This agent already terminated but the opponent hasn't — send_message's
+    # own idempotent no-op still reports phase="messaging". There is no
+    # REST-next_actions-style "just wait" signal for this in MCP, so the
+    # runner must sleep rather than hammer choose_message/send_message.
     sleep_calls = []
-    game = FakeGameSession().queue(waiting_state(messaging_enabled=True, phase="messaging"), terminal_state())
-    result = run_game(game, CONTEXT, Agent(), sleep=sleep_calls.append)
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "messaging"})
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=sleep_calls.append)
 
     assert result.is_terminal is True
     assert sleep_calls == [5.0]
@@ -447,13 +639,12 @@ def test_invalid_choose_message_return_value_rejected():
         def choose_message(self, state, context):
             return "just chat, no wrapper"
 
-    game = FakeGameSession().queue(messaging_state())
+    game = FakeMCPGameSession().queue_state(messaging_state())
 
     with pytest.raises(DecisionError):
         run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
     assert game.send_message_calls == []
-    assert game.terminate_messaging_calls == 0
 
 
 def test_choose_message_exception_chains_into_decision_error():
@@ -464,7 +655,7 @@ def test_choose_message_exception_chains_into_decision_error():
         def choose_message(self, state, context):
             raise ValueError("boom")
 
-    game = FakeGameSession().queue(messaging_state())
+    game = FakeMCPGameSession().queue_state(messaging_state())
 
     with pytest.raises(DecisionError) as exc_info:
         run_game(game, CONTEXT, Agent(), sleep=no_sleep)
@@ -480,9 +671,10 @@ def test_messaging_quota_exceeded_becomes_decision_error():
         def choose_message(self, state, context):
             return SendMessage("one too many")
 
-    game = FakeGameSession().queue(
-        messaging_state(),
-        PlatformError("quota", status_code=429, error_code="messages_quota_exceeded"),
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state())
+        .queue_send_message(MCPToolError("quota", status_code=None, error_code="MESSAGES_QUOTA_EXCEEDED"))
     )
 
     with pytest.raises(DecisionError):
@@ -497,39 +689,17 @@ def test_invalid_recipients_becomes_decision_error():
         def choose_message(self, state, context):
             return SendMessage("hi", recipients=[0, 1])
 
-    game = FakeGameSession().queue(
-        messaging_state(),
-        PlatformError("bad recipients", status_code=400, error_code="invalid_recipients"),
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state())
+        .queue_send_message(MCPToolError("bad recipients", status_code=None, error_code="INVALID_RECIPIENTS"))
     )
 
     with pytest.raises(DecisionError):
         run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
 
-def test_wrong_phase_race_refetches_instead_of_blaming_contestant():
-    calls = []
-
-    class Agent:
-        def choose_action(self, state, context):
-            return state.legal_actions[0]
-
-        def choose_message(self, state, context):
-            calls.append(state)
-            return TERMINATE_MESSAGING
-
-    game = FakeGameSession().queue(
-        messaging_state(),
-        PlatformError("phase moved on", status_code=409, error_code="wrong_phase"),
-        terminal_state(),
-    )
-    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
-
-    assert result.is_terminal is True
-    assert len(calls) == 1  # not re-invoked — this was never a contestant bug
-    assert game.state_calls == 2  # initial + the wrong_phase refetch
-
-
-def test_messaging_game_already_finished_treated_as_natural_completion():
+def test_messaging_runtime_unavailable_becomes_unsupported_game_flow_error():
     class Agent:
         def choose_action(self, state, context):
             return state.legal_actions[0]
@@ -537,20 +707,19 @@ def test_messaging_game_already_finished_treated_as_natural_completion():
         def choose_message(self, state, context):
             return TERMINATE_MESSAGING
 
-    game = FakeGameSession().queue(
-        messaging_state(),
-        PlatformError("done", status_code=409, error_code="game_already_finished"),
-        terminal_state(termination_reason="completed"),
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state())
+        .queue_send_message(MCPToolError("unsupported", status_code=None, error_code="RUNTIME_UNAVAILABLE"))
     )
-    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
-    assert result.is_terminal is True
-    assert result.termination_reason == "completed"
+    with pytest.raises(UnsupportedGameFlowError):
+        run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
 
 def test_non_messaging_game_never_touches_messaging_transport():
-    # Regression guard: a normal move-only game must never call
-    # send_message/terminate_messaging even if choose_message is defined.
+    # Regression guard: a normal move-only game must never call send_message
+    # even if choose_message is defined.
     class Agent:
         def choose_action(self, state, context):
             return state.legal_actions[0]
@@ -558,58 +727,149 @@ def test_non_messaging_game_never_touches_messaging_transport():
         def choose_message(self, state, context):
             raise AssertionError("choose_message should never run for this game")
 
-    game = FakeGameSession().queue(make_state(), terminal_state())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
     result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
     assert result.is_terminal is True
     assert game.send_message_calls == []
-    assert game.terminate_messaging_calls == 0
 
 
-def test_resign_still_works_when_choose_message_is_defined():
-    class Agent:
-        def choose_action(self, state, context):
-            return RESIGN
+def test_structured_game_phase_never_equals_messaging_marker():
+    # Pokemon-shaped: phase is "draft"/"teambuild"/"moving", never
+    # "messaging" — the generic runner treats any non-"messaging" phase the
+    # same way (enumerate legal actions, invoke choose_action), with zero
+    # adapter-specific code.
+    def choose_action(state, context):
+        raise AssertionError("choose_message-triggering path must not run")
 
-        def choose_message(self, state, context):
-            return TERMINATE_MESSAGING
-
-    game = FakeGameSession().queue(make_state(), terminal_state(termination_reason="resignation"))
-    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(phase="draft"), terminal_state())
+        .queue_legal_actions(structured_actions("draft_pick:card-7"))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert game.resign_calls == 1
+    assert game.play_action_calls == [{"action_id": "draft_pick:card-7", "action": None, "state_version": 0}]
 
 
-def test_terminate_messaging_only_flow_fails_as_unsupported():
-    # Real GameAPI always pairs send_message + terminate_messaging together
-    # (see next_actions.py) — this checks the runner's detection logic
-    # handles either member of the messaging set on its own, defensively.
-    game = FakeGameSession().queue(
-        make_state(
-            messaging_enabled=True,
-            phase="messaging",
-            legal_actions=[0, 1],
-            next_actions=[{"action": "terminate_messaging", "hint": "end round"}],
+# -- state_version ------------------------------------------------------
+
+
+def test_state_version_from_legal_actions_used_in_play_action_not_stale_get_state():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(state_version=1), terminal_state())
+        .queue_legal_actions(int_actions(0, 1, state_version=9))
+        .queue_play_action(play_action_result(state_version=10))
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert game.play_action_calls == [{"action_id": "0", "action": None, "state_version": 9}]
+
+
+def test_stale_state_refetches_and_does_not_replay_the_decision_blindly():
+    calls = []
+
+    def choose_action(state, context):
+        calls.append(state.state_version)
+        return state.legal_actions[0]
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), make_mcp_state(state_version=5), terminal_state())
+        .queue_legal_actions(int_actions(0, 1, state_version=0), int_actions(0, 1, state_version=5))
+        .queue_play_action(
+            MCPToolError("stale", status_code=None, error_code="STALE_STATE"), play_action_result()
         )
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, choose_action, sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert calls == [0, 5]  # re-decided against fresh state, not replayed
+    assert len(game.play_action_calls) == 2
+
+
+def test_not_your_turn_race_refetches_state_instead_of_blaming_contestant():
+    calls = []
+
+    def choose_action(state, context):
+        calls.append(state)
+        return state.legal_actions[0]
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(MCPToolError("stale read", status_code=None, error_code="NOT_YOUR_TURN"))
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, choose_action, sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert len(calls) == 1  # not re-invoked — this was never a contestant bug
+
+
+def test_game_already_complete_race_treated_as_natural_completion():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), terminal_state(termination_reason="completed"))
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(MCPToolError("done", status_code=None, error_code="GAME_ALREADY_COMPLETE"))
+        .queue_result(result_dict(termination_reason="completed"))
+    )
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert result.termination_reason == "completed"
+
+
+def test_action_runtime_unavailable_becomes_unsupported_game_flow_error():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(MCPToolError("unsupported", status_code=None, error_code="RUNTIME_UNAVAILABLE"))
     )
 
     with pytest.raises(UnsupportedGameFlowError):
-        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
-
-    assert game.step_calls == []
-    assert game.resign_calls == 0
+        run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
 
 
-def test_unknown_next_action_fails_clearly():
-    game = FakeGameSession().queue(
-        make_state(next_actions=[{"action": "some_future_action", "hint": "?"}])
+def test_invalid_action_error_becomes_decision_error():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(MCPToolError("bad action", status_code=None, error_code="INVALID_ACTION"))
     )
 
-    with pytest.raises(UnsupportedGameFlowError):
-        run_game(game, CONTEXT, lambda s, c: 0, sleep=no_sleep)
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
 
-    assert game.step_calls == []
+
+def test_unknown_error_code_propagates_as_mcp_tool_error():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(MCPToolError("weird", status_code=None, error_code="SOME_OTHER_ERROR"))
+    )
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert exc_info.value.error_code == "SOME_OTHER_ERROR"
 
 
 # -- errors -----------------------------------------------------------------
@@ -619,57 +879,13 @@ def test_contestant_exception_chains_into_decision_error():
     def choose_action(state, context):
         raise ValueError("boom")
 
-    game = FakeGameSession().queue(make_state())
+    game = FakeMCPGameSession().queue_state(make_mcp_state()).queue_legal_actions(int_actions(0, 1))
 
     with pytest.raises(DecisionError) as exc_info:
         run_game(game, CONTEXT, choose_action, sleep=no_sleep)
 
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert "boom" in str(exc_info.value.__cause__)
-
-
-def test_not_your_turn_refetches_state_instead_of_blaming_contestant():
-    calls = []
-
-    def choose_action(state, context):
-        calls.append(state)
-        return state.legal_actions[0]
-
-    game = FakeGameSession().queue(
-        make_state(),
-        PlatformError("stale", status_code=409, error_code="not_your_turn"),
-        terminal_state(),
-    )
-    result = run_game(game, CONTEXT, choose_action, sleep=no_sleep)
-
-    assert result.is_terminal is True
-    assert len(calls) == 1  # not re-invoked — this was never a contestant bug
-    assert game.step_calls == [0]
-    assert game.state_calls == 2  # initial + the not_your_turn refetch
-
-
-def test_game_already_finished_treated_as_natural_completion():
-    game = FakeGameSession().queue(
-        make_state(),
-        PlatformError("done", status_code=409, error_code="game_already_finished"),
-        terminal_state(termination_reason="completed"),
-    )
-    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
-
-    assert result.is_terminal is True
-    assert result.termination_reason == "completed"
-
-
-def test_unknown_platform_error_propagates():
-    game = FakeGameSession().queue(
-        make_state(),
-        PlatformError("weird", status_code=500, error_code="server_error"),
-    )
-
-    with pytest.raises(PlatformError) as exc_info:
-        run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
-
-    assert exc_info.value.error_code == "server_error"
 
 
 # -- context ------------------------------------------------------------
@@ -683,12 +899,15 @@ def test_context_is_passed_through_to_decision_fn():
         return state.legal_actions[0]
 
     context = DecisionContext(
-        session_id="session-42",
-        tournament_id="tournament-7",
-        game_type="tic_tac_toe",
-        agent_id="agent-99",
+        session_id="session-42", tournament_id="tournament-7", game_type="tic_tac_toe", agent_id="agent-99"
     )
-    game = FakeGameSession(session_id="session-42").queue(make_state(session_id="session-42"), terminal_state())
+    game = (
+        FakeMCPGameSession(session_id="session-42")
+        .queue_state(make_mcp_state(session_id="session-42"), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
     run_game(game, context, choose_action, sleep=no_sleep)
 
     assert len(received) == 1
@@ -707,10 +926,14 @@ def test_run_match_builds_context_from_match_and_delegates_to_game():
             "game_type": "tic_tac_toe",
         }
     )
-    fake_game = FakeGameSession(session_id="session-77").queue(
-        make_state(session_id="session-77"), terminal_state()
+    fake_game = (
+        FakeMCPGameSession(session_id="session-77")
+        .queue_state(make_mcp_state(session_id="session-77"), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
     )
-    match.game = lambda: fake_game  # bypass real resolution; tested elsewhere
+    match.game = lambda: fake_game  # bypass real resolution; tested in test_sessions.py
 
     received = []
 
@@ -725,3 +948,27 @@ def test_run_match_builds_context_from_match_and_delegates_to_game():
     assert received[0].tournament_id == "tournament-3"
     assert received[0].game_type == "tic_tac_toe"
     assert received[0].agent_id == "agent-1"
+
+
+def test_run_match_never_constructs_a_rest_gamesession():
+    # Proves no hidden REST fallback at the run_match level: match.game()
+    # (not match.rest_game()) is the only thing run_match calls.
+    match = Match.from_dict({"session_id": "s-1", "status": "in_progress", "game_type": "tic_tac_toe"})
+    fake_game = (
+        FakeMCPGameSession(session_id="s-1")
+        .queue_state(make_mcp_state(session_id="s-1"), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    game_calls = []
+    match.game = lambda: (game_calls.append(1) or fake_game)
+
+    def rest_game_should_not_be_called():
+        raise AssertionError("run_match must never call Match.rest_game()")
+
+    match.rest_game = rest_game_should_not_be_called
+
+    run_match(match, "agent-1", lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert game_calls == [1]

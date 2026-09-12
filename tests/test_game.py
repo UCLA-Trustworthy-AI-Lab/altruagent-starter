@@ -68,7 +68,10 @@ def test_fetch_game_state_successfully():
     state = session.state()
 
     assert state.session_id == SESSION_ID
-    assert state.legal_actions == [0, 1, 2]
+    # REST's legal_actions/legal_actions_str pair is synthesized into
+    # LegalAction entries, same shape MCP produces natively (see models.py).
+    assert [a.action_id for a in state.legal_actions] == ["0", "1", "2"]
+    assert [a.label for a in state.legal_actions] == ["a", "b", "c"]
     assert state.next_actions[0].action == "make_move"
 
 

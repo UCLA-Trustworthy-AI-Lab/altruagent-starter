@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .client import AltruAgentClient
     from .game import GameSession
+    from .mcp_game import MCPGameSession
 
 # The real GET /auth/agent/me and POST /auth/human/claim responses currently
 # include these (they're the agent's raw DB row — see
@@ -59,14 +60,17 @@ class Agent:
 
 @dataclass
 class NextAction:
-    """Machine-readable "what can I do right now" guidance from GameAPI.
+    """Machine-readable "what can I do right now" guidance — supplementary
+    context only, never the runner's primary turn-detection mechanism (see
+    ``altruagent.runner``, which drives off ``is_current_actor``/``phase``/
+    ``is_terminal`` instead).
 
-    Mirrors gameapi/src/gameapi/models/responses.py's ``NextAction`` exactly
-    (``action``, ``endpoint``, ``hint``, ``required_fields``). A single state
-    response can carry more than one of these — e.g. during a messaging round,
-    ``compute_next_actions`` (gameapi/src/gameapi/domain/next_actions.py)
-    returns both ``send_message`` and ``terminate_messaging`` together — so
-    this is never collapsed down to a single value.
+    REST shapes this as ``{"action", "endpoint", "hint", "required_fields"}``
+    (gameapi/src/gameapi/models/responses.py's ``NextAction``); MCP shapes it
+    as ``{"tool", "hint"}`` (gameapi/src/gameapi/mcp_server/catalog.py's
+    ``game_state_payload``/``play_action_payload``/etc.) — this model reads
+    either key name into the same ``action`` field so callers don't need to
+    know which transport produced it.
     """
 
     action: str
@@ -77,7 +81,7 @@ class NextAction:
     @classmethod
     def from_dict(cls, data: dict) -> "NextAction":
         return cls(
-            action=data.get("action", ""),
+            action=data.get("action") or data.get("tool", ""),
             hint=data.get("hint", ""),
             endpoint=data.get("endpoint"),
             required_fields=list(data.get("required_fields") or []),
@@ -128,22 +132,63 @@ class Message:
 
 
 @dataclass
-class GameState:
-    """A GameAPI game state, as returned by ``GET/POST /games/{session_id}...``.
+class LegalAction:
+    """One action a contestant may currently take, as MCP's ``get_legal_actions``
+    tool returns it (and as REST's ``legal_actions``/``legal_actions_str`` pair
+    is synthesized into, for uniformity — see ``GameState.from_dict`` below).
 
-    Covers the fields needed to play a single match generically (see
-    gameapi/src/gameapi/models/responses.py's ``GameStateResponse``). Richer
-    per-game fields (repeated_pd's round history, Avalon's ``avalon_*``
-    fields, Pokémon's extras) are not individually modeled — they're always
-    available via ``raw``, which holds the complete, unmodified server
-    response. Messaging fields *are* modeled (``new_messages``,
-    ``terminated_messaging``, ``messaging_mode``), since a contestant needs
-    them to act during a MESSAGING phase (see ``altruagent.runner``'s
-    ``choose_message`` support). Two messaging config knobs the server
-    computes but never returns in this response at all —
-    ``word_limit_per_message`` and ``max_messages_per_phase_per_agent`` — are
-    not modeled here because there is nothing to parse; a contestant that
-    needs them must track its own usage.
+    ``action_id`` is always a string and is the only thing ``play_action``
+    needs back — for OpenSpiel-family games it's a stringified int (e.g.
+    ``"0"``); for structured RuntimeAdapter games (e.g. Pokémon) it can be
+    anything the adapter defines (``"move:0"``, ``"switch:1"``,
+    ``"draft_pick:<card_id>"``, ``"submit_team"``). ``input`` is the adapter's
+    own structured payload for this action (empty ``{}`` for a REST-synthesized
+    entry, since REST has nothing equivalent) — for constructive actions like
+    Pokémon's ``submit_team`` it's a template the server expects a contestant
+    to build a real value from, not something to submit verbatim (see
+    ``altruagent.runner``'s dict-decision escape hatch).
+    """
+
+    action_id: str
+    label: str | None
+    input: dict
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LegalAction":
+        return cls(
+            action_id=str(data.get("action_id", "")),
+            label=data.get("label"),
+            input=dict(data.get("input") or {}),
+            raw=data,
+        )
+
+
+@dataclass
+class GameState:
+    """A game state, normalized across both the REST GameAPI
+    (``GET/POST /games/{session_id}...`` — see ``GameSession``, kept only as
+    a lower-level debug/manual-testing tool) and MCP's gameplay tools (see
+    ``MCPGameSession``, what ``python -m agent`` actually plays through).
+
+    ``legal_actions`` is always ``list[LegalAction]`` regardless of which
+    transport produced it: MCP's ``get_legal_actions`` already returns that
+    shape; REST's separate ``legal_actions``/``legal_actions_str`` int/str
+    lists are zipped into synthetic ``LegalAction`` entries (``input={}``) so
+    contestant code never has to care which transport it's talking to. The
+    universal pattern ``return state.legal_actions[0]`` works unchanged either
+    way.
+
+    ``state_version``/``is_current_actor`` are MCP concepts with no REST
+    equivalent (default to ``0``/``None`` when parsed from a REST response,
+    since REST has no optimistic-concurrency counter and infers turn-taking
+    from ``current_player`` instead — preserved on this model only for the
+    debug path, not used by the MCP-driven runner).
+
+    Richer per-game fields (repeated_pd's round history, Avalon's
+    ``avalon_*`` fields, Pokémon's draft/roster detail) are not individually
+    modeled — always available via ``raw``, the complete unmodified response
+    for whichever tool/endpoint produced this state.
     """
 
     session_id: str
@@ -151,9 +196,10 @@ class GameState:
     status: str
     observation: str
     current_player: PlayerRef | None
-    legal_actions: list[int]
-    legal_actions_str: list[str]
+    legal_actions: list[LegalAction]
     is_terminal: bool
+    is_current_actor: bool | None
+    state_version: int
     returns: dict[str, float] | None
     move_count: int
     termination_reason: str | None
@@ -167,6 +213,10 @@ class GameState:
 
     @classmethod
     def from_dict(cls, data: dict) -> "GameState":
+        """Parse a REST ``GameStateResponse`` (``GameSession`` — the debug
+        path). Synthesizes ``LegalAction`` entries from the separate
+        ``legal_actions``/``legal_actions_str`` int/str lists REST returns.
+        """
         current_player_data = data.get("current_player")
         current_player = (
             PlayerRef(name=current_player_data["name"])
@@ -179,15 +229,27 @@ class GameState:
         new_messages = [
             Message.from_dict(m) for m in (data.get("new_messages") or [])
         ]
+        raw_actions = list(data.get("legal_actions") or [])
+        raw_labels = list(data.get("legal_actions_str") or [])
+        legal_actions = [
+            LegalAction(
+                action_id=str(action),
+                label=raw_labels[i] if i < len(raw_labels) else None,
+                input={},
+                raw={"action": action, "label": raw_labels[i] if i < len(raw_labels) else None},
+            )
+            for i, action in enumerate(raw_actions)
+        ]
         return cls(
             session_id=data.get("session_id", ""),
             game_name=data.get("game_name", ""),
             status=data.get("status", "unknown"),
             observation=data.get("observation", ""),
             current_player=current_player,
-            legal_actions=list(data.get("legal_actions") or []),
-            legal_actions_str=list(data.get("legal_actions_str") or []),
+            legal_actions=legal_actions,
             is_terminal=bool(data.get("is_terminal", False)),
+            is_current_actor=None,
+            state_version=0,
             returns=data.get("returns"),
             move_count=data.get("move_count", 0),
             termination_reason=data.get("termination_reason"),
@@ -198,6 +260,74 @@ class GameState:
             terminated_messaging=list(data.get("terminated_messaging") or []),
             messaging_mode=data.get("messaging_mode", "per_move"),
             raw=data,
+        )
+
+    @classmethod
+    def from_mcp_state(
+        cls,
+        state: dict,
+        *,
+        legal_actions: list[dict] | None = None,
+        result: dict | None = None,
+    ) -> "GameState":
+        """Parse an MCP ``get_game_state`` result (the production path —
+        see ``MCPGameSession``), optionally merging in a ``get_legal_actions``
+        result (only fetched by the runner when it's actually this agent's
+        turn — see ``altruagent.runner``) and/or a ``get_result`` result
+        (only fetched once ``is_terminal`` — MCP's ``get_game_state`` doesn't
+        embed ``returns``/``termination_reason`` the way REST's does).
+
+        Confirmed field names directly against
+        ``gameapi/src/gameapi/runtime_adapters/{openspiel_adapter,pokemon_adapter}.py``:
+        both adapters return the same generic keys (``session_id``,
+        ``state_version``, ``observation``, ``phase``, ``is_terminal``,
+        ``is_current_actor``, ``status``) regardless of which one is behind a
+        given session — this is what lets one runner drive both without any
+        per-game branching.
+        """
+        current_actor = state.get("current_actor")
+        current_player = (
+            PlayerRef(name=str(current_actor.get("agent_id")))
+            if isinstance(current_actor, dict) and current_actor.get("agent_id")
+            else None
+        )
+        actions = list((legal_actions or {}).get("actions") or [])
+        parsed_actions = [LegalAction.from_dict(a) for a in actions]
+        new_messages = [
+            Message.from_dict(m) for m in (state.get("new_messages") or [])
+        ]
+        result = result or {}
+        # `result` (get_result/resign) is authoritative for is_terminal/status
+        # when present — it's fetched precisely because `state` (an earlier
+        # get_game_state, or the pre-resign state) may be stale on exactly
+        # these two fields (e.g. built right before resigning, when the
+        # match wasn't terminal yet).
+        is_terminal = bool(result.get("is_terminal", state.get("is_terminal", False)))
+        status = result.get("status", state.get("status", "unknown"))
+        return cls(
+            session_id=state.get("session_id", ""),
+            game_name=state.get("game_type", ""),
+            status=status,
+            observation=str(state.get("observation", "")),
+            current_player=current_player,
+            legal_actions=parsed_actions,
+            is_terminal=is_terminal,
+            is_current_actor=state.get("is_current_actor"),
+            state_version=int(
+                (legal_actions or {}).get("state_version", state.get("state_version", 0))
+            ),
+            returns=result.get("returns"),
+            move_count=int(state.get("state_version", 0)),
+            termination_reason=result.get("termination_reason"),
+            messaging_enabled=bool(state.get("messaging_enabled", False)),
+            phase=state.get("phase", "moving"),
+            next_actions=[
+                NextAction.from_dict(a) for a in (state.get("next_actions") or [])
+            ],
+            new_messages=new_messages,
+            terminated_messaging=list(state.get("terminated_messaging") or []),
+            messaging_mode=state.get("messaging_mode", "per_move"),
+            raw=state,
         )
 
 
@@ -243,9 +373,11 @@ class Match:
         match._client = client
         return match
 
-    def game(self) -> "GameSession":
-        """Return a playable ``GameSession`` for this match, resolving
-        ``game_server_url`` lazily if it isn't already known.
+    def _resolve_game_server_url(self) -> str:
+        """Shared lazy-resolution logic for both ``game()`` and
+        ``rest_game()`` — MCP is mounted on the same host REST's
+        ``game_server_url`` already points at, so one resolution serves both
+        transports; only the path suffix differs (see each method below).
 
         - If ``game_server_url`` was already resolved (cached from a prior
           call on this same ``Match`` instance), this makes no network
@@ -266,7 +398,7 @@ class Match:
             )
 
         if self.game_server_url:
-            return self._client.game(session_id=self.session_id, game_server_url=self.game_server_url)
+            return self.game_server_url
 
         if self.status != "in_progress":
             raise ValueError(
@@ -288,6 +420,26 @@ class Match:
             )
 
         self.game_server_url = game_server_url
+        return game_server_url
+
+    def game(self) -> "MCPGameSession":
+        """Return a playable ``MCPGameSession`` for this match — the
+        production gameplay path ``run_match``/``python -m agent`` use.
+        Resolves ``game_server_url`` lazily (see ``_resolve_game_server_url``)
+        — MCP is mounted on the same host REST's ``game_server_url`` already
+        resolves to, so no new discovery step is needed; only the path
+        suffix (``/mcp`` vs ``/games/{id}``) differs.
+        """
+        game_server_url = self._resolve_game_server_url()
+        return self._client.mcp_game(session_id=self.session_id, game_server_url=game_server_url)
+
+    def rest_game(self) -> "GameSession":
+        """Return a playable REST ``GameSession`` for this match — the
+        lower-level debug/manual-testing path (see ``scripts/check_game.py``),
+        not used by ``run_match``/``python -m agent``. Same lazy resolution
+        as ``game()``.
+        """
+        game_server_url = self._resolve_game_server_url()
         return self._client.game(session_id=self.session_id, game_server_url=game_server_url)
 
 

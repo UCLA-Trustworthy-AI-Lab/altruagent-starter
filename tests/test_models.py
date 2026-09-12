@@ -8,6 +8,7 @@ from altruagent.models import (
     Agent,
     AgentSessions,
     GameState,
+    LegalAction,
     Match,
     Message,
     NextAction,
@@ -102,12 +103,17 @@ def test_game_state_parses_core_fields():
 
 
 def test_game_state_legal_actions_parsing():
+    # REST's separate legal_actions/legal_actions_str int/str lists are
+    # synthesized into LegalAction entries — the same shape MCP's
+    # get_legal_actions returns natively (see from_mcp_state below) — so
+    # contestant code never has to care which transport produced a GameState.
     state = GameState.from_dict(
         _base_game_state_payload(legal_actions=[0, 4, 8], legal_actions_str=["a", "b", "c"])
     )
 
-    assert state.legal_actions == [0, 4, 8]
-    assert state.legal_actions_str == ["a", "b", "c"]
+    assert [a.action_id for a in state.legal_actions] == ["0", "4", "8"]
+    assert [a.label for a in state.legal_actions] == ["a", "b", "c"]
+    assert all(isinstance(a, LegalAction) for a in state.legal_actions)
 
 
 def test_game_state_current_player_none_when_not_your_turn():
@@ -324,6 +330,148 @@ def test_game_state_terminal_with_returns():
     assert state.returns == {"Alice": 1.0, "Bob": -1.0}
     assert state.termination_reason == "completed"
     assert [a.action for a in state.next_actions] == ["game_over"]
+
+
+# -- LegalAction / GameState.from_mcp_state (Milestone 6: MCP-first) -------
+
+
+def test_legal_action_from_dict_openspiel_shape():
+    action = LegalAction.from_dict(
+        {"action_id": "0", "label": "cooperate", "input": {"session_id": "s-1", "action_id": "0"}}
+    )
+
+    assert action.action_id == "0"
+    assert action.label == "cooperate"
+    assert action.input == {"session_id": "s-1", "action_id": "0"}
+
+
+def test_legal_action_from_dict_structured_shape():
+    # Pokemon-shaped: action_id is not int-coercible, input carries a richer
+    # structured payload than OpenSpiel-family games ever need.
+    action = LegalAction.from_dict(
+        {
+            "action_id": "move:0",
+            "label": "Use Thunderbolt",
+            "input": {"type": "move", "slot": 0, "move_id": "thunderbolt", "base_power": 90},
+        }
+    )
+
+    assert action.action_id == "move:0"
+    assert action.input["type"] == "move"
+    assert action.input["base_power"] == 90
+
+
+def _mcp_state_payload(**overrides) -> dict:
+    payload = {
+        "session_id": "session-1",
+        "game_type": "tic_tac_toe",
+        "runtime_adapter": "openspiel",
+        "status": "in_progress",
+        "state_version": 3,
+        "observation": "...",
+        "phase": "moving",
+        "messaging_enabled": False,
+        "terminated_messaging": [],
+        "new_messages": [],
+        "current_actor": {"agent_id": "agent-1", "position": 0},
+        "is_current_actor": True,
+        "is_terminal": False,
+        "legal_action_count": 3,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_game_state_from_mcp_state_parses_generic_fields():
+    state = GameState.from_mcp_state(_mcp_state_payload())
+
+    assert state.session_id == "session-1"
+    assert state.game_name == "tic_tac_toe"
+    assert state.state_version == 3
+    assert state.phase == "moving"
+    assert state.is_current_actor is True
+    assert state.is_terminal is False
+    assert state.current_player.name == "agent-1"
+    # get_game_state alone carries no legal_actions (a separate tool) —
+    # confirmed empty until the runner merges in a get_legal_actions result.
+    assert state.legal_actions == []
+
+
+def test_game_state_from_mcp_state_merges_legal_actions_and_its_state_version():
+    legal_actions = {
+        "session_id": "session-1",
+        "state_version": 4,  # freshest — the one that should win
+        "actions": [
+            {"action_id": "0", "label": "a", "input": {}},
+            {"action_id": "1", "label": "b", "input": {}},
+        ],
+    }
+    state = GameState.from_mcp_state(_mcp_state_payload(state_version=3), legal_actions=legal_actions)
+
+    assert state.state_version == 4
+    assert [a.action_id for a in state.legal_actions] == ["0", "1"]
+
+
+def test_game_state_from_mcp_state_merges_result_for_terminal_fields():
+    # get_game_state/play_action never carry returns/termination_reason —
+    # confirmed against openspiel_adapter.py; only get_result/resign do.
+    result = {
+        "session_id": "session-1",
+        "is_terminal": True,
+        "status": "completed",
+        "returns": {"Alice": 1.0, "Bob": -1.0},
+        "your_return": 1.0,
+        "termination_reason": "completed",
+    }
+    state = GameState.from_mcp_state(
+        _mcp_state_payload(is_terminal=True, is_current_actor=False), result=result
+    )
+
+    assert state.is_terminal is True
+    assert state.returns == {"Alice": 1.0, "Bob": -1.0}
+    assert state.termination_reason == "completed"
+
+
+def test_game_state_from_mcp_state_pokemon_shaped_never_reports_messaging():
+    # Confirmed against pokemon_adapter.py: phases are draft/draft_complete/
+    # teambuild/moving, never "messaging" — messaging_enabled is always False.
+    state = GameState.from_mcp_state(
+        _mcp_state_payload(
+            game_type="pokemon_gen9ou_draft",
+            phase="draft",
+            messaging_enabled=False,
+            current_actor=None,
+            is_current_actor=True,
+        )
+    )
+
+    assert state.phase == "draft"
+    assert state.messaging_enabled is False
+
+
+def test_game_state_from_mcp_state_new_messages_parsed_as_message_objects():
+    state = GameState.from_mcp_state(
+        _mcp_state_payload(
+            phase="messaging",
+            messaging_enabled=True,
+            new_messages=[
+                {
+                    "message_id": "session-1:0",
+                    "index": 0,
+                    "sender": 1,
+                    "recipients": [],
+                    "content": "hello",
+                    "type": "chat",
+                    "sent_at": "2026-01-01T00:00:00Z",
+                    "move_index": 2,
+                }
+            ],
+        )
+    )
+
+    assert len(state.new_messages) == 1
+    assert state.new_messages[0].content == "hello"
+    assert state.new_messages[0].sender == 1
 
 
 # -- Tournament / TournamentViewer -----------------------------------------

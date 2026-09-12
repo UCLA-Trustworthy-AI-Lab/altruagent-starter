@@ -3,8 +3,10 @@
 No base class, no decorator, no registration — just two functions.
 `choose_action` is called only when a real move is actually being requested
 (the runtime already checked that it's your turn); return one action from
-`state.legal_actions`. If you'd rather concede a match, return
-`altruagent.RESIGN` instead of an int.
+`state.legal_actions` (a list of `LegalAction`s — this same pattern works
+for every game on the platform, whether its actions are simple integers or
+richer structured ones). If you'd rather concede a match, return
+`altruagent.RESIGN` instead.
 
 `create_agent()` is the one thing the runtime looks for at startup — it's
 called exactly once per match (in that match's own independent process),
@@ -38,10 +40,10 @@ actually negotiate, add an optional `choose_message(state, context)` method
 next to `choose_action` — see examples/messaging_agent.py.
 """
 
-from altruagent import DecisionContext, GameState
+from altruagent import DecisionContext, GameState, LegalAction
 
 
-def choose_action(state: GameState, context: DecisionContext) -> int:
+def choose_action(state: GameState, context: DecisionContext) -> LegalAction:
     return state.legal_actions[0]
 
 

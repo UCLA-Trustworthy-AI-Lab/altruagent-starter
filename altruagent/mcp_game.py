@@ -1,0 +1,139 @@
+"""MCPGameSession — a handle to one already-known match, played through
+Agent_ACP's MCP gameplay tools rather than the REST GameAPI.
+
+This is the production gameplay transport: ``run_match``/``python -m agent``
+always play through this class (see ``altruagent.runner``). ``GameSession``
+(``game.py``, REST) remains available only as a lower-level debug/manual-
+testing tool (``scripts/check_game.py``) — kept unmodified, not used here.
+
+Method names mirror Agent_ACP's MCP tool names directly (``get_game_state``,
+``get_legal_actions``, ``play_action``, ``send_message``, ``get_messages``,
+``resign``, ``get_result`` — gameapi/src/gameapi/mcp_server/server.py) rather
+than REST's ``state()``/``step()``/``resign()`` shape, since the whole point
+is that this class is a thin, honest transport — all orchestration (when to
+call what, how to interpret the result) lives in ``altruagent.runner``, not
+here.
+
+Auth/retry/error-parsing all go through the exact same
+``AltruAgentClient.request()`` this session's REST counterpart uses (via
+``altruagent.mcp_transport.call_tool``) — there is only one HTTP/auth stack
+in this SDK, not one per transport.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from .errors import ConfigurationError
+from .game import _normalize_game_server_url
+from .mcp_transport import call_tool
+from .models import GameState
+
+if TYPE_CHECKING:
+    from .client import AltruAgentClient
+
+
+class MCPGameSession:
+    """One concrete match, identified by ``session_id`` + ``game_server_url``,
+    played through MCP. Construct via ``AltruAgentClient.mcp_game(...)`` or
+    ``Match.game()`` rather than directly.
+    """
+
+    def __init__(self, client: "AltruAgentClient", *, session_id: str, game_server_url: str) -> None:
+        if not session_id:
+            raise ConfigurationError("session_id must not be empty.")
+        self._client = client
+        self.session_id = session_id
+        # Same host REST's game_server_url already resolves to (confirmed:
+        # Agent_ACP mounts both REST routers and the MCP server on one
+        # FastAPI app, gameapi/src/gameapi/app.py) — only the path differs.
+        self.game_server_url = _normalize_game_server_url(game_server_url)
+
+    def _mcp_url(self) -> str:
+        return f"{self.game_server_url}/mcp"
+
+    def _call(self, tool: str, arguments: dict) -> dict:
+        return call_tool(self._client, self._mcp_url(), tool, arguments)
+
+    def get_state(self) -> GameState:
+        """``get_game_state`` — this agent's current view of the match.
+        Does not include ``legal_actions`` (a separate, only-called-when-
+        needed tool — see ``get_legal_actions``) or ``returns``/
+        ``termination_reason`` (see ``get_result``, only relevant once
+        terminal) — both confirmed absent from this tool's response shape.
+        """
+        data = self._call("get_game_state", {"session_id": self.session_id})
+        return GameState.from_mcp_state(data)
+
+    def get_legal_actions(self) -> dict:
+        """``get_legal_actions`` — the actions available right now, plus the
+        ``state_version`` to use for the next ``play_action``/``send_message``
+        call. Returns the raw dict (``{"session_id","state_version","actions"}``)
+        rather than a ``GameState``, since the runner merges this into a
+        ``GameState`` it already has (see ``GameState.from_mcp_state``).
+        """
+        return self._call("get_legal_actions", {"session_id": self.session_id})
+
+    def play_action(self, *, action_id: str | None = None, action: dict | None = None, state_version: int) -> dict:
+        """``play_action`` — submit a move. Exactly one of ``action_id``
+        (matched from ``get_legal_actions``) or ``action`` (a structured
+        payload for constructive actions, e.g. Pokémon's ``submit_team``)
+        should be given — mirrors the tool's own ``action_id``/``action``
+        precedence (``action`` wins if both are given, per
+        gameapi/src/gameapi/mcp_server/server.py's ``play_action``).
+
+        Returns the raw ``{"accepted","session_id","state_version","status"}``
+        dict, not a ``GameState`` — confirmed narrower than ``get_state()``'s
+        response (no ``is_current_actor``/``phase``/``observation``), so the
+        runner always re-fetches ``get_state()`` after this rather than
+        treating the result as a drop-in replacement.
+        """
+        arguments: dict = {"session_id": self.session_id, "state_version": state_version}
+        if action is not None:
+            arguments["action"] = action
+        if action_id is not None:
+            arguments["action_id"] = action_id
+        return self._call("play_action", arguments)
+
+    def send_message(self, *, message_type: str, content: str | None = None, recipients: list[int] | None = None) -> dict:
+        """``send_message`` — send a chat message (``message_type="chat"``)
+        or vote to end the messaging round (``message_type="terminate"``).
+
+        Deliberately takes no ``state_version`` — confirmed against
+        ``gameapi/src/gameapi/runtime_adapters/openspiel_adapter.py``'s
+        ``send_message``: unlike ``apply_action``, it never checks
+        ``state_version`` for staleness, only ``session.phase`` (raising
+        ``WrongPhaseError`` -> MCP's ``STALE_STATE``-adjacent race handling
+        in the runner covers this the same way).
+        """
+        arguments = {
+            "session_id": self.session_id,
+            "message_type": message_type,
+            "content": content,
+            "recipients": recipients,
+        }
+        return self._call("send_message", arguments)
+
+    def get_messages(self, *, since: int = -1) -> dict:
+        """``get_messages`` — full/incremental transcript. Not needed for the
+        normal ``choose_message`` flow (``get_state()``'s own ``new_messages``
+        already carries what's arrived since the last phase flip — confirmed
+        directly in ``openspiel_adapter.get_state``); available for a
+        contestant that wants more history than that.
+        """
+        return self._call("get_messages", {"session_id": self.session_id, "since": since})
+
+    def resign(self) -> dict:
+        """``resign`` — concede the game. Returns the same terminal-result
+        shape as ``get_result()`` (confirmed identical dict literal in
+        ``openspiel_adapter.py``), so no follow-up call is needed.
+        """
+        return self._call("resign", {"session_id": self.session_id})
+
+    def get_result(self) -> dict:
+        """``get_result`` — final outcome. Only meaningful once ``is_terminal``
+        — ``get_state()``/``play_action()`` don't carry ``returns``/
+        ``termination_reason`` themselves, confirmed narrower than REST's
+        single-response terminal state.
+        """
+        return self._call("get_result", {"session_id": self.session_id})

@@ -276,67 +276,81 @@ def test_two_worker_invocations_get_distinct_contestant_instances():
 # -- messaging survives the worker's object-passing path (Milestone 5) ------
 
 
-def messaging_state(**overrides) -> GameState:
+def mcp_messaging_state_payload(**overrides) -> dict:
     payload = {
         "session_id": "s-1",
-        "game_name": "repeated_pd",
-        "status": "active",
+        "game_type": "repeated_pd",
+        "status": "in_progress",
+        "state_version": 0,
         "observation": "...",
-        "current_player": {"name": "Me"},
-        "legal_actions": [0, 1],
-        "legal_actions_str": ["cooperate", "defect"],
-        "is_terminal": False,
-        "returns": None,
-        "move_count": 0,
-        "termination_reason": None,
-        "messaging_enabled": True,
         "phase": "messaging",
-        "next_actions": [
-            {"action": "send_message", "hint": "chat or terminate", "required_fields": ["type"]},
-            {"action": "terminate_messaging", "hint": "end round", "required_fields": ["type"]},
-        ],
+        "messaging_enabled": True,
+        "terminated_messaging": [],
+        "new_messages": [],
+        "current_actor": {"agent_id": "agent-1", "position": 0},
+        "is_current_actor": True,
+        "is_terminal": False,
     }
     payload.update(overrides)
-    return GameState.from_dict(payload)
+    return payload
 
 
-class FakeGameSessionForWorker:
-    """Minimal GameSession double so this test can exercise the REAL
+class FakeMCPGameSessionForWorker:
+    """Minimal MCPGameSession double so this test can exercise the REAL
     ``run_match``/``run_game`` (not a faked ``run_match_fn``) — proving a
     contestant object's ``choose_message`` survives run_worker's
-    unmodified object-passing all the way through a real messaging round.
+    unmodified object-passing all the way through a real messaging round,
+    through the MCP transport specifically (never REST).
     """
 
     def __init__(self) -> None:
-        self._queue = [messaging_state(), terminal_state()]
+        self._queue = [
+            mcp_messaging_state_payload(),
+            mcp_messaging_state_payload(phase="moving", status="completed", is_terminal=True),
+        ]
         self.terminate_messaging_calls = 0
 
-    def state(self) -> GameState:
-        return self._queue[0]
+    def get_state(self) -> GameState:
+        return GameState.from_mcp_state(self._queue[0])
 
-    def step(self, action: int) -> GameState:
-        raise AssertionError("step should not be called during a messaging round")
+    def get_legal_actions(self) -> dict:
+        raise AssertionError("get_legal_actions should not be called during a messaging round")
 
-    def resign(self) -> GameState:
-        raise AssertionError("resign not exercised by this test")
+    def play_action(self, *, action_id=None, action=None, state_version):
+        raise AssertionError("play_action should not be called during a messaging round")
 
-    def send_message(self, content: str, recipients=None) -> GameState:
-        raise AssertionError("this test's agent always terminates, never chats")
-
-    def terminate_messaging(self) -> GameState:
+    def send_message(self, *, message_type: str, content=None, recipients=None) -> dict:
+        if message_type != "terminate":
+            raise AssertionError("this test's agent always terminates, never chats")
         self.terminate_messaging_calls += 1
         self._queue.pop(0)
-        return self._queue[0]
+        return {"accepted": True, "session_id": "s-1", "phase": self._queue[0]["phase"]}
+
+    def get_messages(self, *, since: int = -1) -> dict:
+        raise AssertionError("not exercised by this test")
+
+    def resign(self) -> dict:
+        raise AssertionError("resign not exercised by this test")
+
+    def get_result(self) -> dict:
+        return {
+            "session_id": "s-1",
+            "is_terminal": True,
+            "status": "completed",
+            "returns": {"Me": 0.0, "Them": 0.0},
+            "your_return": 0.0,
+            "termination_reason": "completed",
+        }
 
 
 class FakeMatchForWorker:
-    def __init__(self, game_session: FakeGameSessionForWorker) -> None:
+    def __init__(self, game_session: FakeMCPGameSessionForWorker) -> None:
         self.session_id = "s-1"
         self.tournament_id = None
         self.game_type = "repeated_pd"
         self._game_session = game_session
 
-    def game(self) -> FakeGameSessionForWorker:
+    def game(self) -> FakeMCPGameSessionForWorker:
         return self._game_session
 
 
@@ -353,7 +367,7 @@ def test_run_worker_supports_choose_message_through_real_run_match():
             return TERMINATE_MESSAGING
 
     agent = NegotiatingAgent()
-    fake_game = FakeGameSessionForWorker()
+    fake_game = FakeMCPGameSessionForWorker()
 
     exit_code = run_worker(
         WORKER_INPUT,

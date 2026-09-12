@@ -35,6 +35,7 @@ from .models import Agent, AgentSessions, Tournament
 
 if TYPE_CHECKING:
     from .game import GameSession
+    from .mcp_game import MCPGameSession
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
@@ -125,6 +126,20 @@ class AltruAgentClient:
                 status_code=response.status_code,
             )
         self._access_token = token
+
+    def _current_access_token(self, *, force_relogin: bool = False) -> str:
+        """Return this client's current JWT — the single source of auth
+        state for both REST (``request()``, above) and MCP traffic
+        (``altruagent.mcp_transport.call_tool``, which cannot reuse
+        ``request()`` directly since the official ``mcp`` SDK owns its own
+        HTTP transport). Logs in if there's no token yet, or if
+        ``force_relogin=True`` — the MCP transport's own one-retry-after-401
+        recovery, mirroring ``request()``'s exactly, so there is still only
+        ever one login/retry policy, not a second auth system.
+        """
+        if self._access_token is None or force_relogin:
+            self.login()
+        return self._access_token
 
     def me(self) -> Agent:
         """``GET /auth/agent/me`` — the authenticated agent's profile."""
@@ -229,6 +244,17 @@ class AltruAgentClient:
         from .game import GameSession  # local import: game.py imports this module
 
         return GameSession(self, session_id=session_id, game_server_url=game_server_url)
+
+    def mcp_game(self, session_id: str, game_server_url: str) -> "MCPGameSession":
+        """Open a handle to one already-known match, played through MCP —
+        the production gameplay transport (see ``altruagent.mcp_game``).
+        ``Match.game()`` calls this for you with a lazily-resolved
+        ``game_server_url``; call this directly only if you already have
+        both values some other way.
+        """
+        from .mcp_game import MCPGameSession  # local import: mirrors .game() above
+
+        return MCPGameSession(self, session_id=session_id, game_server_url=game_server_url)
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         """Send an authenticated request using this agent's JWT.
