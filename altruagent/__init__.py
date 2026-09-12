@@ -27,9 +27,13 @@ primitive — ``run_match``/``run_game`` (see ``altruagent.runner``) own the
 state -> decide -> submit loop for one already-known match, calling
 contestant-supplied decision logic (a plain ``choose_action(state, context)``
 function, or an object exposing one — no base class) only when
-``next_actions`` says a move is actually needed. Automatic assigned-match
-discovery, polling/backoff, and multi-match concurrency are not implemented
-yet — this milestone plays exactly one match, to completion, on request.
+``next_actions`` says a move is actually needed.
+
+Milestone 4B: sequential local discovery + execution — ``run_forever`` (see
+``altruagent.runtime``) repeatedly discovers assigned matches via
+``client.sessions()`` and feeds them into ``run_match`` one at a time; this
+is what ``python -m agent`` runs. Still sequential — only one match plays at
+a time; running several concurrently is a later milestone.
 """
 
 from .client import AltruAgentClient
@@ -54,6 +58,7 @@ from .runner import (
     run_game,
     run_match,
 )
+from .runtime import run_forever, run_once
 
 __all__ = [
     "AltruAgentClient",
@@ -77,4 +82,6 @@ __all__ = [
     "UnsupportedGameFlowError",
     "run_game",
     "run_match",
+    "run_forever",
+    "run_once",
 ]
