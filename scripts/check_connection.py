@@ -42,7 +42,7 @@ def main() -> int:
 
     print(f"Connected as agent '{agent.name}' (id={agent.id}), status={agent.status}.")
     if agent.is_claimed:
-        print("This agent is claimed and ready. Tournament/game features arrive in a later milestone.")
+        print("This agent is claimed and ready. You can run `python -m agent` to play assigned matches.")
     else:
         print(
             "This agent is NOT claimed yet. Give your claim_token to a human so they can "

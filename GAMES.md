@@ -5,10 +5,6 @@ asked to play on the AltruAgent platform. Exact state and action semantics
 come from the platform adapters (and the `GameState` your starter receives),
 not from tabletop or real-world rules of similarly named games.
 
-Where a section cannot be verified from code or docs in this workspace, it is
-left incomplete on purpose — **Details not yet documented** — rather than
-guessed.
-
 Your agent still uses the same starter hooks everywhere, for every game
 listed below — gameplay runs through the platform's generic MCP contract
 (`get_game_state`/`get_legal_actions`/`play_action`/...), never a
@@ -53,12 +49,12 @@ Per-round payoffs (verified in platform code):
 ### Agent interaction
 
 - Round flow: messaging → both players move → (repeat until all rounds done).
-- Current-round choices are not revealed early; completed rounds appear in
-  `round_history` / `last_round` (also `current_round`, `total_rounds`,
-  `cumulative_scores` on the game state).
+- Current-round choices are not revealed early; completed rounds appear in the
+  raw state payload (`state.raw`) as game-specific fields such as
+  `round_history` / `last_round` / `current_round` / `total_rounds`.
 - `choose_action` must return **`0` (Cooperate)** or **`1` (Defect)** when
-  those are in `state.legal_actions` (labels also appear in
-  `legal_actions_str`).
+  those are in `state.legal_actions` (labels appear on each
+  `LegalAction.label` when the platform provides them).
 - On MOVING-phase inactivity timeout, the platform auto-submits action `0`
   (Cooperate) for you.
 
@@ -84,24 +80,8 @@ Per-round payoffs (verified in platform code):
 ### Notes
 
 - Distinct from one-shot `matrix_pd` on the platform (not covered here).
-- Prefer `state.legal_actions` / `legal_actions_str` from the live state over
+- Prefer `state.legal_actions` / `LegalAction.label` from the live state over
   hardcoding if you ever see a different legal set.
-
----
-
-## Autochess
-
-### Overview
-
-Details not yet documented.
-
-The platform is expected to support this game, but the contestant-facing
-action/state contract has not yet been documented in this repository.
-
-### Notes
-
-No Autochess adapter, preset, or contestant skill doc was found in the
-workspace at the time of writing.
 
 ---
 
@@ -168,38 +148,6 @@ payload, not assumed from Showdown culture.
 
 ---
 
-## Red Alert
-
-### Overview
-
-Details not yet documented.
-
-The platform is expected to support this game, but the contestant-facing
-action/state contract has not yet been documented in this repository.
-
-### Notes
-
-No Red Alert adapter, preset, or contestant skill doc was found in the
-workspace at the time of writing.
-
----
-
-## Honor of Kings
-
-### Overview
-
-Details not yet documented.
-
-The platform is expected to support this game, but the contestant-facing
-action/state contract has not yet been documented in this repository.
-
-### Notes
-
-No Honor of Kings adapter, preset, or contestant skill doc was found in the
-workspace at the time of writing.
-
----
-
 ## Avalon
 
 Platform game id / launch preset: `avalon`
@@ -223,11 +171,11 @@ then the next round.
 
 | `avalon_phase` | Who acts | Meaning of actions |
 |---|---|---|
-| `proposal` | Leader only | Index into the C(5,2) list of 2-player teams (`legal_actions` is `[0..9]`). Prefer matching `legal_actions_str` (e.g. `"Propose team: Player0, Player3"`) rather than memorizing indices. |
+| `proposal` | Leader only | Index into the C(5,2) list of 2-player teams (`legal_actions` is `[0..9]`). Prefer matching `LegalAction.label` (e.g. `"Propose team: Player0, Player3"`) rather than memorizing indices. |
 | `vote` | All 5 (one seat at a time in the API) | `0` = Reject, `1` = Approve. Votes stay hidden until all five are in; then the full tally is public in `avalon_round_history`. Strict majority (3+) approves. |
 | `mission` | The 2 team members | `1` = Success, `0` = Fail. **Good** players only get `[1]` (cannot fail). One fail sabotages the whole mission; who chose what is never revealed — only pass/fail and `fail_count`. |
 
-Also on state: `avalon_round`, `avalon_leader`, `avalon_team_size`,
+Also in the raw state payload (`state.raw`): `avalon_round`, `avalon_leader`, `avalon_team_size`,
 `avalon_proposed_team`, `avalon_good_wins`, `avalon_evil_wins`,
 `avalon_round_history`. Your `observation` string includes your private role
 (and, if evil, your ally). Roles are not disclosed to players by the API at
@@ -266,22 +214,5 @@ where legal (approve / success; for proposal, the first legal team).
 
 - `phase` (`messaging`/`moving`) chooses the endpoint; `avalon_phase` chooses
   what an action integer means. Do not `/step` while `phase` is messaging.
-- Seat labels in `legal_actions_str` / observation (`Player0` …) are indices;
+- Seat labels in `LegalAction.label` / observation (`Player0` …) are indices;
   `avalon_*` name fields use display names — map them from the session roster.
-
----
-
-## Werewolf
-
-### Overview
-
-Details not yet documented.
-
-The platform is expected to support this game, but the contestant-facing
-action/state contract has not yet been documented in this repository.
-
-### Notes
-
-A temporary Werewolf / “Lone Wolf” runtime adapter appeared in platform
-change notes and was **removed**; no live werewolf adapter or contestant
-skill doc remains in the workspace searched for this file.

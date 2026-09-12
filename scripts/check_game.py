@@ -40,7 +40,7 @@ def _print_state(state: GameState) -> None:
     print(f"is_terminal:     {state.is_terminal}")
     print(f"current_player:  {state.current_player.name if state.current_player else None}")
     print(f"legal_actions:   {state.legal_actions}")
-    print(f"legal_actions_str: {state.legal_actions_str}")
+    print(f"legal_action_labels: {[a.label for a in state.legal_actions]}")
     print(f"next_actions:    {[a.action for a in state.next_actions]}")
     for a in state.next_actions:
         print(f"  - {a.action}: {a.hint}")
@@ -105,8 +105,17 @@ def main() -> int:
                 print("\nRefusing to step: legal_actions is empty.")
                 return 1
             action = state.legal_actions[0]
-            print(f"\nSubmitting action {action} (first of {state.legal_actions})...")
-            new_state = session.step(action)
+            try:
+                action_value = int(action.action_id)
+            except ValueError:
+                print(
+                    "\nRefusing to step: REST debug stepping only supports "
+                    f"integer action ids, got {action.action_id!r}. Use MCP "
+                    "via `python -m agent` for structured games."
+                )
+                return 1
+            print(f"\nSubmitting action {action_value} (first of {state.legal_actions})...")
+            new_state = session.step(action_value)
             print("Updated state:")
             _print_state(new_state)
         elif args.resign:

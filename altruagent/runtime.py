@@ -1,17 +1,17 @@
-"""Sequential local discovery + execution loop — the engine behind
-``python -m agent``.
+"""Legacy sequential local discovery + execution loop.
 
 Owns exactly what Milestone 4A's single-match runner (``altruagent.runner``)
 deliberately didn't: repeatedly discovering which match to play via
 ``client.sessions()``, and feeding matches into ``run_match()`` one at a
 time, forever (or until interrupted). It does not implement concurrency —
-only one match is ever being played at any moment. Multiple simultaneous
-matches are a later milestone; this one is explicitly sequential.
+only one match is ever being played at any moment.
 
 No new game-loop logic lives here — every actual decision/state/step call
 still goes through the committed ``run_match()``. This module is only
 responsible for *which* match to hand it next, and what to do when that
-match finishes or fails.
+match finishes or fails. It remains exported as a bounded/manual primitive;
+the normal ``python -m agent`` entry point uses ``altruagent.supervisor``'s
+concurrent process-per-match runtime instead.
 """
 
 from __future__ import annotations
@@ -137,8 +137,7 @@ def run_forever(
     Each tick calls ``run_once``. If it serviced a match, the next tick
     starts immediately (there may be another active match waiting); if
     nothing was eligible, sleeps ``discovery_interval`` before checking
-    again. Sequential only — this never plays more than one match at a
-    time; running several matches concurrently is a later milestone.
+    again. Sequential only — this never plays more than one match at a time.
 
     ``max_iterations`` bounds the loop to that many discovery ticks instead
     of running forever — the same parameter a production caller would just
