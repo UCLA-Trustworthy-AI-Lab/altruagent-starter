@@ -31,7 +31,7 @@ import httpx
 from dotenv import load_dotenv
 
 from .errors import AuthenticationError, ConfigurationError, PlatformError
-from .models import Agent, AgentSessions
+from .models import Agent, AgentSessions, Tournament
 
 if TYPE_CHECKING:
     from .game import GameSession
@@ -146,6 +146,72 @@ class AltruAgentClient:
         """
         data = self.request("GET", "/agents/me/sessions")
         return AgentSessions.from_dict(data if isinstance(data, dict) else {}, client=self)
+
+    def tournaments(self) -> list[Tournament]:
+        """``GET /tournaments`` — public listing of active tournaments (see
+        Agent_ACP backend/src/index.ts:442, ``listActiveTournaments`` /
+        ``db/tournaments.ts``'s ``getActiveTournaments``).
+
+        Exactly one request; no per-tournament detail calls. Entries are raw
+        DB rows, returned in whatever order the server gives them (newest
+        `created_at` first, currently). The backend already filters this to
+        `waiting`/`in_progress` only (capped at 10) — completed tournaments
+        never appear here, so no client-side filtering is applied on top.
+        """
+        data = self.request("GET", "/tournaments")
+        rows = data.get("tournaments") if isinstance(data, dict) else None
+        return [Tournament.from_dict(row) for row in (rows or [])]
+
+    def tournament(self, tournament_id: str) -> Tournament:
+        """``GET /tournaments/{id}`` — one tournament's detail, including this
+        agent's ``viewer`` membership info (present because this uses the
+        authenticated request path, so an agent JWT is sent even though the
+        route itself only optionally requires one).
+
+        Note: this GET is **not side-effect-free** on the current backend.
+        ``getTournament`` (tournamentService.ts) can, as a side effect of
+        this same call: advance a queue-linked tournament past an expired
+        timer (starting it), and reconcile any child match GameAPI already
+        finished (recomputing the leaderboard, scheduling the next batch of
+        matches, or completing the tournament). This is real platform
+        behavior, not something the SDK compensates for or hides.
+        """
+        data = self.request("GET", f"/tournaments/{tournament_id}")
+        tournament_data = data.get("tournament") if isinstance(data, dict) else None
+        viewer_data = data.get("viewer") if isinstance(data, dict) else None
+        return Tournament.from_dict(tournament_data or {}, viewer=viewer_data)
+
+    def join_tournament(self, tournament_id: str) -> dict:
+        """``POST /tournaments/{id}/join``. Identity comes entirely from the
+        authenticated, claimed agent's JWT — no request body is sent or
+        needed (verified against Agent_ACP index.ts:462, which never reads
+        ``req.body``).
+
+        Returns the parsed JSON response as a plain dict (a dedicated model
+        would add little value here — the only fields worth reading are
+        ``status``/``position``/``next_actions``, all already anonymous
+        dict keys). Idempotent: rejoining a tournament you're already in
+        returns success with ``already_joined: true`` rather than an error.
+        If this join fills the tournament's capacity, the tournament starts
+        synchronously as part of this same call — every round-robin child
+        competition is created before this returns. A full/already-started/
+        nonexistent tournament all collapse to the same
+        ``PlatformError(error_code="join_failed")`` — the backend does not
+        distinguish them with separate machine codes (and, notably, a
+        nonexistent tournament returns 400 here, not the 404 that
+        ``tournament()`` would give for the same id).
+        """
+        return self.request("POST", f"/tournaments/{tournament_id}/join")
+
+    def leave_tournament(self, tournament_id: str) -> dict:
+        """``POST /tournaments/{id}/leave``. No request body.
+
+        Idempotent when not a member. Only succeeds while the tournament is
+        still ``waiting`` — once it has started there is no code path to
+        leave it, and this always fails with
+        ``PlatformError(error_code="leave_failed")``.
+        """
+        return self.request("POST", f"/tournaments/{tournament_id}/leave")
 
     def game(self, session_id: str, game_server_url: str) -> "GameSession":
         """Open a handle to one already-known GameAPI match.

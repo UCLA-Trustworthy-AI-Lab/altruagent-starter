@@ -1,10 +1,11 @@
 """Focused unit tests for scripts/smoke_game.py's helper logic.
 
-Only the bounded-polling loop (`wait_for_in_progress`) is unit-tested here —
-it has real logic worth verifying (returns as soon as ready, times out
-without looping forever) and is easy to test with injected clock/sleep
-functions. The rest of smoke_game.py is orchestration against the real
-platform, exercised by running the script itself, not by mocking it here.
+Only the bounded-polling loops (`wait_for_in_progress`,
+`wait_for_tournament_in_progress`) are unit-tested here — they have real
+logic worth verifying (return as soon as ready, time out without looping
+forever) and are easy to test with injected clock/sleep functions. The rest
+of smoke_game.py is orchestration against the real platform, exercised by
+running the script itself, not by mocking it here.
 """
 
 from __future__ import annotations
@@ -106,3 +107,55 @@ def test_wait_for_in_progress_ignores_in_progress_without_game_server_url():
 
     assert result["game_server_url"] == "host:8000"
     assert sleep_calls == [1.0]
+
+
+def test_wait_for_tournament_in_progress_returns_as_soon_as_ready():
+    poll_results = iter([{"status": "waiting"}, {"status": "in_progress"}])
+    sleep_calls = []
+
+    result = smoke_game.wait_for_tournament_in_progress(
+        lambda: next(poll_results),
+        timeout_seconds=10.0,
+        interval_seconds=1.0,
+        sleep=sleep_calls.append,
+        now=_clock([0.0, 1.0]),
+    )
+
+    assert result == {"status": "in_progress"}
+    assert sleep_calls == [1.0]
+
+
+def test_wait_for_tournament_in_progress_does_not_require_game_server_url():
+    # Unlike wait_for_in_progress, a tournament dict with no game_server_url
+    # at all is still "ready" once status flips — the tournament smoke flow
+    # resolves the child match's URL separately, via client.sessions().
+    poll_results = iter([{"status": "in_progress"}])
+    sleep_calls = []
+
+    result = smoke_game.wait_for_tournament_in_progress(
+        lambda: next(poll_results),
+        timeout_seconds=10.0,
+        interval_seconds=1.0,
+        sleep=sleep_calls.append,
+        now=_clock([0.0]),
+    )
+
+    assert result["status"] == "in_progress"
+    assert sleep_calls == []
+
+
+def test_wait_for_tournament_in_progress_times_out_without_looping_forever():
+    poll_results = itertools.repeat({"status": "waiting"})
+    sleep_calls = []
+    clock = _clock([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+
+    with pytest.raises(smoke_game.SmokeTestError):
+        smoke_game.wait_for_tournament_in_progress(
+            lambda: next(poll_results),
+            timeout_seconds=5.0,
+            interval_seconds=1.0,
+            sleep=sleep_calls.append,
+            now=clock,
+        )
+
+    assert len(sleep_calls) <= 6

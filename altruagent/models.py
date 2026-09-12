@@ -274,3 +274,77 @@ class AgentSessions:
             completed=_matches("completed_sessions"),
             raw=data,
         )
+
+
+@dataclass
+class TournamentViewer:
+    """The calling agent's membership view of a tournament — present only on
+    an authenticated ``GET /tournaments/{id}`` (see Agent_ACP
+    backend/src/services/tournamentService.ts's ``getTournament``, which only
+    builds a ``viewer`` object when the request carried a JWT that resolved
+    to an agent).
+    """
+
+    agent_id: str | None = None
+    is_tournament_participant: bool = False
+    active_child_session_ids: list[str] = field(default_factory=list)
+    should_join_tournament: bool | None = None
+    should_wait_for_child_match: bool | None = None
+    next_actions: list[NextAction] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TournamentViewer":
+        return cls(
+            agent_id=data.get("agent_id"),
+            is_tournament_participant=bool(data.get("is_tournament_participant", False)),
+            active_child_session_ids=list(data.get("active_child_session_ids") or []),
+            should_join_tournament=data.get("should_join_tournament"),
+            should_wait_for_child_match=data.get("should_wait_for_child_match"),
+            next_actions=[NextAction.from_dict(a) for a in (data.get("next_actions") or [])],
+        )
+
+
+@dataclass
+class Tournament:
+    """A tournament, as returned by either ``GET /tournaments`` (list — a raw
+    ``tournaments`` DB row) or ``GET /tournaments/{id}`` (detail — a curated
+    ``compactTournament()`` subset with a *different* field set — see
+    Agent_ACP backend/src/services/tournamentService.ts). Both shapes are
+    tolerated: only fields useful and common enough to model are typed;
+    everything else (list-only fields like ``created_at``/``metadata``, or
+    detail-only ``leaderboard``/``participants``) stays reachable via ``raw``.
+
+    There is no ``name`` field anywhere on the backend (confirmed against
+    the DB schema) — a tournament is identified only by ``tournament_id`` +
+    ``game_type``.
+
+    ``viewer`` is ``None`` unless this came from an authenticated
+    ``GET /tournaments/{id}`` call that returned one (never present on a
+    ``GET /tournaments`` list entry).
+    """
+
+    tournament_id: str
+    status: str
+    game_type: str | None = None
+    max_participants: int | None = None
+    current_participants: int | None = None
+    max_active_matches: int | None = None
+    queue_id: str | None = None
+    game_server_url: str | None = None
+    viewer: TournamentViewer | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: dict, *, viewer: dict | None = None) -> "Tournament":
+        return cls(
+            tournament_id=data.get("tournament_id", ""),
+            status=data.get("status", "unknown"),
+            game_type=data.get("game_type"),
+            max_participants=data.get("max_participants"),
+            current_participants=data.get("current_participants"),
+            max_active_matches=data.get("max_active_matches"),
+            queue_id=data.get("queue_id"),
+            game_server_url=data.get("game_server_url"),
+            viewer=TournamentViewer.from_dict(viewer) if isinstance(viewer, dict) else None,
+            raw=data,
+        )

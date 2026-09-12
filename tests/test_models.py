@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from altruagent.models import Agent, AgentSessions, GameState, Match, NextAction
+from altruagent.models import (
+    Agent,
+    AgentSessions,
+    GameState,
+    Match,
+    NextAction,
+    Tournament,
+    TournamentViewer,
+)
 
 
 def test_agent_parsing_excludes_sensitive_hash_fields():
@@ -240,3 +248,112 @@ def test_game_state_terminal_with_returns():
     assert state.returns == {"Alice": 1.0, "Bob": -1.0}
     assert state.termination_reason == "completed"
     assert [a.action for a in state.next_actions] == ["game_over"]
+
+
+# -- Tournament / TournamentViewer -----------------------------------------
+
+
+def test_tournament_from_dict_list_shape():
+    # GET /tournaments list entries are raw DB rows: no viewer, no
+    # game_server_url (never a stored column).
+    tournament = Tournament.from_dict(
+        {
+            "tournament_id": "t-1",
+            "game_type": "tic_tac_toe",
+            "status": "waiting",
+            "max_participants": 2,
+            "current_participants": 1,
+            "max_active_matches": 1,
+            "queue_id": None,
+            "created_by_user_id": "user-1",
+            "metadata": None,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    )
+
+    assert tournament.tournament_id == "t-1"
+    assert tournament.status == "waiting"
+    assert tournament.current_participants == 1
+    assert tournament.game_server_url is None
+    assert tournament.viewer is None
+    assert tournament.raw["created_by_user_id"] == "user-1"
+
+
+def test_tournament_from_dict_detail_shape_with_viewer():
+    # GET /tournaments/{id}'s `tournament` sub-object (compactTournament) can
+    # include game_server_url; `viewer` is passed separately (it's a sibling
+    # key in the response body, not nested inside `tournament`).
+    tournament = Tournament.from_dict(
+        {
+            "tournament_id": "t-1",
+            "game_type": "tic_tac_toe",
+            "status": "in_progress",
+            "max_participants": 2,
+            "current_participants": 2,
+            "max_active_matches": 1,
+            "queue_id": None,
+            "game_server_url": "host:8000",
+        },
+        viewer={
+            "agent_id": "agent-1",
+            "is_tournament_participant": True,
+            "active_child_session_ids": ["session-1"],
+            "should_join_tournament": False,
+            "should_wait_for_child_match": False,
+            "next_actions": [
+                {"action": "play_child_session", "endpoint": "GET .../games/session-1", "hint": "Play it."}
+            ],
+        },
+    )
+
+    assert tournament.game_server_url == "host:8000"
+    assert tournament.viewer is not None
+    assert tournament.viewer.agent_id == "agent-1"
+    assert tournament.viewer.is_tournament_participant is True
+    assert tournament.viewer.active_child_session_ids == ["session-1"]
+    assert [a.action for a in tournament.viewer.next_actions] == ["play_child_session"]
+
+
+def test_tournament_viewer_absent_gives_none():
+    tournament = Tournament.from_dict({"tournament_id": "t-1", "status": "waiting"})
+
+    assert tournament.viewer is None
+
+
+def test_tournament_tolerates_missing_optional_fields():
+    tournament = Tournament.from_dict({"tournament_id": "t-1", "status": "waiting"})
+
+    assert tournament.game_type is None
+    assert tournament.max_participants is None
+    assert tournament.current_participants is None
+    assert tournament.queue_id is None
+    assert tournament.game_server_url is None
+
+
+def test_tournament_preserves_unknown_fields_in_raw():
+    tournament = Tournament.from_dict(
+        {"tournament_id": "t-1", "status": "waiting", "leaderboard": [], "messaging_config": {"messaging_enabled": True}}
+    )
+
+    assert tournament.raw["leaderboard"] == []
+    assert tournament.raw["messaging_config"] == {"messaging_enabled": True}
+
+
+def test_tournament_has_no_name_attribute():
+    # There is no `name` field anywhere on the backend's tournaments table —
+    # guard against ever accidentally assuming one exists.
+    tournament = Tournament.from_dict({"tournament_id": "t-1", "status": "waiting", "name": "Ignored"})
+
+    assert not hasattr(tournament, "name")
+    # If a "name" key is ever present in a payload (it shouldn't be), it's
+    # only reachable via raw, never promoted to a typed attribute.
+    assert tournament.raw.get("name") == "Ignored"
+
+
+def test_tournament_viewer_from_dict_defaults():
+    viewer = TournamentViewer.from_dict({})
+
+    assert viewer.agent_id is None
+    assert viewer.is_tournament_participant is False
+    assert viewer.active_child_session_ids == []
+    assert viewer.next_actions == []
