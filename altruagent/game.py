@@ -1,19 +1,23 @@
 """GameSession — a handle to one already-known GameAPI match.
 
-Wraps exactly three endpoints, verified directly against
-Agent_ACP/gameapi/src/gameapi/routes/games.py:
+Wraps five endpoints, verified directly against Agent_ACP's actual route
+implementations:
 
-- ``GET /games/{session_id}``        (games.py:333, ``get_game_state``)
-- ``POST /games/{session_id}/step``  (games.py:358, ``step_game``)
-- ``POST /games/{session_id}/resign`` (games.py:477, ``resign_game``)
+- ``GET /games/{session_id}``         (gameapi/routes/games.py, ``get_game_state``)
+- ``POST /games/{session_id}/step``   (gameapi/routes/games.py, ``step_game``)
+- ``POST /games/{session_id}/resign`` (gameapi/routes/games.py, ``resign_game``)
+- ``POST /games/{session_id}/message`` with ``type="chat"``/``"terminate"``
+  (gameapi/routes/messages.py, ``send_message`` — shared by both
+  ``send_message()`` and ``terminate_messaging()`` below, which just fix the
+  request body's ``type``)
 
-All three require the same bearer JWT the control plane issued (GameAPI
-validates it independently via JWKS — see
-gameapi/src/gameapi/auth/jwt_validator.py — but it's the identical Supabase
-token). ``GameSession`` never manages its own auth: every call goes through
-``AltruAgentClient.request()``, which already knows how to log in and retry
-once on a 401. This intentionally does not implement messaging, spectating,
-replay, or cancel — those are out of scope for this milestone.
+All require the same bearer JWT the control plane issued (GameAPI validates
+it independently via JWKS — see gameapi/src/gameapi/auth/jwt_validator.py —
+but it's the identical Supabase token). ``GameSession`` never manages its
+own auth: every call goes through ``AltruAgentClient.request()``, which
+already knows how to log in and retry once on a 401. Spectating, replay,
+and cancel are still out of scope — those aren't part of the contestant
+gameplay loop.
 """
 
 from __future__ import annotations
@@ -85,4 +89,34 @@ class GameSession:
         Allowed at any time, in any phase, regardless of whose turn it is.
         """
         data = self._client.request("POST", self._url("/resign"), json={})
+        return GameState.from_dict(data if isinstance(data, dict) else {})
+
+    def send_message(self, content: str, recipients: list[int] | None = None) -> GameState:
+        """``POST /games/{session_id}/message`` with ``type="chat"``.
+
+        Only valid while ``state().phase == "messaging"`` and this agent
+        hasn't already sent ``terminate`` this round — the server 409s
+        (``wrong_phase``) otherwise. ``recipients`` empty/``None`` broadcasts
+        to every other player; a single index sends a targeted p2p message
+        (the server currently rejects 2+ recipients — p2group is gated, see
+        Agent_ACP/gameapi/src/gameapi/routes/messages.py's
+        ``_validate_recipients``). Word/length/quota limits are enforced
+        server-side and surface as ``PlatformError``.
+        """
+        body = {"type": "chat", "content": content, "recipients": list(recipients or [])}
+        data = self._client.request("POST", self._url("/message"), json=body)
+        return GameState.from_dict(data if isinstance(data, dict) else {})
+
+    def terminate_messaging(self) -> GameState:
+        """``POST /games/{session_id}/message`` with ``type="terminate"`` —
+        vote to end the current messaging round.
+
+        Idempotent: re-terminating in the same round is a no-op server-side
+        (see ``messages.py``'s ``send_message`` handler). Once every active
+        player has terminated, the phase flips to ``moving``; until then,
+        the next state's ``next_actions`` reports ``wait_for_opponent``.
+        """
+        data = self._client.request(
+            "POST", self._url("/message"), json={"type": "terminate", "recipients": []}
+        )
         return GameState.from_dict(data if isinstance(data, dict) else {})

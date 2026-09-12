@@ -96,15 +96,54 @@ class PlayerRef:
 
 
 @dataclass
+class Message:
+    """A single messaging-phase message, as GameAPI serializes it. Mirrors
+    gameapi/src/gameapi/models/responses.py's ``MessageResponse`` exactly
+    (``index``, ``sender``, ``recipients``, ``content``, ``type``,
+    ``sent_at``, ``move_index``). ``type`` is ``"chat"`` or ``"terminate"``
+    (see gameapi/src/gameapi/domain/__init__.py's ``MessageType``);
+    ``recipients`` empty means broadcast, one entry means a targeted p2p
+    message (the server rejects 2+ today — p2group is gated).
+    """
+
+    index: int
+    sender: int
+    recipients: list[int]
+    content: str
+    type: str
+    sent_at: str
+    move_index: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Message":
+        return cls(
+            index=data.get("index", 0),
+            sender=data.get("sender", 0),
+            recipients=list(data.get("recipients") or []),
+            content=data.get("content", ""),
+            type=data.get("type", "chat"),
+            sent_at=data.get("sent_at", ""),
+            move_index=data.get("move_index", 0),
+        )
+
+
+@dataclass
 class GameState:
     """A GameAPI game state, as returned by ``GET/POST /games/{session_id}...``.
 
     Covers the fields needed to play a single match generically (see
     gameapi/src/gameapi/models/responses.py's ``GameStateResponse``). Richer
-    games (repeated_pd's round history, Avalon's ``avalon_*`` fields,
-    Pokémon's extras, messaging fields) are not individually modeled yet —
-    they're always available via ``raw``, which holds the complete,
-    unmodified server response.
+    per-game fields (repeated_pd's round history, Avalon's ``avalon_*``
+    fields, Pokémon's extras) are not individually modeled — they're always
+    available via ``raw``, which holds the complete, unmodified server
+    response. Messaging fields *are* modeled (``new_messages``,
+    ``terminated_messaging``, ``messaging_mode``), since a contestant needs
+    them to act during a MESSAGING phase (see ``altruagent.runner``'s
+    ``choose_message`` support). Two messaging config knobs the server
+    computes but never returns in this response at all —
+    ``word_limit_per_message`` and ``max_messages_per_phase_per_agent`` — are
+    not modeled here because there is nothing to parse; a contestant that
+    needs them must track its own usage.
     """
 
     session_id: str
@@ -121,6 +160,9 @@ class GameState:
     messaging_enabled: bool
     phase: str
     next_actions: list[NextAction]
+    new_messages: list[Message]
+    terminated_messaging: list[int]
+    messaging_mode: str
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -133,6 +175,9 @@ class GameState:
         )
         next_actions = [
             NextAction.from_dict(a) for a in (data.get("next_actions") or [])
+        ]
+        new_messages = [
+            Message.from_dict(m) for m in (data.get("new_messages") or [])
         ]
         return cls(
             session_id=data.get("session_id", ""),
@@ -149,6 +194,9 @@ class GameState:
             messaging_enabled=bool(data.get("messaging_enabled", False)),
             phase=data.get("phase", "moving"),
             next_actions=next_actions,
+            new_messages=new_messages,
+            terminated_messaging=list(data.get("terminated_messaging") or []),
+            messaging_mode=data.get("messaging_mode", "per_move"),
             raw=data,
         )
 

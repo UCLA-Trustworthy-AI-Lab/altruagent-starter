@@ -14,7 +14,9 @@ from altruagent.errors import PlatformError
 from altruagent.models import DecisionContext, GameState, Match
 from altruagent.runner import (
     RESIGN,
+    TERMINATE_MESSAGING,
     DecisionError,
+    SendMessage,
     UnsupportedGameFlowError,
     run_game,
     run_match,
@@ -25,7 +27,8 @@ SESSION_ID = "session-1"
 
 class FakeGameSession:
     """Scripted stand-in for GameSession. Queue GameState objects (returned
-    in order by state()/step()/resign()) or exception instances (raised).
+    in order by state()/step()/resign()/send_message()/terminate_messaging())
+    or exception instances (raised).
     """
 
     def __init__(self, session_id: str = SESSION_ID) -> None:
@@ -35,6 +38,8 @@ class FakeGameSession:
         self.state_calls = 0
         self.step_calls: list[int] = []
         self.resign_calls = 0
+        self.send_message_calls: list[tuple[str, list[int]]] = []
+        self.terminate_messaging_calls = 0
 
     def queue(self, *items) -> "FakeGameSession":
         self._queue.extend(items)
@@ -56,6 +61,14 @@ class FakeGameSession:
 
     def resign(self) -> GameState:
         self.resign_calls += 1
+        return self._next()
+
+    def send_message(self, content: str, recipients: list[int] | None = None) -> GameState:
+        self.send_message_calls.append((content, list(recipients or [])))
+        return self._next()
+
+    def terminate_messaging(self) -> GameState:
+        self.terminate_messaging_calls += 1
         return self._next()
 
 
@@ -96,6 +109,23 @@ def terminal_state(**overrides) -> GameState:
     overrides.setdefault("current_player", None)
     overrides.setdefault("returns", {"Me": 1.0, "Them": -1.0})
     overrides.setdefault("next_actions", [{"action": "game_over", "hint": "Done."}])
+    return make_state(**overrides)
+
+
+def messaging_state(**overrides) -> GameState:
+    """A MESSAGING-phase state where this viewer has not yet terminated —
+    real GameAPI always pairs send_message + terminate_messaging together
+    here (see next_actions.py's compute_next_actions).
+    """
+    overrides.setdefault("messaging_enabled", True)
+    overrides.setdefault("phase", "messaging")
+    overrides.setdefault(
+        "next_actions",
+        [
+            {"action": "send_message", "hint": "chat or terminate", "required_fields": ["type"]},
+            {"action": "terminate_messaging", "hint": "end round", "required_fields": ["type"]},
+        ],
+    )
     return make_state(**overrides)
 
 
@@ -259,31 +289,296 @@ def test_resign_calls_resign_not_step():
     assert game.step_calls == []
 
 
-# -- messaging (unsupported) -------------------------------------------------
+# -- messaging ----------------------------------------------------------
 
 
-def test_send_message_flow_fails_as_unsupported_without_invoking_decision():
+def test_messaging_phase_never_invokes_choose_action():
+    # legal_actions non-empty on purpose: proves the runner defers to
+    # next_actions, not legal_actions, to decide whether to act.
     def choose_action(state, context):
         raise AssertionError("choose_action must not run during a messaging phase")
 
-    # legal_actions non-empty on purpose: proves the runner defers to
-    # next_actions, not legal_actions, to decide whether to act.
     game = FakeGameSession().queue(
-        make_state(
-            messaging_enabled=True,
-            phase="messaging",
-            legal_actions=[0, 1],
-            next_actions=[
-                {"action": "send_message", "hint": "chat or terminate"},
-                {"action": "terminate_messaging", "hint": "end round"},
-            ],
-        )
+        messaging_state(legal_actions=[0, 1]),
+        terminal_state(),
+    )
+    result = run_game(game, CONTEXT, choose_action, sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.step_calls == []
+
+
+def test_default_choose_message_auto_terminates_when_absent():
+    # No choose_message defined anywhere (bare function choose_action) — the
+    # existing simple starter agent must still be able to finish a
+    # messaging-enabled match without any new code.
+    game = FakeGameSession().queue(
+        messaging_state(),
+        terminal_state(),
+    )
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.terminate_messaging_calls == 1
+    assert game.send_message_calls == []
+
+
+def test_default_choose_message_auto_terminates_for_object_without_it():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.terminate_messaging_calls == 1
+
+
+def test_custom_choose_message_sends_chat():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return SendMessage("let's cooperate", recipients=[1])
+
+    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.send_message_calls == [("let's cooperate", [1])]
+    assert game.terminate_messaging_calls == 0
+
+
+def test_custom_choose_message_can_terminate_explicitly():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return TERMINATE_MESSAGING
+
+    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.terminate_messaging_calls == 1
+
+
+def test_choose_message_resolved_off_original_object_not_bound_method():
+    # Regression guard: choose_message must be looked up on the object
+    # create_agent() returned, not on the bound choose_action method (bound
+    # methods don't proxy attribute lookups back to their owning instance).
+    class Agent:
+        def __init__(self):
+            self.messages_sent = 0
+
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            self.messages_sent += 1
+            return TERMINATE_MESSAGING
+
+    agent = Agent()
+    game = FakeGameSession().queue(messaging_state(), terminal_state())
+    run_game(game, CONTEXT, agent, sleep=no_sleep)
+
+    assert agent.messages_sent == 1
+
+
+def test_repeated_messaging_rounds_across_the_match():
+    # repeated_pd reopens messaging after every round (messaging_mode
+    # per_all_moves) — the loop must handle this more than once.
+    class Agent:
+        def __init__(self):
+            self.rounds_seen = 0
+
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            self.rounds_seen += 1
+            return TERMINATE_MESSAGING
+
+    agent = Agent()
+    game = FakeGameSession().queue(
+        messaging_state(),
+        make_state(),
+        messaging_state(),
+        terminal_state(),
+    )
+    result = run_game(game, CONTEXT, agent, sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert agent.rounds_seen == 2
+    assert game.terminate_messaging_calls == 2
+    assert game.step_calls == [0]
+
+
+def test_already_terminated_messaging_round_waits_without_calling_choose_message():
+    # This viewer already sent terminate this round: next_actions collapses
+    # to wait_for_opponent alone (no send_message/terminate_messaging) — the
+    # existing waiting branch handles this without any messaging-specific code.
+    def choose_message_never(state, context):
+        raise AssertionError("choose_message should not run while only waiting")
+
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return choose_message_never(state, context)
+
+    sleep_calls = []
+    game = FakeGameSession().queue(waiting_state(messaging_enabled=True, phase="messaging"), terminal_state())
+    result = run_game(game, CONTEXT, Agent(), sleep=sleep_calls.append)
+
+    assert result.is_terminal is True
+    assert sleep_calls == [5.0]
+
+
+def test_invalid_choose_message_return_value_rejected():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return "just chat, no wrapper"
+
+    game = FakeGameSession().queue(messaging_state())
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert game.send_message_calls == []
+    assert game.terminate_messaging_calls == 0
+
+
+def test_choose_message_exception_chains_into_decision_error():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            raise ValueError("boom")
+
+    game = FakeGameSession().queue(messaging_state())
+
+    with pytest.raises(DecisionError) as exc_info:
+        run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_messaging_quota_exceeded_becomes_decision_error():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return SendMessage("one too many")
+
+    game = FakeGameSession().queue(
+        messaging_state(),
+        PlatformError("quota", status_code=429, error_code="messages_quota_exceeded"),
     )
 
-    with pytest.raises(UnsupportedGameFlowError):
-        run_game(game, CONTEXT, choose_action, sleep=no_sleep)
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
-    assert game.step_calls == []
+
+def test_invalid_recipients_becomes_decision_error():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return SendMessage("hi", recipients=[0, 1])
+
+    game = FakeGameSession().queue(
+        messaging_state(),
+        PlatformError("bad recipients", status_code=400, error_code="invalid_recipients"),
+    )
+
+    with pytest.raises(DecisionError):
+        run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+
+def test_wrong_phase_race_refetches_instead_of_blaming_contestant():
+    calls = []
+
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            calls.append(state)
+            return TERMINATE_MESSAGING
+
+    game = FakeGameSession().queue(
+        messaging_state(),
+        PlatformError("phase moved on", status_code=409, error_code="wrong_phase"),
+        terminal_state(),
+    )
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert len(calls) == 1  # not re-invoked — this was never a contestant bug
+    assert game.state_calls == 2  # initial + the wrong_phase refetch
+
+
+def test_messaging_game_already_finished_treated_as_natural_completion():
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            return TERMINATE_MESSAGING
+
+    game = FakeGameSession().queue(
+        messaging_state(),
+        PlatformError("done", status_code=409, error_code="game_already_finished"),
+        terminal_state(termination_reason="completed"),
+    )
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert result.termination_reason == "completed"
+
+
+def test_non_messaging_game_never_touches_messaging_transport():
+    # Regression guard: a normal move-only game must never call
+    # send_message/terminate_messaging even if choose_message is defined.
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            raise AssertionError("choose_message should never run for this game")
+
+    game = FakeGameSession().queue(make_state(), terminal_state())
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.send_message_calls == []
+    assert game.terminate_messaging_calls == 0
+
+
+def test_resign_still_works_when_choose_message_is_defined():
+    class Agent:
+        def choose_action(self, state, context):
+            return RESIGN
+
+        def choose_message(self, state, context):
+            return TERMINATE_MESSAGING
+
+    game = FakeGameSession().queue(make_state(), terminal_state(termination_reason="resignation"))
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.resign_calls == 1
 
 
 def test_terminate_messaging_only_flow_fails_as_unsupported():

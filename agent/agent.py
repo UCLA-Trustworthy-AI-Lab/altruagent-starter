@@ -30,6 +30,12 @@ next match is what gives you a fresh instance automatically:
 
 This baseline always plays the first legal action — replace it with your
 own strategy, an LLM call, whatever you want.
+
+Some games (e.g. repeated_pd, avalon) also have a messaging phase before/
+between moves. You don't have to do anything about it: this agent will
+automatically vote to end each messaging round and move on. If you want to
+actually negotiate, add an optional `choose_message(state, context)` method
+next to `choose_action` — see examples/messaging_agent.py.
 """
 
 from altruagent import DecisionContext, GameState

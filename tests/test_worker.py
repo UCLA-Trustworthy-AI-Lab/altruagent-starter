@@ -13,7 +13,7 @@ import pytest
 
 from altruagent.errors import PlatformError
 from altruagent.models import GameState
-from altruagent.runner import RESIGN, DecisionError, UnsupportedGameFlowError
+from altruagent.runner import RESIGN, TERMINATE_MESSAGING, DecisionError, UnsupportedGameFlowError
 from altruagent.worker import (
     EXIT_MATCH_FAILURE,
     EXIT_SUCCESS,
@@ -271,6 +271,100 @@ def test_two_worker_invocations_get_distinct_contestant_instances():
     assert created_instances[0] is not created_instances[1]
     assert created_instances[0].history == ["s-1"]
     assert created_instances[1].history == ["s-2"]  # no cross-contamination
+
+
+# -- messaging survives the worker's object-passing path (Milestone 5) ------
+
+
+def messaging_state(**overrides) -> GameState:
+    payload = {
+        "session_id": "s-1",
+        "game_name": "repeated_pd",
+        "status": "active",
+        "observation": "...",
+        "current_player": {"name": "Me"},
+        "legal_actions": [0, 1],
+        "legal_actions_str": ["cooperate", "defect"],
+        "is_terminal": False,
+        "returns": None,
+        "move_count": 0,
+        "termination_reason": None,
+        "messaging_enabled": True,
+        "phase": "messaging",
+        "next_actions": [
+            {"action": "send_message", "hint": "chat or terminate", "required_fields": ["type"]},
+            {"action": "terminate_messaging", "hint": "end round", "required_fields": ["type"]},
+        ],
+    }
+    payload.update(overrides)
+    return GameState.from_dict(payload)
+
+
+class FakeGameSessionForWorker:
+    """Minimal GameSession double so this test can exercise the REAL
+    ``run_match``/``run_game`` (not a faked ``run_match_fn``) — proving a
+    contestant object's ``choose_message`` survives run_worker's
+    unmodified object-passing all the way through a real messaging round.
+    """
+
+    def __init__(self) -> None:
+        self._queue = [messaging_state(), terminal_state()]
+        self.terminate_messaging_calls = 0
+
+    def state(self) -> GameState:
+        return self._queue[0]
+
+    def step(self, action: int) -> GameState:
+        raise AssertionError("step should not be called during a messaging round")
+
+    def resign(self) -> GameState:
+        raise AssertionError("resign not exercised by this test")
+
+    def send_message(self, content: str, recipients=None) -> GameState:
+        raise AssertionError("this test's agent always terminates, never chats")
+
+    def terminate_messaging(self) -> GameState:
+        self.terminate_messaging_calls += 1
+        self._queue.pop(0)
+        return self._queue[0]
+
+
+class FakeMatchForWorker:
+    def __init__(self, game_session: FakeGameSessionForWorker) -> None:
+        self.session_id = "s-1"
+        self.tournament_id = None
+        self.game_type = "repeated_pd"
+        self._game_session = game_session
+
+    def game(self) -> FakeGameSessionForWorker:
+        return self._game_session
+
+
+def test_run_worker_supports_choose_message_through_real_run_match():
+    class NegotiatingAgent:
+        def __init__(self) -> None:
+            self.choose_message_calls = 0
+
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            self.choose_message_calls += 1
+            return TERMINATE_MESSAGING
+
+    agent = NegotiatingAgent()
+    fake_game = FakeGameSessionForWorker()
+
+    exit_code = run_worker(
+        WORKER_INPUT,
+        client_factory=lambda: FakeClient(),
+        match_factory=lambda data, *, client: FakeMatchForWorker(fake_game),
+        agent_module=make_agent_module(create_agent=lambda: agent),
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert agent.choose_message_calls == 1
+    assert fake_game.terminate_messaging_calls == 1
 
 
 # -- real multiprocessing spawn compatibility (minimal, targeted) -----------

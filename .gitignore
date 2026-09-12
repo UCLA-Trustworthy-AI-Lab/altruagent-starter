@@ -1,6 +1,11 @@
 # Secrets — never commit
 .env
 
+# Leftover backup from an abnormally terminated scripts/smoke_game.py
+# --concurrent run (it swaps agent/agent.py's contents temporarily and
+# restores from this backup — see that script's own docstring).
+agent/agent.py.smoke_test_backup
+
 # Python
 __pycache__/
 *.py[cod]

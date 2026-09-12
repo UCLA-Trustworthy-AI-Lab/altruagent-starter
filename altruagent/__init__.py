@@ -44,6 +44,16 @@ own ``agent.agent.create_agent()`` call — so simultaneous matches get
 genuinely isolated contestant instances (and module-level state), not a
 single shared one. The parent only manages worker lifecycle and
 failed-match cooldowns; it never plays a match itself.
+
+Milestone 5: messaging support — both launch games (``repeated_pd``,
+``avalon``) default to ``messaging_enabled=True`` and block ``/step`` while
+in a MESSAGING phase, so a contestant needs *some* way through it.
+``GameSession.send_message``/``.terminate_messaging`` are the transport;
+``choose_message`` (optional, alongside ``choose_action`` on whatever
+``create_agent()`` returns) is the contestant hook — ``SendMessage(...)`` to
+chat, or ``TERMINATE_MESSAGING`` to vote the round closed. A contestant that
+never defines ``choose_message`` gets ``TERMINATE_MESSAGING`` automatically
+every round, so existing move-only agents keep working unchanged.
 """
 
 from .client import AltruAgentClient
@@ -55,6 +65,7 @@ from .models import (
     DecisionContext,
     GameState,
     Match,
+    Message,
     NextAction,
     PlayerRef,
     Tournament,
@@ -62,8 +73,10 @@ from .models import (
 )
 from .runner import (
     RESIGN,
+    TERMINATE_MESSAGING,
     DecisionError,
     RunnerError,
+    SendMessage,
     UnsupportedGameFlowError,
     run_game,
     run_match,
@@ -79,6 +92,7 @@ __all__ = [
     "GameSession",
     "GameState",
     "Match",
+    "Message",
     "NextAction",
     "PlayerRef",
     "Tournament",
@@ -88,8 +102,10 @@ __all__ = [
     "AuthenticationError",
     "PlatformError",
     "RESIGN",
+    "TERMINATE_MESSAGING",
     "RunnerError",
     "DecisionError",
+    "SendMessage",
     "UnsupportedGameFlowError",
     "run_game",
     "run_match",

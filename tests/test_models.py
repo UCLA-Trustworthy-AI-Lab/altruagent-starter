@@ -9,6 +9,7 @@ from altruagent.models import (
     AgentSessions,
     GameState,
     Match,
+    Message,
     NextAction,
     Tournament,
     TournamentViewer,
@@ -134,6 +135,81 @@ def test_game_state_next_actions_can_have_multiple_entries():
 
     assert [a.action for a in state.next_actions] == ["send_message", "terminate_messaging"]
     assert all(isinstance(a, NextAction) for a in state.next_actions)
+
+
+# -- messaging (Milestone 5) ----------------------------------------------
+
+
+def test_message_from_dict_parses_all_fields():
+    message = Message.from_dict(
+        {
+            "index": 3,
+            "sender": 0,
+            "recipients": [1],
+            "content": "let's cooperate",
+            "type": "chat",
+            "sent_at": "2026-01-01T00:00:00Z",
+            "move_index": 2,
+        }
+    )
+
+    assert message.index == 3
+    assert message.sender == 0
+    assert message.recipients == [1]
+    assert message.content == "let's cooperate"
+    assert message.type == "chat"
+    assert message.move_index == 2
+
+
+def test_message_from_dict_tolerates_missing_fields():
+    message = Message.from_dict({})
+
+    assert message.index == 0
+    assert message.sender == 0
+    assert message.recipients == []
+    assert message.content == ""
+    assert message.type == "chat"
+    assert message.move_index == 0
+
+
+def test_game_state_parses_new_messages_as_typed_message_objects():
+    state = GameState.from_dict(
+        _base_game_state_payload(
+            messaging_enabled=True,
+            phase="messaging",
+            messaging_mode="per_all_moves",
+            terminated_messaging=[1],
+            new_messages=[
+                {
+                    "index": 0,
+                    "sender": 1,
+                    "recipients": [],
+                    "content": "hello",
+                    "type": "chat",
+                    "sent_at": "2026-01-01T00:00:00Z",
+                    "move_index": 0,
+                }
+            ],
+        )
+    )
+
+    assert state.messaging_mode == "per_all_moves"
+    assert state.terminated_messaging == [1]
+    assert len(state.new_messages) == 1
+    assert isinstance(state.new_messages[0], Message)
+    assert state.new_messages[0].content == "hello"
+    assert state.new_messages[0].sender == 1
+
+
+def test_game_state_messaging_fields_default_when_absent():
+    payload = _base_game_state_payload()
+    state = GameState.from_dict(payload)
+
+    assert state.new_messages == []
+    assert state.terminated_messaging == []
+    assert state.messaging_mode == "per_move"
+    assert state.messaging_enabled is False
+    assert state.phase == "moving"
 
 
 def test_game_state_preserves_unknown_game_specific_extra_fields():
