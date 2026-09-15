@@ -38,11 +38,14 @@ agent is left claimed afterward; there is no safe deletion endpoint.
 
 Contestant file handling: exactly like smoke_game.py's `--concurrent` mode,
 this temporarily replaces `agent/agent.py`'s *contents* with one of the two
-example files' contents (backed up first, always restored in `finally`,
-with the same leftover-backup self-healing check at startup) — this is the
-one proven-reliable way to make a real `python -m agent` subprocess run
-specific, deterministic contestant logic without touching
-altruagent.worker/supervisor/runner.
+example files' contents via `scripts/_agent_file_swap.py` (backed up first,
+always restored, regardless of outcome or interruption) — this is the one
+proven-reliable way to make a real `python -m agent` subprocess run specific,
+deterministic contestant logic without touching
+altruagent.worker/supervisor/runner. If a leftover backup from a previous,
+abnormally-terminated run is found, this refuses to guess which file holds
+your real code and asks you to resolve it by hand — see that module's
+docstring.
 
 Bounded by design: explicit per-scenario match-completion timeout, explicit
 subprocess-startup timeout, and subprocess termination + `.wait()` in a
@@ -131,6 +134,8 @@ import httpx  # noqa: E402
 
 from altruagent.client import AltruAgentClient  # noqa: E402
 
+from _agent_file_swap import AgentFileSwapError, restore_real_agent, temporary_agent  # noqa: E402
+
 NUM_ROUNDS = 3  # small on purpose — bounds how many messaging<->moving cycles this test waits through
 HTTP_TIMEOUT_SECONDS = 10.0
 COMPETITION_POLL_TIMEOUT_SECONDS = 60.0
@@ -141,8 +146,6 @@ MATCH_POLL_INTERVAL_SECONDS = 3.0
 SUBPROCESS_TERMINATE_TIMEOUT_SECONDS = 10.0
 
 EXAMPLES_DIR = REPO_ROOT / "examples"
-AGENT_FILE = REPO_ROOT / "agent" / "agent.py"
-AGENT_FILE_BACKUP = AGENT_FILE.with_suffix(".py.smoke_test_backup")
 
 SCENARIOS = {
     "default": EXAMPLES_DIR / "basic_agent.py",       # no choose_message -> auto-terminate
@@ -297,25 +300,9 @@ def wait_for_completed(poll: Callable[[], dict]) -> dict:
     )
 
 
-# -- contestant file swap (identical mechanism to smoke_game.py --concurrent) --
-
-
-def _install_scenario_agent(scenario: str) -> None:
-    if AGENT_FILE_BACKUP.exists():
-        print(
-            "[WARN] Found a leftover agent.py.smoke_test_backup from a previous "
-            "run that didn't finish cleanly — restoring the real agent.py from "
-            "it before continuing."
-        )
-        AGENT_FILE_BACKUP.replace(AGENT_FILE)
-    source_path = SCENARIOS[scenario]
-    AGENT_FILE_BACKUP.write_text(AGENT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
-    AGENT_FILE.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-
-def _restore_real_agent() -> None:
-    if AGENT_FILE_BACKUP.exists():
-        AGENT_FILE_BACKUP.replace(AGENT_FILE)
+# -- contestant file swap (shared with smoke_game.py --concurrent — see
+# scripts/_agent_file_swap.py for the install/restore mechanics and the
+# safety rules around a leftover backup from a crashed prior run) -----------
 
 
 # -- one scenario ------------------------------------------------------------
@@ -356,49 +343,60 @@ def run_scenario(
     finally:
         http.close()
 
-    _install_scenario_agent(scenario)
-    processes: list[subprocess.Popen] = []
     try:
-        for label, api_key in (("primary", primary_api_key), ("opponent", opponent_api_key)):
-            env = {**os.environ, "ALTRUAGENT_CONTROL_URL": control_url, "ALTRUAGENT_API_KEY": api_key}
-            process = subprocess.Popen(
-                [sys.executable, "-m", "agent"],
-                cwd=str(REPO_ROOT),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            processes.append(process)
-            print(f"[{scenario}] started `python -m agent` for {label}, pid={process.pid}")
-
-        # Startup sanity check: both processes must still be alive shortly
-        # after launch (an immediate exit means a config/import error).
-        time.sleep(min(SUBPROCESS_STARTUP_TIMEOUT_SECONDS, 5.0))
-        for process in processes:
-            if process.poll() is not None:
-                _fail(
-                    f"`python -m agent` exited immediately (code {process.returncode}) "
-                    f"during scenario {scenario!r} — see its output above/below."
-                )
-
-        control_url_client = httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)
-        try:
-            wait_for_completed(lambda: control_url_client.get(f"{control_url}/competitions/{session_id}").json())
-        finally:
-            control_url_client.close()
-        _checkpoint(f"scenario {scenario!r} match completed via real python -m agent subprocesses")
-    finally:
-        for process in processes:
-            if process.poll() is None:
-                process.terminate()
-        for process in processes:
+        with temporary_agent(SCENARIOS[scenario].read_text(encoding="utf-8")):
+            processes: list[subprocess.Popen] = []
             try:
-                process.wait(timeout=SUBPROCESS_TERMINATE_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=SUBPROCESS_TERMINATE_TIMEOUT_SECONDS)
-        _restore_real_agent()
+                for label, api_key in (("primary", primary_api_key), ("opponent", opponent_api_key)):
+                    env = {
+                        **os.environ,
+                        "ALTRUAGENT_CONTROL_URL": control_url,
+                        "ALTRUAGENT_API_KEY": api_key,
+                    }
+                    # Inherit this process's stdout/stderr rather than capturing
+                    # to a pipe nobody reads: a captured-but-undrained pipe can
+                    # fill up and block a chatty child indefinitely, and the
+                    # failure message below promises the child's output is
+                    # visible "above/below" — which is only true if it was
+                    # never captured in the first place.
+                    process = subprocess.Popen(
+                        [sys.executable, "-m", "agent"],
+                        cwd=str(REPO_ROOT),
+                        env=env,
+                    )
+                    processes.append(process)
+                    print(f"[{scenario}] started `python -m agent` for {label}, pid={process.pid}")
+
+                # Startup sanity check: both processes must still be alive shortly
+                # after launch (an immediate exit means a config/import error).
+                time.sleep(min(SUBPROCESS_STARTUP_TIMEOUT_SECONDS, 5.0))
+                for process in processes:
+                    if process.poll() is not None:
+                        _fail(
+                            f"`python -m agent` exited immediately (code {process.returncode}) "
+                            f"during scenario {scenario!r} — see its output above/below."
+                        )
+
+                control_url_client = httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)
+                try:
+                    wait_for_completed(
+                        lambda: control_url_client.get(f"{control_url}/competitions/{session_id}").json()
+                    )
+                finally:
+                    control_url_client.close()
+                _checkpoint(f"scenario {scenario!r} match completed via real python -m agent subprocesses")
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
+                for process in processes:
+                    try:
+                        process.wait(timeout=SUBPROCESS_TERMINATE_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=SUBPROCESS_TERMINATE_TIMEOUT_SECONDS)
+    except AgentFileSwapError as exc:
+        _fail(str(exc))
 
 
 # -- Milestone 6: direct MCPGameSession checks (--mcp) -----------------------
@@ -670,7 +668,10 @@ def main() -> int:
         print(f"\nACCEPTANCE TEST FAILED: {exc}")
         return 1
     finally:
-        _restore_real_agent()  # double safety net, on top of run_scenario's own finally
+        # Idempotent no-op in the normal case — run_scenario's own
+        # temporary_agent(...) context manager already restores agent.py
+        # unconditionally. Kept as a harmless extra safety net.
+        restore_real_agent()
         primary.close()
 
 

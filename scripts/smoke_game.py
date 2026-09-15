@@ -117,6 +117,8 @@ from altruagent.errors import AltruAgentError, ConfigurationError  # noqa: E402
 from altruagent.runner import RESIGN  # noqa: E402
 from altruagent.runtime import run_once  # noqa: E402
 
+from _agent_file_swap import AgentFileSwapError, temporary_agent  # noqa: E402
+
 COMPETITION_GAME_TYPE = "tic_tac_toe"
 DEFAULT_POLL_TIMEOUT_SECONDS = 60.0
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
@@ -338,10 +340,10 @@ def wait_for_tournament_in_progress(
 # altruagent/worker.py, altruagent/supervisor.py, or altruagent/runner.py,
 # and no change to what create_agent() means for a real contestant (this
 # only ever touches the file during this one function's own run, and only
-# ever with a real backup in place first).
-AGENT_FILE = Path(__file__).resolve().parent.parent / "agent" / "agent.py"
-AGENT_FILE_BACKUP = AGENT_FILE.with_suffix(".py.smoke_test_backup")
-
+# ever with a real backup in place first). The actual install/restore
+# mechanics — including the safety rules around a leftover backup from a
+# crashed prior run — live in scripts/_agent_file_swap.py, shared with
+# acceptance_test.py's identical need.
 _DETERMINISTIC_RESIGN_AGENT_SOURCE = '''"""TEMPORARY FILE — written by scripts/smoke_game.py --concurrent for the
 duration of the Milestone 4C concurrency check, and restored automatically
 when it finishes. If you are reading this and did not just run that check,
@@ -356,33 +358,6 @@ from altruagent import RESIGN
 def create_agent():
     return lambda state, context: RESIGN
 '''
-
-
-def _install_deterministic_resign_agent() -> None:
-    """Back up the real agent/agent.py, then replace it with a hardcoded
-    create_agent() that always returns RESIGN. Self-healing: if a backup
-    from a previous, abnormally-terminated run is already present, restores
-    the real file from it first rather than risking clobbering an
-    already-swapped file.
-    """
-    if AGENT_FILE_BACKUP.exists():
-        print(
-            "[WARN] Found a leftover agent.py.smoke_test_backup from a previous "
-            "run that didn't finish cleanly — restoring the real agent.py from "
-            "it before continuing."
-        )
-        AGENT_FILE_BACKUP.replace(AGENT_FILE)
-
-    AGENT_FILE_BACKUP.write_text(AGENT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
-    AGENT_FILE.write_text(_DETERMINISTIC_RESIGN_AGENT_SOURCE, encoding="utf-8")
-
-
-def _restore_real_agent() -> None:
-    """Undo _install_deterministic_resign_agent(). Safe to call even if
-    installation never happened (no backup present -> no-op).
-    """
-    if AGENT_FILE_BACKUP.exists():
-        AGENT_FILE_BACKUP.replace(AGENT_FILE)
 
 
 WORKER_COMPLETION_TIMEOUT_SECONDS = 30.0
@@ -421,7 +396,6 @@ def run_concurrent_check(primary: AltruAgentClient, http: httpx.Client, control_
 
     opponent: AltruAgentClient | None = None
     registry: WorkerRegistry | None = None
-    agent_file_swapped = False
     try:
         primary_agent = primary.me()
         if not primary_agent.is_claimed:
@@ -479,45 +453,53 @@ def run_concurrent_check(primary: AltruAgentClient, http: httpx.Client, control_
         game_sessions_by_id = {sid: matches_by_id[sid].rest_game() for sid in session_ids}
         _checkpoint("game_server_url resolved for both matches ahead of time")
 
-        _install_deterministic_resign_agent()
-        agent_file_swapped = True
-        _checkpoint(
-            "temporary deterministic-RESIGN agent/agent.py installed "
-            "(restored automatically at the end of this run)"
-        )
-
         registry = WorkerRegistry()
-        run_once_concurrent(primary, registry=registry, failed_until={}, agent_id=primary_agent.id)
-        pids = registry.pids()
-        if set(pids) != set(session_ids):
-            _fail(f"Expected a worker for each of {session_ids}, got {pids}.")
-        if len(set(pids.values())) != 2:
-            _fail(f"Expected two DISTINCT process PIDs, got {pids}.")
-        _checkpoint(f"two distinct worker processes started concurrently (pids={pids})")
+        try:
+            with temporary_agent(_DETERMINISTIC_RESIGN_AGENT_SOURCE):
+                _checkpoint(
+                    "temporary deterministic-RESIGN agent/agent.py installed "
+                    "(restored automatically at the end of this run)"
+                )
 
-        # Bounded wait for both workers to finish ON THEIR OWN — each one
-        # independently builds its client, calls create_agent() once, reaches
-        # run_match(), resigns, and exits; nothing here terminates a worker
-        # that's still legitimately running its match.
-        deadline = time.monotonic() + WORKER_COMPLETION_TIMEOUT_SECONDS
-        reaped: dict[str, int] = {}
-        while len(reaped) < 2 and time.monotonic() < deadline:
-            reaped.update(registry.reap_finished())
-            if len(reaped) < 2:
-                time.sleep(WORKER_REAP_POLL_INTERVAL_SECONDS)
+                run_once_concurrent(
+                    primary, registry=registry, failed_until={}, agent_id=primary_agent.id
+                )
+                pids = registry.pids()
+                if set(pids) != set(session_ids):
+                    _fail(f"Expected a worker for each of {session_ids}, got {pids}.")
+                if len(set(pids.values())) != 2:
+                    _fail(f"Expected two DISTINCT process PIDs, got {pids}.")
+                _checkpoint(f"two distinct worker processes started concurrently (pids={pids})")
 
-        if len(reaped) < 2:
-            _fail(
-                f"Only {len(reaped)}/2 workers exited naturally within "
-                f"{WORKER_COMPLETION_TIMEOUT_SECONDS:.0f}s (reaped so far: {reaped})."
-            )
-        if any(exitcode != 0 for exitcode in reaped.values()):
-            _fail(f"One or more workers exited with a non-success code: {reaped}")
-        _checkpoint(f"both workers exited naturally after resigning (exit codes={reaped})")
+                # Bounded wait for both workers to finish ON THEIR OWN — each one
+                # independently builds its client, calls create_agent() once, reaches
+                # run_match(), resigns, and exits; nothing here terminates a worker
+                # that's still legitimately running its match.
+                deadline = time.monotonic() + WORKER_COMPLETION_TIMEOUT_SECONDS
+                reaped: dict[str, int] = {}
+                while len(reaped) < 2 and time.monotonic() < deadline:
+                    reaped.update(registry.reap_finished())
+                    if len(reaped) < 2:
+                        time.sleep(WORKER_REAP_POLL_INTERVAL_SECONDS)
 
-        if len(registry) != 0:
-            _fail(f"Expected the registry to be empty after reaping both workers, still tracking {len(registry)}.")
-        _checkpoint("supervisor registry confirms both workers reaped — none remaining")
+                if len(reaped) < 2:
+                    _fail(
+                        f"Only {len(reaped)}/2 workers exited naturally within "
+                        f"{WORKER_COMPLETION_TIMEOUT_SECONDS:.0f}s (reaped so far: {reaped})."
+                    )
+                if any(exitcode != 0 for exitcode in reaped.values()):
+                    _fail(f"One or more workers exited with a non-success code: {reaped}")
+                _checkpoint(f"both workers exited naturally after resigning (exit codes={reaped})")
+
+                if len(registry) != 0:
+                    _fail(
+                        "Expected the registry to be empty after reaping both workers, "
+                        f"still tracking {len(registry)}."
+                    )
+                _checkpoint("supervisor registry confirms both workers reaped — none remaining")
+        except AgentFileSwapError as exc:
+            _fail(str(exc))
+        _checkpoint("cleanup: real agent/agent.py restored")
 
         for session_id, game in game_sessions_by_id.items():
             final_state = game.state()
@@ -541,9 +523,6 @@ def run_concurrent_check(primary: AltruAgentClient, http: httpx.Client, control_
         if registry is not None and len(registry) > 0:
             print(f"[WARN] cleanup: terminating {len(registry)} still-running worker(s)")
             registry.terminate_all(timeout=10.0)
-        if agent_file_swapped:
-            _restore_real_agent()
-            print("[OK] cleanup: real agent/agent.py restored")
         if opponent is not None:
             opponent.close()
 

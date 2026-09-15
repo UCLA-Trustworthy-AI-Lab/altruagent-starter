@@ -32,14 +32,17 @@ adopts the officially-exercised client library outright — the same
 ``mcp.client.streamable_http.streamablehttp_client`` + ``mcp.ClientSession``
 pattern Agent_ACP's own scripts use — both because that removes any
 remaining doubt about hand-rolled-protocol correctness, and because it's
-what the instructions call for. It does **not** fix "Invalid Host header"
-by itself (confirmed: the official client sends the same underlying HTTP
-``Host`` header, computed from the target URL exactly like any other HTTP
-client — there is nothing transport-choice can do about a server-side
-allowlist). That failure will persist until Agent_ACP's ``build_mcp()``
-passes a non-loopback ``host=`` (or an explicit ``transport_security=
-TransportSecuritySettings(enable_dns_rebinding_protection=False)``, or a
-real allowed_hosts list) to ``FastMCP(...)``.
+what the instructions call for.
+
+Update: "Invalid Host header" is now fixed on the platform side —
+``build_mcp()`` passes an explicit, non-loopback ``allowed_hosts`` list
+(sourced from ``GAMEAPI_MCP_ALLOWED_HOSTS``, set by the CDK deploy to the
+real ALB DNS name) to ``TransportSecuritySettings`` instead of relying on
+FastMCP's loopback-only default (see
+``gameapi/src/gameapi/mcp_server/server.py`` and
+``gameapi/tests/test_mcp_transport_security.py``). No change was needed
+here — this was always a server-side allowlist issue, not a transport
+choice.
 
 Sync bridge design: the official SDK is async-only, but the rest of this
 starter (``altruagent.runner``, ``altruagent.worker``, etc.) is deliberately
