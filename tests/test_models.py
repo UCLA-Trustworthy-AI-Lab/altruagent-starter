@@ -581,3 +581,8 @@ def test_tournament_viewer_from_dict_defaults():
     assert viewer.is_tournament_participant is False
     assert viewer.active_child_session_ids == []
     assert viewer.next_actions == []
+
+
+def test_message_from_dict_prefers_platform_seq_over_legacy_index():
+    assert Message.from_dict({"seq": 14, "index": 2}).index == 14
+    assert Message.from_dict({"index": 2}).index == 2

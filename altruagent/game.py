@@ -23,6 +23,7 @@ gameplay loop.
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 from typing import TYPE_CHECKING
 
 from .errors import ConfigurationError
@@ -34,20 +35,33 @@ if TYPE_CHECKING:
 _HAS_SCHEME = re.compile(r"^https?://", re.IGNORECASE)
 
 
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _is_local_host(host_and_path: str) -> bool:
+    host = urlsplit(f"//{host_and_path}").hostname or ""
+    return host in _LOCAL_HOSTS or host.endswith(".localhost")
+
+
 def _normalize_game_server_url(game_server_url: str) -> str:
     """Apply the platform's own game_server_url normalization rule.
 
-    The control plane returns this as a bare host, not a full URL — see
-    Agent_ACP/backend/src/services/gameAPIService.ts:79-81
-    (``getGameAPIServerUrl`` strips the scheme before returning it) — and
-    documents the fix-up itself in backend/skill/03-competitions.md
-    ("If host-only, prepend http://"). This does the same thing client-side.
+    The control plane may return this as a bare host rather than a full URL;
+    Agent_ACP's backend/skill/03-competitions.md says to prepend
+    ``https://`` in that case. Local development hosts (``localhost``,
+    ``127.0.0.1``, ``[::1]``) get ``http://`` instead, since a local GameAPI
+    doesn't serve TLS. An explicit scheme is always kept as given.
+
+    Plain ``http://`` to the deployed game server only answers with a
+    redirect, after the request (and its bearer token) already went out
+    unencrypted — so defaulting a remote host to ``http://`` is never right.
     """
     value = (game_server_url or "").strip()
     if not value:
         raise ConfigurationError("game_server_url must not be empty.")
     if not _HAS_SCHEME.match(value):
-        value = f"http://{value}"
+        scheme = "http" if _is_local_host(value) else "https"
+        value = f"{scheme}://{value}"
     return value.rstrip("/")
 
 

@@ -1,8 +1,9 @@
 """Unit tests for altruagent.runner (run_game / run_match) — MCP-first.
 
 All gameplay is driven through a lightweight FakeMCPGameSession test double —
-run_game only needs an object exposing get_state()/get_legal_actions()/
-play_action()/send_message()/get_messages()/resign()/get_result(), so there
+run_game only needs an object exposing get_state()/wait_for_update()/
+get_legal_actions()/play_action()/send_message()/get_messages()/resign()/
+get_result(), so there
 is no need to mock HTTP for these; MCPGameSession's own transport is covered
 by tests/test_mcp_game.py and tests/test_mcp_transport.py.
 """
@@ -43,8 +44,12 @@ class FakeMCPGameSession:
         self._result_queue: list = []
         self.play_action_calls: list[dict] = []
         self.send_message_calls: list[dict] = []
+        self.wait_calls: list[dict] = []
+        self.get_state_calls = 0
         self.get_legal_actions_calls = 0
         self.resign_calls = 0
+        # False simulates a server that predates wait_for_update.
+        self.supports_wait = True
 
     # -- queueing helpers (chainable) ----------------------------------
 
@@ -82,6 +87,37 @@ class FakeMCPGameSession:
     # -- MCPGameSession-shaped interface --------------------------------
 
     def get_state(self) -> GameState:
+        self.get_state_calls += 1
+        return self._pop(self._state_queue)
+
+    def wait_for_update(
+        self,
+        *,
+        since_version,
+        since_message_seq=None,
+        since_is_current_actor=None,
+        since_phase=None,
+        timeout_seconds=None,
+    ) -> GameState:
+        """Pops from the same state queue as get_state — a wait's result is
+        just the next state.
+        """
+        self.wait_calls.append(
+            {
+                "since_version": since_version,
+                "since_message_seq": since_message_seq,
+                "since_is_current_actor": since_is_current_actor,
+                "since_phase": since_phase,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        if not self.supports_wait:
+            raise MCPToolError(
+                "MCP tool 'wait_for_update' failed at the protocol level: "
+                "Unknown tool: wait_for_update",
+                status_code=None,
+                error_code=None,
+            )
         return self._pop(self._state_queue)
 
     def get_legal_actions(self) -> dict:
@@ -369,12 +405,65 @@ def test_wait_for_opponent_does_not_invoke_decision_or_fetch_legal_actions():
         raise AssertionError("choose_action should not be called while waiting")
 
     sleep_calls = []
-    game = FakeMCPGameSession().queue_state(waiting_state(), terminal_state()).queue_result(result_dict())
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(state_version=4), terminal_state())
+        .queue_result(result_dict())
+    )
     result = run_game(game, CONTEXT, choose_action, sleep=sleep_calls.append)
 
     assert result.is_terminal is True
-    assert sleep_calls == [5.0]  # DEFAULT_WAIT_SECONDS
+    # Long-polls the server rather than sleeping client-side.
+    # Sends what it last saw, so a turn/phase change that lands before the
+    # call still wakes it.
+    assert game.wait_calls == [
+        {
+            "since_version": 4,
+            "since_message_seq": None,
+            "since_is_current_actor": False,
+            "since_phase": "moving",
+            "timeout_seconds": 20.0,
+        }
+    ]
+    assert sleep_calls == []
     assert game.get_legal_actions_calls == 0
+
+
+def test_wait_falls_back_to_sleep_when_server_lacks_wait_for_update():
+    sleep_calls = []
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), waiting_state(), terminal_state())
+        .queue_result(result_dict())
+    )
+    game.supports_wait = False
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=sleep_calls.append)
+
+    assert result.is_terminal is True
+    # Tried once, then remembered the server doesn't have it.
+    assert len(game.wait_calls) == 1
+    assert sleep_calls == [5.0, 5.0]  # DEFAULT_WAIT_SECONDS
+
+
+def test_wait_for_update_protocol_error_other_than_unknown_tool_propagates():
+    game = FakeMCPGameSession().queue_state(
+        waiting_state(),
+        MCPToolError("transport failed", status_code=None, error_code=None),
+    )
+
+    with pytest.raises(MCPToolError):
+        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
+
+
+def test_wait_passes_highest_seen_message_seq():
+    state = waiting_state(
+        state_version=3,
+        new_messages=[{"seq": 5, "sender": 1, "content": "hi"}, {"seq": 8, "sender": 2, "content": "yo"}],
+    )
+    game = FakeMCPGameSession().queue_state(state, terminal_state()).queue_result(result_dict())
+    run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
+
+    assert game.wait_calls[0]["since_message_seq"] == 8
 
 
 def test_terminal_state_exits_cleanly_and_fetches_result():
@@ -407,7 +496,8 @@ def test_repeated_wait_then_make_move_transition():
     result = run_game(game, CONTEXT, choose_action, sleep=sleep_calls.append)
 
     assert result.is_terminal is True
-    assert len(sleep_calls) == 2
+    assert len(game.wait_calls) == 2
+    assert sleep_calls == []
     assert len(calls) == 1
 
 
@@ -513,24 +603,29 @@ def test_custom_choose_message_sends_chat():
 
     game = (
         FakeMCPGameSession()
-        .queue_state(messaging_state(), messaging_state())
-        .queue_send_message({"accepted": True, "phase": "messaging"})
+        # The wait's result is terminal, which ends the loop after one round.
+        .queue_state(messaging_state(state_version=2), terminal_state())
+        .queue_send_message(
+            {"accepted": True, "phase": "messaging", "message": {"seq": 11, "type": "chat"}}
+        )
+        .queue_result(result_dict())
     )
-    # Only run one iteration's worth by stopping after asserting the call —
-    # use a sleep spy that raises to short-circuit the (still-messaging) loop.
-    sleep_calls = []
-
-    def stop_after_one(_seconds):
-        sleep_calls.append(_seconds)
-        raise SystemExit()
-
-    with pytest.raises(SystemExit):
-        run_game(game, CONTEXT, Agent(), sleep=stop_after_one)
+    run_game(game, CONTEXT, Agent(), sleep=no_sleep)
 
     assert game.send_message_calls == [
         {"message_type": "chat", "content": "let's cooperate", "recipients": [1]}
     ]
-    assert sleep_calls == [5.0]  # phase stayed "messaging" -> must not busy-poll
+    # Phase stayed "messaging" -> waits (past this agent's own message)
+    # instead of busy-polling.
+    assert game.wait_calls == [
+        {
+            "since_version": 2,
+            "since_message_seq": 11,
+            "since_is_current_actor": True,
+            "since_phase": "messaging",
+            "timeout_seconds": 20.0,
+        }
+    ]
 
 
 def test_custom_choose_message_can_terminate_explicitly():
@@ -613,22 +708,33 @@ def test_repeated_messaging_rounds_across_the_match():
     assert len(game.play_action_calls) == 1
 
 
-def test_messaging_still_open_after_terminate_sleeps_instead_of_busy_polling():
-    # This agent already terminated but the opponent hasn't — send_message's
-    # own idempotent no-op still reports phase="messaging". There is no
-    # REST-next_actions-style "just wait" signal for this in MCP, so the
-    # runner must sleep rather than hammer choose_message/send_message.
-    sleep_calls = []
+def test_messaging_still_open_after_terminate_waits_instead_of_busy_polling():
+    # This agent already terminated but others haven't — send_message's own
+    # idempotent no-op still reports phase="messaging", so the runner must
+    # wait rather than hammer choose_message/send_message.
     game = (
         FakeMCPGameSession()
         .queue_state(messaging_state(), terminal_state())
         .queue_send_message({"accepted": True, "phase": "messaging"})
         .queue_result(result_dict())
     )
-    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=sleep_calls.append)
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
 
     assert result.is_terminal is True
-    assert sleep_calls == [5.0]
+    assert len(game.wait_calls) == 1
+    assert len(game.send_message_calls) == 1
+
+
+def test_messaging_closed_by_send_refetches_immediately_without_waiting():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(), terminal_state())
+        .queue_send_message({"accepted": True, "phase": "moving"})
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
+
+    assert game.wait_calls == []
 
 
 def test_invalid_choose_message_return_value_rejected():
@@ -972,3 +1078,84 @@ def test_run_match_never_constructs_a_rest_gamesession():
     run_match(match, "agent-1", lambda s, c: s.legal_actions[0], sleep=no_sleep)
 
     assert game_calls == [1]
+
+
+# -- current MCP payloads: embedded legal_actions, post-move state ------------
+
+
+def embedded(state_version: int, *ints) -> dict:
+    return int_actions(*ints, state_version=state_version)
+
+
+def test_embedded_legal_actions_used_without_get_legal_actions_call():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(state_version=3, legal_actions=embedded(3, 0, 1)), terminal_state())
+        .queue_play_action(play_action_result())
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: s.legal_actions[1], sleep=no_sleep)
+
+    assert game.get_legal_actions_calls == 0
+    assert game.play_action_calls == [{"action_id": "1", "action": None, "state_version": 3}]
+
+
+def test_play_action_post_move_state_used_without_refetch():
+    post_move = {
+        "session_id": SESSION_ID,
+        "state_version": 4,
+        "phase": "moving",
+        "is_current_actor": True,
+        "is_terminal": False,
+        "legal_actions": embedded(4, 7),
+    }
+    result = dict(play_action_result(state_version=4), state=post_move)
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(state_version=3, legal_actions=embedded(3, 0)), terminal_state())
+        .queue_play_action(result, play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+    run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    # Second move came straight from the first play_action's `state`.
+    assert game.play_action_calls == [
+        {"action_id": "0", "action": None, "state_version": 3},
+        {"action_id": "7", "action": None, "state_version": 4},
+    ]
+    # Initial read + one after the final (completed, state-less) move.
+    assert game.get_state_calls == 2
+
+
+def test_eliminated_agent_never_acts_or_chats_and_waits_for_the_end():
+    def never(state, context):
+        raise AssertionError("an eliminated agent must not be asked to decide")
+
+    class Agent:
+        choose_action = staticmethod(never)
+        choose_message = staticmethod(never)
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(eliminated=True, is_current_actor=False), terminal_state())
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, Agent(), sleep=no_sleep)
+
+    assert result.is_terminal is True
+    assert game.send_message_calls == []
+    assert len(game.wait_calls) == 1
+
+
+def test_player_eliminated_race_refetches_instead_of_crashing():
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(legal_actions=embedded(0, 0)), terminal_state())
+        .queue_play_action(
+            MCPToolError("eliminated", status_code=None, error_code="PLAYER_ELIMINATED")
+        )
+        .queue_result(result_dict())
+    )
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert result.is_terminal is True

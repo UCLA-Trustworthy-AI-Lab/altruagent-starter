@@ -3,46 +3,12 @@ OFFICIAL `mcp` Python SDK client — not a hand-rolled JSON-RPC-over-HTTP
 implementation (see "why" below).
 
 History: an earlier version of this module hand-rolled the JSON-RPC 2.0
-envelope directly over ``AltruAgentClient.request()``, reasoned from reading
-the server's ``streamable_http.py`` transport code (stateless_http=True,
-json_response=True implies no SSE framing and no initialize handshake is
-*required*). That reasoning was correct as far as it went, but the first
-real request against the deployed platform failed immediately with
-``Invalid Host header`` (HTTP 421) — a check the hand-rolled client had no
-way to have anticipated from reading the transport-framing code alone.
-Root-caused (Agent_ACP is read-only; this was investigated, not patched)
-to gameapi/src/gameapi/mcp_server/server.py's ``build_mcp()`` never passing
-``host=`` to ``FastMCP(...)``, which defaults to ``host="127.0.0.1"``
-(mcp/server/fastmcp/server.py); FastMCP auto-enables DNS-rebinding
-protection whenever that constructor-time ``host`` value is a loopback
-name, hardcoding ``allowed_hosts=["127.0.0.1:*","localhost:*","[::1]:*"]`` —
-a heuristic based on a config value nobody overrides, not gameapi's actual
-bind address or the real host contestants connect to. This rejects every
-real remote ``Host`` header, for ANY client (this starter's own, or the
-official SDK) — confirmed by reading gameapi's own real scripts
-(``scripts/mcp_smoke.py``, ``scripts/pokemon_mcp_play.py``): both default to
-``http://localhost:...``, i.e. neither has ever actually been run against a
-real deployed instance either, so this appears to be a genuine, previously
-unexercised platform gap rather than a transport mistake on this SDK's
-side. See the Milestone 6 follow-up report for the full evidence trail.
-
-Given that, per instruction, do not spoof/rewrite the Host header to work
-around it, and do not modify Agent_ACP (read-only). This module instead
-adopts the officially-exercised client library outright — the same
-``mcp.client.streamable_http.streamablehttp_client`` + ``mcp.ClientSession``
-pattern Agent_ACP's own scripts use — both because that removes any
-remaining doubt about hand-rolled-protocol correctness, and because it's
-what the instructions call for.
-
-Update: "Invalid Host header" is now fixed on the platform side —
-``build_mcp()`` passes an explicit, non-loopback ``allowed_hosts`` list
-(sourced from ``GAMEAPI_MCP_ALLOWED_HOSTS``, set by the CDK deploy to the
-real ALB DNS name) to ``TransportSecuritySettings`` instead of relying on
-FastMCP's loopback-only default (see
-``gameapi/src/gameapi/mcp_server/server.py`` and
-``gameapi/tests/test_mcp_transport_security.py``). No change was needed
-here — this was always a server-side allowlist issue, not a transport
-choice.
+envelope directly over ``AltruAgentClient.request()``. It was replaced with
+the official ``mcp.client.streamable_http.streamablehttp_client`` +
+``mcp.ClientSession`` pattern Agent_ACP's own scripts use, which removes any
+doubt about hand-rolled-protocol correctness. (The "Invalid Host header"
+HTTP 421 first seen against the deployed server was a platform-side
+allowed-hosts issue, since fixed in Agent_ACP; no client change was needed.)
 
 Sync bridge design: the official SDK is async-only, but the rest of this
 starter (``altruagent.runner``, ``altruagent.worker``, etc.) is deliberately
@@ -67,8 +33,8 @@ not a shortcut:
   process runs asyncio.
 - This sidesteps every cross-call event-loop-lifetime question entirely
   (Windows' default Proactor loop, multiprocessing ``spawn`` workers each
-  starting with no inherited loop state, a match's ``sleep(wait_seconds)``
-  between turns potentially lasting a long time) — there is no persistent
+  starting with no inherited loop state, a match potentially idling a long
+  time between turns) — there is no persistent
   loop or connection to keep alive, reconnect, or leak.
 - The cost is one extra TCP handshake + MCP ``initialize`` round-trip per
   tool call versus a kept-open session. For a turn-based game polling at
@@ -105,9 +71,8 @@ class MCPToolError(PlatformError):
     application-level error the tool itself returned (``error_code`` is one
     of MCP's own codes, e.g. ``STALE_STATE``/``GAME_ALREADY_COMPLETE``), or a
     protocol/transport-level failure (``error_code`` is ``None`` in that
-    case — including an HTTP-level rejection like the 421 "Invalid Host
-    header" described in this module's docstring, surfaced with
-    ``status_code=421``).
+    case — including an HTTP-level rejection, surfaced with its
+    ``status_code``).
     """
 
 

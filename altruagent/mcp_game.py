@@ -7,8 +7,9 @@ always play through this class (see ``altruagent.runner``). ``GameSession``
 testing tool (``scripts/check_game.py``) — kept unmodified, not used here.
 
 Method names mirror Agent_ACP's MCP tool names directly (``get_game_state``,
-``get_legal_actions``, ``play_action``, ``send_message``, ``get_messages``,
-``resign``, ``get_result`` — gameapi/src/gameapi/mcp_server/server.py) rather
+``wait_for_update``, ``get_legal_actions``, ``play_action``, ``send_message``,
+``get_messages``, ``resign``, ``get_result`` —
+gameapi/src/gameapi/mcp_server/server.py) rather
 than REST's ``state()``/``step()``/``resign()`` shape, since the whole point
 is that this class is a thin, honest transport — all orchestration (when to
 call what, how to interpret the result) lives in ``altruagent.runner``, not
@@ -57,20 +58,55 @@ class MCPGameSession:
 
     def get_state(self) -> GameState:
         """``get_game_state`` — this agent's current view of the match.
-        Does not include ``legal_actions`` (a separate, only-called-when-
-        needed tool — see ``get_legal_actions``) or ``returns``/
-        ``termination_reason`` (see ``get_result``, only relevant once
-        terminal) — both confirmed absent from this tool's response shape.
+        When this agent can act, the payload embeds ``legal_actions`` for the
+        same ``state_version``, parsed onto ``GameState.legal_actions`` — no
+        separate ``get_legal_actions`` call needed. ``returns``/
+        ``termination_reason`` are still absent (see ``get_result``, only
+        relevant once terminal).
         """
         data = self._call("get_game_state", {"session_id": self.session_id})
         return GameState.from_mcp_state(data)
 
+    def wait_for_update(
+        self,
+        *,
+        since_version: int,
+        since_message_seq: int | None = None,
+        since_is_current_actor: bool | None = None,
+        since_phase: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> GameState:
+        """``wait_for_update`` — server-side long-poll. Returns as soon as
+        ``state_version`` differs from ``since_version``, a message newer than
+        ``since_message_seq`` is visible, whose-turn/phase changes, or the
+        game ends; otherwise after ``timeout_seconds`` (server default 20,
+        max 25). Same payload as ``get_state()`` plus ``updated`` (in
+        ``raw``), so the result can be used directly as the new state.
+
+        ``since_is_current_actor``/``since_phase`` are what the caller last
+        saw: whose turn it is and the phase can change without
+        ``state_version`` moving, and without them the server compares
+        against its own reading when the call arrives, missing a change that
+        landed just before. Servers predating these parameters ignore them.
+        """
+        arguments: dict = {"session_id": self.session_id, "since_version": since_version}
+        if since_message_seq is not None:
+            arguments["since_message_seq"] = since_message_seq
+        if since_is_current_actor is not None:
+            arguments["since_is_current_actor"] = since_is_current_actor
+        if since_phase is not None:
+            arguments["since_phase"] = since_phase
+        if timeout_seconds is not None:
+            arguments["timeout_seconds"] = timeout_seconds
+        return GameState.from_mcp_state(self._call("wait_for_update", arguments))
+
     def get_legal_actions(self) -> dict:
         """``get_legal_actions`` — the actions available right now, plus the
-        ``state_version`` to use for the next ``play_action``/``send_message``
-        call. Returns the raw dict (``{"session_id","state_version","actions"}``)
-        rather than a ``GameState``, since the runner merges this into a
-        ``GameState`` it already has (see ``GameState.from_mcp_state``).
+        ``state_version`` to use for the next ``play_action`` call. Usually
+        unnecessary (``get_state()`` already embeds it when this agent can
+        act); the runner only calls it as a fallback when the server omitted
+        it (the state moved between the server's two reads). Returns the raw
+        dict (``{"session_id","state_version","actions"}``).
         """
         return self._call("get_legal_actions", {"session_id": self.session_id})
 
@@ -83,10 +119,10 @@ class MCPGameSession:
         gameapi/src/gameapi/mcp_server/server.py's ``play_action``).
 
         Returns the raw ``{"accepted","session_id","state_version","status"}``
-        dict, not a ``GameState`` — confirmed narrower than ``get_state()``'s
-        response (no ``is_current_actor``/``phase``/``observation``), so the
-        runner always re-fetches ``get_state()`` after this rather than
-        treating the result as a drop-in replacement.
+        dict. While the game continues it also carries ``state``: this
+        agent's ``get_game_state`` payload after the move (with
+        ``legal_actions`` if it acts again), which the runner uses directly
+        instead of re-fetching.
         """
         arguments: dict = {"session_id": self.session_id, "state_version": state_version}
         if action is not None:

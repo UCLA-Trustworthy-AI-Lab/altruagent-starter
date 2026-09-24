@@ -1,7 +1,7 @@
 """Unit tests for MCPGameSession. call_tool()'s own JSON-RPC/auth/error-
 unwrapping mechanics (built on the official `mcp` SDK client) are fully
 covered in tests/test_mcp_transport.py — these tests only check that
-MCPGameSession's seven methods build the right (tool_name, arguments) pairs
+MCPGameSession's eight methods build the right (tool_name, arguments) pairs
 and parse the right response shape, by monkeypatching
 `altruagent.mcp_game.call_tool` directly rather than re-exercising the real
 async transport here too.
@@ -61,7 +61,73 @@ def test_get_state_calls_get_game_state_and_parses_generic_state(monkeypatch):
     assert state.session_id == SESSION_ID
     assert state.state_version == 2
     assert state.is_current_actor is True
-    assert state.legal_actions == []  # get_game_state alone never carries these
+    assert state.legal_actions == []  # none embedded in this payload
+
+
+def test_get_state_parses_embedded_legal_actions(monkeypatch):
+    def fake_call_tool(client, mcp_url, name, arguments):
+        return {
+            "session_id": SESSION_ID,
+            "state_version": 5,
+            "is_current_actor": True,
+            "legal_actions": {
+                "session_id": SESSION_ID,
+                "state_version": 5,
+                "actions": [{"action_id": "3", "label": "Vote Player3", "input": {}}],
+            },
+        }
+
+    patch_call_tool(monkeypatch, fake_call_tool)
+    state = make_session().get_state()
+
+    assert [a.action_id for a in state.legal_actions] == ["3"]
+    assert state.state_version == 5
+
+
+def test_wait_for_update_sends_cursors_and_parses_state(monkeypatch):
+    calls = []
+
+    def fake_call_tool(client, mcp_url, name, arguments):
+        calls.append((name, arguments))
+        return {"session_id": SESSION_ID, "state_version": 9, "updated": True}
+
+    patch_call_tool(monkeypatch, fake_call_tool)
+    state = make_session().wait_for_update(
+        since_version=8,
+        since_message_seq=4,
+        since_is_current_actor=False,
+        since_phase="moving",
+        timeout_seconds=20.0,
+    )
+
+    assert calls == [
+        (
+            "wait_for_update",
+            {
+                "session_id": SESSION_ID,
+                "since_version": 8,
+                "since_message_seq": 4,
+                "since_is_current_actor": False,
+                "since_phase": "moving",
+                "timeout_seconds": 20.0,
+            },
+        )
+    ]
+    assert state.state_version == 9
+    assert state.raw["updated"] is True
+
+
+def test_wait_for_update_omits_unset_optional_arguments(monkeypatch):
+    calls = []
+
+    def fake_call_tool(client, mcp_url, name, arguments):
+        calls.append(arguments)
+        return {"session_id": SESSION_ID}
+
+    patch_call_tool(monkeypatch, fake_call_tool)
+    make_session().wait_for_update(since_version=1)
+
+    assert calls == [{"session_id": SESSION_ID, "since_version": 1}]
 
 
 def test_mcp_url_appends_mcp_path_to_normalized_game_server_url(monkeypatch):
@@ -75,7 +141,7 @@ def test_mcp_url_appends_mcp_path_to_normalized_game_server_url(monkeypatch):
     session = MCPGameSession(FakeClient(), session_id=SESSION_ID, game_server_url="game.example.test")
     session.get_state()
 
-    assert seen_urls == ["http://game.example.test/mcp"]
+    assert seen_urls == ["https://game.example.test/mcp"]
 
 
 def test_get_legal_actions_returns_raw_dict_not_gamestate(monkeypatch):

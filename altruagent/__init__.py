@@ -70,6 +70,15 @@ actions like Pokémon's team submission), or ``RESIGN``. The REST
 ``GameSession`` (``altruagent.game``) is kept, unmodified, as a lower-level
 debug/manual-testing tool only (``scripts/check_game.py``) — it is never
 used by ``run_match``/``python -m agent``.
+
+Milestone 7: tracks Agent_ACP's 2026-09-22/23 MCP updates. The runner reads
+``legal_actions`` embedded in ``get_game_state`` and the post-move ``state``
+returned by ``play_action`` instead of extra round trips, long-polls
+``wait_for_update`` instead of sleeping between reads (falling back to
+sleeping against a server without it), and stops acting once a Werewolf
+agent is eliminated. Bare remote ``game_server_url`` hosts now default to
+``https://``. The contestant-facing games are Werewolf and the Pokémon
+types (see ``GAMES.md``).
 """
 
 from .client import AltruAgentClient

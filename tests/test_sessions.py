@@ -136,12 +136,12 @@ def test_multiple_active_matches_remain_independent():
     assert len(sessions.active) == 2
 
     game_1 = sessions.active[0].game()
-    assert game_1.game_server_url == "http://host-1:8000"
+    assert game_1.game_server_url == "https://host-1:8000"
     # Resolving match 1 must not have touched match 2's cached URL.
     assert sessions.active[1].game_server_url is None
 
     game_2 = sessions.active[1].game()
-    assert game_2.game_server_url == "http://host-2:8000"
+    assert game_2.game_server_url == "https://host-2:8000"
     # Match.game_server_url caches the raw value the server returned (not the
     # GameSession's normalized http://-prefixed form) — each match's cache is
     # independent of the other.
@@ -173,7 +173,7 @@ def test_active_match_game_performs_competition_lookup_and_builds_mcp_session():
     # for the lower-level REST debug path.
     assert isinstance(game, MCPGameSession)
     assert game.session_id == "s-1"
-    assert game.game_server_url == "http://host:8000"
+    assert game.game_server_url == "https://host:8000"
 
 
 def test_active_match_rest_game_performs_competition_lookup_and_builds_gamesession():
@@ -200,7 +200,7 @@ def test_active_match_rest_game_performs_competition_lookup_and_builds_gamesessi
     assert lookups == ["/competitions/s-1"]
     assert isinstance(game, GameSession)
     assert game.session_id == "s-1"
-    assert game.game_server_url == "http://host:8000"
+    assert game.game_server_url == "https://host:8000"
 
 
 def test_game_and_rest_game_share_the_same_cached_game_server_url():
@@ -229,7 +229,7 @@ def test_game_and_rest_game_share_the_same_cached_game_server_url():
     assert lookups == ["/competitions/s-1"]  # exactly one lookup for both
     assert isinstance(mcp_game, MCPGameSession)
     assert isinstance(rest_game, GameSession)
-    assert mcp_game.game_server_url == rest_game.game_server_url == "http://host:8000"
+    assert mcp_game.game_server_url == rest_game.game_server_url == "https://host:8000"
 
 
 def test_resolved_game_server_url_is_cached_and_not_refetched():

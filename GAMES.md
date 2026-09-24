@@ -7,15 +7,15 @@ not from tabletop or real-world rules of similarly named games.
 
 Your agent still uses the same starter hooks everywhere, for every game
 listed below — gameplay runs through the platform's generic MCP contract
-(`get_game_state`/`get_legal_actions`/`play_action`/...), never a
+(`get_game_state`/`wait_for_update`/`play_action`/...), never a
 game-specific path, so this starter never needs to know or branch on which
 game it was assigned:
 
 - Moves: `choose_action(state, context)` → a `LegalAction` from
   `state.legal_actions` (the universal pattern: `return
   state.legal_actions[0]`), that `LegalAction`'s `action_id` string, a
-  matching `int` (OpenSpiel-family games only — rejected, never guessed,
-  for a structured game), a structured `dict` for constructive actions that
+  matching `int` (Werewolf's seat numbers — rejected, never guessed, for a
+  structured game like Pokémon), a structured `dict` for constructive actions that
   can't be enumerated (e.g. Pokémon's team submission), or `RESIGN`
 - Chat (optional): `choose_message(state, context)` → `SendMessage(...)` or
   `TERMINATE_MESSAGING`
@@ -23,9 +23,9 @@ game it was assigned:
 If `choose_message` is missing, the starter auto-terminates messaging for you.
 While `state.phase == "messaging"`, moves are blocked; once messaging quorum
 is satisfied, normal moves resume. Branch on `state.phase`/
-`state.is_current_actor`, not on `legal_actions` alone (legal actions can
-still be non-empty while messaging is open, and `state.legal_actions` is
-empty until you actually fetch it, whether or not it's your turn).
+`state.is_current_actor`, not on `legal_actions` alone (the server only
+includes legal actions when you can act, and never during a messaging
+window — `choose_action` is only called when a move is actually due).
 
 This tournament runs exactly **four** games: Pokémon Showdown, Red Alert,
 Honor of Kings, and Werewolf. Each is documented below; where the platform
@@ -38,36 +38,49 @@ says so plainly rather than guessing.
 
 ### Overview
 
-For the tournament, Pokémon is exposed **only** in the open-draft format:
+For the tournament, Pokémon is exposed **only** as VGC doubles draft:
 
-- Game type: `pokemon_gen9ou_draft`
+- Game type: `pokemon_vgc_doubles_draft` (the only tournament-eligible
+  Pokémon type)
 - **2 players**
-- Snake-draft **six Pokémon each** from a shared randomized **18-card** pool,
-  then battle in Gen 9 OU (Showdown-backed pokemon runtime adapter)
+- Snake-draft **six Pokémon each** from a shared randomized **18-card** pool
+  (Item Clause: your six must hold six different items — clashing cards are
+  simply not offered), then pick **4 of 6** at Team Preview and battle VGC
+  **doubles**, 4v4 (Showdown-backed pokemon runtime adapter)
 
-Other Pokémon modes exist in the platform catalog (same-team, random,
-teambuild) but are **not** the tournament-facing format.
+Other Pokémon types exist for standalone matches (`pokemon_gen9same`,
+`pokemon_gen9random`, `pokemon_gen9ou_teambuild`, `pokemon_gen9ou_draft`,
+all singles) but are **not** the tournament-facing format.
 
 ### Agent interaction
 
-- Phases (from the draft config): `draft`, then `teambuild`, then `moving`
-  (battle) — never `"messaging"`.
-- Action model is **structured** (not the OpenSpiel-style integer space used
-  by `repeated_pd`/`avalon`): `state.legal_actions` entries look like
-  `action_id="draft_pick:<card_id>"` during draft, or
-  `action_id="move:0"`/`"switch:1"` during battle — the same universal
-  `return state.legal_actions[0]` pattern this starter uses everywhere
-  works here too. Team submission during `teambuild` is a *constructive*
-  action (there's nothing to enumerate/pick) — return a structured `dict`
-  instead, e.g. `{"type": "submit_team", "team": [...]}`; the SDK passes it
-  through without validating it, since only the server knows the schema.
-- Draft-phase state includes pool/roster/pick fields (e.g. current seat,
-  picks remaining, available cards); battle observations include active
-  Pokémon and related fields once the match has moved past draft.
+- Phases: `draft`, then `team_preview`, then `moving` (battle) — never
+  `"messaging"`.
+- Action model is **structured**. During `draft`, `state.legal_actions`
+  entries look like `action_id="draft_pick:<card_id>"`, and the universal
+  `return state.legal_actions[0]` pattern works.
+- **Team Preview and doubles turns need a `dict`.** Each offers exactly one
+  legal action whose `input["action"]` is a *template with instructions*,
+  not a finished answer — returning that `LegalAction` as-is is rejected.
+  Return a structured `dict` instead; the SDK passes it through without
+  validating it, since only the server knows the schema:
+  - Team Preview: `{"type": "select_lineup", "bring": [4 species ids from
+    your roster], "leads": [2 of those 4]}`
+  - Doubles turn: `{"type": "doubles_turn", "slot_0": {...}, "slot_1":
+    {...}}`, each slot `{"type": "move", "move_id": ..., "target": <int>}`,
+    `{"type": "switch", "species": ...}`, or `{"type": "pass"}` (only when
+    offered). Targets: `1`/`2` = opponent position A/B, `-1`/`-2` = your own
+    slot 0/1, `0` = no target needed.
+- Turns are simultaneous: after you submit you have no decision until the
+  turn resolves. Between decisions the observation is a placeholder
+  (`"No pending decision is currently available."`); the runtime just waits.
+- **Move timer:** a pending battle decision (move, switch, or lineup) not
+  submitted within **300 seconds** is played randomly for you.
 
-Exact draft pick encoding and full battle observation schema: further
-contestant-facing detail is still thin in this starter — prefer the live
-`legal_actions`/observation payload over assumptions.
+The full observation schema (draft pool/rosters, per-slot `available_moves`
+with `targets`, team-preview rosters) is in the platform's own game guide
+(`<control_plane>/skill/pokemon`) — prefer the live observation payload
+over assumptions.
 
 ### Messaging
 
@@ -76,10 +89,8 @@ this workspace (`messaging_enabled: false`). `choose_message` is not used.
 
 ### Win / scoring
 
-Details not yet documented beyond: sessions become terminal and expose
-`returns` / winner fields through the pokemon runtime result path. Exact
-contestant-facing scoring should be taken from the live state / result
-payload, not assumed from Showdown culture.
+Winner `1.0`, loser `0.0`; a tie is `0.5`/`0.5`. Resigning (allowed in any
+phase) is an immediate loss.
 
 ### Notes
 
@@ -173,13 +184,14 @@ decides what the action integer means).
 
 `legal_actions` is `[]` whenever it isn't your turn, including throughout
 `day_vote` (the engine hands out day-vote turns one seat at a time) — an
-empty list means "poll again," not "you have no options."
+empty list means "wait," not "you have no options." The runtime handles
+this: `choose_action` is only called when you actually have a move.
 
-**Elimination is real and immediate.** Check `state.raw["eliminated"]` (or the
-equivalent field on whichever transport you're using) every poll: once true,
-`/step`, `/message`, and resign all become forbidden for you — you keep
-read-only access (state, observation, transcript) and should switch to
-watching rather than retrying. Every death (`state.raw["game_state"]["dead"]`)
+**Elimination is real and immediate.** Once `state.raw["eliminated"]` is
+true, moving, messaging, and resigning all become forbidden for you — you
+keep read-only access (state, observation, transcript). The runtime handles
+this: it stops calling `choose_action`/`choose_message` and just waits for
+the game to end. Every death (`state.raw["game_state"]["dead"]`)
 publishes the dead player's **true role**, tagged `night_kill` or `lynch` —
 the richest evidence source in the game.
 
@@ -218,7 +230,8 @@ game to advance, so there's no "do nothing" default there).
   Do not `/step` while `phase` is messaging.
 - Seat labels in `LegalAction.label` / `observation` (`Player0` …) are
   indices; `state.raw["game_state"]` uses display names for `alive`, `dead`,
-  and `vote_history` — build an index→name map from the session roster once,
-  up front.
+  and `vote_history` — map between them with `state.raw["players"]`
+  (`[{"position", "name", "agent_id"}, ...]`); `state.raw["your_position"]`
+  is your own seat.
 - Being dead doesn't end your interest in the outcome: your payoff is
   determined by which side wins, not by whether you survived to see it.
