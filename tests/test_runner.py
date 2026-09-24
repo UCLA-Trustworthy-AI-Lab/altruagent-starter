@@ -422,7 +422,7 @@ def test_wait_for_opponent_does_not_invoke_decision_or_fetch_legal_actions():
             "since_message_seq": None,
             "since_is_current_actor": False,
             "since_phase": "moving",
-            "timeout_seconds": 5.0,
+            "timeout_seconds": 20.0,
         }
     ]
     assert sleep_calls == []
@@ -623,7 +623,7 @@ def test_custom_choose_message_sends_chat():
             "since_message_seq": 11,
             "since_is_current_actor": True,
             "since_phase": "messaging",
-            "timeout_seconds": 5.0,
+            "timeout_seconds": 20.0,
         }
     ]
 

@@ -51,8 +51,9 @@ informational only.
 Waiting is a server-side long-poll: when it isn't this agent's turn, the
 runner calls `wait_for_update`, which returns as soon as anything changes
 (a move, a new message, whose turn it is, the phase, or the game ending).
-Each wait lasts at most `wait_seconds`; against a server that predates that
-tool, the runner sleeps `wait_seconds` and re-reads state instead.
+Each wait lasts at most `WAIT_FOR_UPDATE_TIMEOUT_SECONDS` (then it simply
+waits again); against a server that predates that tool, the runner sleeps
+`wait_seconds` and re-reads state instead.
 
 Messaging works the same way: `phase == "messaging"` is the one phase value
 this runner recognizes by exact string match; every other phase value (a
@@ -82,15 +83,16 @@ from .mcp_game import MCPGameSession
 from .mcp_transport import MCPToolError
 from .models import DecisionContext, GameState, LegalAction, Match
 
-# The longest a single wait lasts: wait_for_update's long-poll timeout (it
-# returns earlier as soon as anything changes), or the sleep between reads
-# against a server without that tool. Kept short rather than the server's
-# 20 s default for servers that predate since_is_current_actor/since_phase:
-# those compare whose-turn/phase against the moment the call *starts*, so a
-# change that lands between our last read and the call (e.g. a Pokémon
-# battle turn resolving — its per-seat state_version doesn't move) runs the
-# call to its timeout. 5 s bounds that to the old polling interval.
+# The sleep between reads against a server without wait_for_update.
 DEFAULT_WAIT_SECONDS = 5.0
+
+# wait_for_update's long-poll timeout; it returns earlier as soon as anything
+# changes. 20 s is the server default, under the MCP client's 30 s read
+# timeout. This relies on the server honoring since_is_current_actor/
+# since_phase (Agent_ACP #24): without them, a whose-turn/phase change that
+# lands before the call — every Pokémon battle turn for the second seat to
+# submit — is only noticed at the timeout.
+WAIT_FOR_UPDATE_TIMEOUT_SECONDS = 20.0
 
 # Confirmed exact codes against Agent_ACP's gameapi/src/gameapi/mcp_server/errors.py
 # (`_DOMAIN_ERROR_CODES`, plus the documented fallback of an unlisted domain
@@ -422,8 +424,8 @@ def run_game(
        action, ``resign`` for ``RESIGN``). ``play_action``'s result carries
        the post-move state, which becomes the next state directly.
     6. Else (not this agent's turn): ``wait_for_update`` — returns as soon as
-       anything changes, or after ``wait_seconds`` with the unchanged state
-       (the loop just waits again). Against a server without that tool,
+       anything changes, or after ``WAIT_FOR_UPDATE_TIMEOUT_SECONDS`` with
+       the unchanged state (the loop just waits again). Against a server without that tool,
        sleeps ``wait_seconds`` and re-reads instead.
 
     A race error (``STALE_STATE``/``NOT_YOUR_TURN``/``WRONG_PHASE``/
@@ -450,7 +452,7 @@ def run_game(
                     since_message_seq=message_seq,
                     since_is_current_actor=bool(current.is_current_actor),
                     since_phase=current.phase,
-                    timeout_seconds=wait_seconds,
+                    timeout_seconds=WAIT_FOR_UPDATE_TIMEOUT_SECONDS,
                 )
             except MCPToolError as exc:
                 if not _is_unknown_tool_error(exc):
