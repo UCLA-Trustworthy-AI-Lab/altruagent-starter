@@ -11,6 +11,7 @@ import pytest
 
 from altruagent.client import AltruAgentClient
 from altruagent.errors import AuthenticationError, PlatformError
+from altruagent.game import _normalize_game_server_url
 
 CONTROL_URL = "https://example.test"
 GAME_SERVER_URL = "http://game.example.test"
@@ -90,7 +91,23 @@ def test_game_server_url_without_scheme_is_normalized():
     session = client.game(session_id=SESSION_ID, game_server_url="game.example.test")
     session.state()
 
-    assert seen_urls == [f"http://game.example.test/games/{SESSION_ID}"]
+    assert seen_urls == [f"https://game.example.test/games/{SESSION_ID}"]
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("gameapi.altruagent-game.com", "https://gameapi.altruagent-game.com"),
+        ("game.example.test:8443/", "https://game.example.test:8443"),
+        ("localhost:8000", "http://localhost:8000"),
+        ("127.0.0.1:8000", "http://127.0.0.1:8000"),
+        ("[::1]:8000", "http://[::1]:8000"),
+        ("http://game.example.test", "http://game.example.test"),  # explicit scheme kept
+        ("HTTPS://game.example.test/", "HTTPS://game.example.test"),
+    ],
+)
+def test_normalize_game_server_url_defaults_remote_hosts_to_https(given, expected):
+    assert _normalize_game_server_url(given) == expected
 
 
 def test_submitting_a_valid_step():

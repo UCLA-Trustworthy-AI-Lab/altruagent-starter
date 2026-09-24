@@ -1,22 +1,25 @@
-"""Example: a stateful agent for repeated_pd that actually negotiates.
+"""Example: a stateful Werewolf agent that actually talks.
 
 Shows the messaging half of the contract that basic_agent.py's default
 behavior skips:
 
 - create_agent() returns a fresh object per match (not a bare function),
-  so per-match state (here: which round we've already messaged in) never
-  leaks between matches.
+  so per-match state (here: which day we've already spoken on) never leaks
+  between matches.
 - choose_message is optional, next to choose_action, on that same object.
 - SendMessage(content, recipients=None) to chat (empty/no recipients ==
-  broadcast to every other player); altruagent.TERMINATE_MESSAGING to vote
-  the current messaging round closed.
-- state.new_messages holds what other players sent since you last checked.
+  broadcast to every other player; one seat number == a private message);
+  altruagent.TERMINATE_MESSAGING to vote the current window closed.
+- state.new_messages holds what's been said in the current window.
 
-repeated_pd's default preset caps chat at 1 message per agent per round
-(see Agent_ACP's REPEATED_PD_MESSAGING_CONFIG) — this agent respects that by
-sending exactly one broadcast per round, then terminating. The platform
-doesn't report that cap back to you, so track your own usage; this agent
-does it with one dict keyed by move_count (repeated_pd's round marker).
+Werewolf opens one discussion window per day, before the vote, with up to 5
+chats per agent and a 50-word cap. The platform doesn't report your
+remaining quota back to you, so track your own usage; this agent sends one
+broadcast per day, keyed by the day number in the public game record
+(state.raw["game_state"]["day"]), then terminates.
+
+Once your agent is eliminated the runtime stops asking it to act or chat and
+just waits for the game to end, so neither method needs to check for that.
 
 Run it as your agent with:
 
@@ -28,32 +31,29 @@ Run it as your agent with:
 from altruagent import DecisionContext, GameState, LegalAction, SendMessage, TERMINATE_MESSAGING
 
 
-class RepeatedPDAgent:
+class WerewolfAgent:
     def __init__(self) -> None:
-        # move_count is repeated_pd's round marker — it doesn't change while
-        # a single round's messaging phase is open, so "have I already sent
-        # my one message for this move_count" is enough to avoid resending.
-        self._messaged_for_move_count: int | None = None
+        self._spoke_on_day: int | None = None
 
     def choose_action(self, state: GameState, context: DecisionContext) -> LegalAction:
-        # Always cooperate. Swap this for real strategy — e.g. tit-for-tat
-        # based on what the opponent said last round (state.new_messages)
-        # or your own running record of state.legal_actions picked so far.
-        # Note: unlike the REST GameStateResponse this starter used to read,
-        # MCP's get_game_state does not expose repeated_pd's round_history/
-        # cumulative_scores — track your own history if you need it.
+        # Action ids are seat numbers ("7" = abstain, day vote only); the
+        # label says what it means ("Kill Player3", "Vote to lynch Player3").
+        # Swap this for real strategy — e.g. vote for whoever the seer
+        # accused, using state.observation (your role and private info) and
+        # state.raw["game_state"] (deaths with true roles, past votes).
         return state.legal_actions[0]
 
     def choose_message(self, state: GameState, context: DecisionContext):
         for message in state.new_messages:
-            print(f"[{context.session_id}] opponent says: {message.content!r}")
+            print(f"[{context.session_id}] Player{message.sender} says: {message.content!r}")
 
-        if self._messaged_for_move_count == state.move_count:
+        day = (state.raw.get("game_state") or {}).get("day")
+        if self._spoke_on_day == day:
             return TERMINATE_MESSAGING
 
-        self._messaged_for_move_count = state.move_count
-        return SendMessage("Let's both cooperate this round.")
+        self._spoke_on_day = day
+        return SendMessage("I'm a villager. Let's hear from everyone before we vote.")
 
 
 def create_agent():
-    return RepeatedPDAgent()
+    return WerewolfAgent()

@@ -185,8 +185,8 @@ class AltruAgentClient:
 
         Note: this GET is **not side-effect-free** on the current backend.
         ``getTournament`` (tournamentService.ts) can, as a side effect of
-        this same call: advance a queue-linked tournament past an expired
-        timer (starting it), and reconcile any child match GameAPI already
+        this same call: advance a tournament past an expired start timer
+        (starting it), and reconcile any child match GameAPI already
         finished (recomputing the leaderboard, scheduling the next batch of
         matches, or completing the tournament). This is real platform
         behavior, not something the SDK compensates for or hides.

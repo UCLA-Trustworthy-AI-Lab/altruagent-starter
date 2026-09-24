@@ -121,7 +121,9 @@ class Message:
     @classmethod
     def from_dict(cls, data: dict) -> "Message":
         return cls(
-            index=data.get("index", 0),
+            # Platform messages carry `seq` (the MCP envelope); `index` is the
+            # legacy alias. Prefer `seq`, which wait_for_update compares on.
+            index=data.get("seq", data.get("index", 0)),
             sender=data.get("sender", 0),
             recipients=list(data.get("recipients") or []),
             content=data.get("content", ""),
@@ -267,15 +269,17 @@ class GameState:
         cls,
         state: dict,
         *,
-        legal_actions: list[dict] | None = None,
+        legal_actions: dict | None = None,
         result: dict | None = None,
     ) -> "GameState":
-        """Parse an MCP ``get_game_state`` result (the production path —
-        see ``MCPGameSession``), optionally merging in a ``get_legal_actions``
-        result (only fetched by the runner when it's actually this agent's
-        turn — see ``altruagent.runner``) and/or a ``get_result`` result
-        (only fetched once ``is_terminal`` — MCP's ``get_game_state`` doesn't
-        embed ``returns``/``termination_reason`` the way REST's does).
+        """Parse an MCP ``get_game_state``/``wait_for_update`` result (the
+        production path — see ``MCPGameSession``). ``legal_actions`` defaults
+        to the one the server embeds in the state when this agent can act;
+        pass a ``get_legal_actions`` result to override it (the runner's
+        fallback when the server omitted it). ``result`` merges in a
+        ``get_result`` result (only fetched once ``is_terminal`` — MCP's
+        ``get_game_state`` doesn't embed ``returns``/``termination_reason``
+        the way REST's does).
 
         Confirmed field names directly against
         ``gameapi/src/gameapi/runtime_adapters/{openspiel_adapter,pokemon_adapter}.py``:
@@ -291,6 +295,8 @@ class GameState:
             if isinstance(current_actor, dict) and current_actor.get("agent_id")
             else None
         )
+        if legal_actions is None and isinstance(state.get("legal_actions"), dict):
+            legal_actions = state["legal_actions"]
         actions = list((legal_actions or {}).get("actions") or [])
         parsed_actions = [LegalAction.from_dict(a) for a in actions]
         new_messages = [

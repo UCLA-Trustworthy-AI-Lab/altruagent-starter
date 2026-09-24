@@ -43,12 +43,16 @@ guessing or fuzzy-coercing:
     - `altruagent.RESIGN`
 
 Turn detection is driven by `GameState.is_current_actor`/`phase`/
-`is_terminal` — NOT a rich `next_actions` action-kind enumeration the way
-the earlier REST-based runner used, because MCP's own `next_actions` is
-confirmed sparse (mostly a `{"tool": "get_result"}`-style hint near/at
-terminal — see `gameapi/src/gameapi/mcp_server/catalog.py`), not a per-turn
-mechanism. `next_actions` is still parsed onto `GameState` but is
-supplementary/informational only.
+`is_terminal` (plus Werewolf's `eliminated` flag) rather than MCP's
+`next_actions` hint, so the loop stays independent of hint wording.
+`next_actions` is still parsed onto `GameState` but is supplementary/
+informational only.
+
+Waiting is a server-side long-poll: when it isn't this agent's turn, the
+runner calls `wait_for_update`, which returns as soon as anything changes
+(a move, a new message, whose turn it is, the phase, or the game ending).
+Each wait lasts at most `wait_seconds`; against a server that predates that
+tool, the runner sleeps `wait_seconds` and re-reads state instead.
 
 Messaging works the same way: `phase == "messaging"` is the one phase value
 this runner recognizes by exact string match; every other phase value (a
@@ -58,16 +62,15 @@ choose_action" path with zero adapter-specific code — this is what lets
 Pokémon's draft/teambuild phases work without this runner knowing Pokémon
 exists. `choose_message` is optional — a contestant that only defines
 `choose_action` gets `TERMINATE_MESSAGING` automatically every round (see
-`_default_choose_message`), so both `repeated_pd` and `avalon` (both
-`messaging_enabled=True` by default) can be played move-only with zero new
-contestant code. `choose_message` is never invoked for a game whose adapter
+`_default_choose_message`), so Werewolf (whose discussion window opens once
+per day) can be played move-only with zero new contestant code. `choose_message` is never invoked for a game whose adapter
 never reports `phase == "messaging"` (confirmed: Pokémon's phases are
 `draft`/`draft_complete`/`teambuild`/`moving`, never `"messaging"`).
 
 `state_version` (MCP's optimistic-concurrency counter) is entirely
-runner-owned: fetched fresh via `get_legal_actions()` immediately before a
-`play_action` call (never the value from an older `get_state()` read), never
-something `choose_action`/`choose_message` supply or manage.
+runner-owned: taken from the same read that produced `state.legal_actions`
+(the server only embeds legal actions whose `state_version` matches the
+state's), never something `choose_action`/`choose_message` supply or manage.
 """
 
 from __future__ import annotations
@@ -79,6 +82,14 @@ from .mcp_game import MCPGameSession
 from .mcp_transport import MCPToolError
 from .models import DecisionContext, GameState, LegalAction, Match
 
+# The longest a single wait lasts: wait_for_update's long-poll timeout (it
+# returns earlier as soon as anything changes), or the sleep between reads
+# against a server without that tool. Kept short rather than the server's
+# 20 s default because wait_for_update compares whose-turn/phase against the
+# moment the call *starts*: a change that lands between our last read and
+# the call (e.g. a Pokémon battle turn resolving — its per-seat
+# state_version doesn't move) isn't seen as a change, so the call runs to
+# its timeout. 5 s bounds that to the old polling interval.
 DEFAULT_WAIT_SECONDS = 5.0
 
 # Confirmed exact codes against Agent_ACP's gameapi/src/gameapi/mcp_server/errors.py
@@ -87,8 +98,17 @@ DEFAULT_WAIT_SECONDS = 5.0
 # "wrong_phase" -> "WRONG_PHASE"). All four represent "the match state moved
 # since the last read" — a genuine race, never a contestant bug — so all four
 # just refetch state and re-enter the decision loop from the top.
+# PLAYER_ELIMINATED (Werewolf) belongs here too: this agent was eliminated
+# after the read it acted on; the refetched state carries `eliminated`, and
+# the loop then only waits for the game to end.
 _RACE_ERROR_CODES = frozenset(
-    {"STALE_STATE", "NOT_YOUR_TURN", "WRONG_PHASE", "GAME_ALREADY_COMPLETE"}
+    {
+        "STALE_STATE",
+        "NOT_YOUR_TURN",
+        "WRONG_PHASE",
+        "GAME_ALREADY_COMPLETE",
+        "PLAYER_ELIMINATED",
+    }
 )
 
 # Contestant-caused messaging failures (bad content/recipients, over quota,
@@ -340,6 +360,28 @@ def _validate_message_decision(decision: Any) -> MessageDecision:
     return decision
 
 
+def _last_message_seq(state: GameState, extra: dict | None = None) -> int | None:
+    """Highest message ``seq`` this agent has seen: the state's
+    ``new_messages``, plus (after a ``send_message``) that call's own
+    ``message``/``new_messages``. Passed to ``wait_for_update`` so a message
+    that arrived before the wait started still wakes it.
+    """
+    seqs = [m.index for m in state.new_messages]
+    if extra:
+        messages = list(extra.get("new_messages") or [])
+        if isinstance(extra.get("message"), dict):
+            messages.append(extra["message"])
+        seqs += [m["seq"] for m in messages if isinstance(m, dict) and isinstance(m.get("seq"), int)]
+    return max(seqs) if seqs else None
+
+
+def _is_unknown_tool_error(exc: MCPToolError) -> bool:
+    """A server predating ``wait_for_update`` rejects it at the protocol
+    level (FastMCP's ``Unknown tool: ...``), with no error_code.
+    """
+    return exc.error_code is None and "unknown tool" in str(exc).lower()
+
+
 def _terminal_game_state(last_state: GameState, result: dict) -> GameState:
     """Merge a ``get_result()``/``resign()`` result (authoritative for
     ``returns``/``termination_reason``, confirmed absent from ``get_state()``/
@@ -361,37 +403,59 @@ def run_game(
 
     Loop, once per iteration:
 
-    1. Fetch state (``get_game_state``).
+    1. Read state (``get_game_state``; afterwards each step below hands back
+       the next state itself).
     2. If terminal, fetch the result (``get_result``) and return the merged
        final state.
-    3. If ``phase == "messaging"``: resolve an optional ``choose_message``,
+    3. If this agent was eliminated (Werewolf), it can no longer act or
+       chat: wait (step 6) until the game ends.
+    4. If ``phase == "messaging"``: resolve an optional ``choose_message``,
        validate the result, and submit it (``send_message`` with
        ``message_type="chat"`` or ``"terminate"``). If the round hasn't
        actually advanced yet (``send_message``'s own result still reports
-       ``phase != "moving"`` — e.g. this agent terminated but the other
-       player hasn't, and terminating again is a server-side no-op), sleeps
-       ``wait_seconds`` before refetching, since MCP has no REST-``next_actions``-
-       style "you're done, just wait" signal to detect that otherwise.
-    4. Else if ``is_current_actor``: fetch legal actions (``get_legal_actions``
-       — this is also where the freshest ``state_version`` comes from),
-       invoke ``choose_action``, validate the result, and submit it
-       (``play_action`` for a matched/structured action, ``resign`` for
-       ``RESIGN``).
-    5. Else (not this agent's turn, whatever the phase is): sleep
-       ``wait_seconds`` and refetch.
+       ``phase != "moving"`` — e.g. this agent terminated but others
+       haven't), wait (step 6) for the next message or the phase change.
+    5. Else if ``is_current_actor``: take ``legal_actions`` from the state
+       (the server embeds them when this agent can act; ``get_legal_actions``
+       is only a fallback when it didn't), invoke ``choose_action``, validate
+       the result, and submit it (``play_action`` for a matched/structured
+       action, ``resign`` for ``RESIGN``). ``play_action``'s result carries
+       the post-move state, which becomes the next state directly.
+    6. Else (not this agent's turn): ``wait_for_update`` — returns as soon as
+       anything changes, or after ``wait_seconds`` with the unchanged state
+       (the loop just waits again). Against a server without that tool,
+       sleeps ``wait_seconds`` and re-reads instead.
 
     A race error (``STALE_STATE``/``NOT_YOUR_TURN``/``WRONG_PHASE``/
-    ``GAME_ALREADY_COMPLETE`` — the state changed between our last read and
-    this submit, not a contestant bug) refetches state and continues.
-    ``RUNTIME_UNAVAILABLE`` (the adapter doesn't actually support a capability
-    the runner expected) raises ``UnsupportedGameFlowError``. A
-    contestant-caused messaging/action error raises ``DecisionError``. Any
-    other error propagates immediately — no retrying.
+    ``GAME_ALREADY_COMPLETE``/``PLAYER_ELIMINATED`` — the state changed
+    between our last read and this submit, not a contestant bug) refetches
+    state and continues. ``RUNTIME_UNAVAILABLE`` (the adapter doesn't
+    actually support a capability the runner expected) raises
+    ``UnsupportedGameFlowError``. A contestant-caused messaging/action error
+    raises ``DecisionError``. Any other error propagates immediately — no
+    retrying.
 
     Returns the final ``GameState`` once the match is terminal.
     """
     decision_fn = _resolve_decision_fn(choose_action)
     message_decision_fn = _resolve_message_decision_fn(choose_action)
+    long_poll_supported = True
+
+    def wait(current: GameState, message_seq: int | None) -> GameState:
+        nonlocal long_poll_supported
+        if long_poll_supported:
+            try:
+                return game.wait_for_update(
+                    since_version=current.state_version,
+                    since_message_seq=message_seq,
+                    timeout_seconds=wait_seconds,
+                )
+            except MCPToolError as exc:
+                if not _is_unknown_tool_error(exc):
+                    raise
+                long_poll_supported = False
+        sleep(wait_seconds)
+        return game.get_state()
 
     state = game.get_state()
 
@@ -399,6 +463,10 @@ def run_game(
         if state.is_terminal:
             result = game.get_result()
             return _terminal_game_state(state, result)
+
+        if state.raw.get("eliminated"):
+            state = wait(state, _last_message_seq(state))
+            continue
 
         if state.phase == _MESSAGING_PHASE:
             decision = _validate_message_decision(
@@ -431,34 +499,35 @@ def run_game(
                     ) from exc
                 raise
             # send_message's own result already carries the post-call phase.
-            # Terminating is idempotent server-side (confirmed against
-            # openspiel_adapter.py) — a contestant that already terminated
-            # this round, or the default auto-terminate, will keep getting a
-            # harmless no-op success back every time phase is still
-            # "messaging" (waiting on the opponent to also terminate). There
-            # is no separate "you're done, just wait" signal the way REST's
-            # next_actions had (MCP's is_current_actor is a MOVING-phase
-            # concept, not reliable here) — so this sleeps whenever the round
-            # hasn't actually advanced, to avoid busy-polling that no-op.
-            if result.get("phase") != "moving":
-                sleep(wait_seconds)
-            state = game.get_state()
+            # Terminating is idempotent server-side, so a contestant that
+            # already terminated this round (or the default auto-terminate)
+            # would just get a no-op success back while the others are still
+            # talking — wait for the next message or the phase flip instead
+            # of re-sending.
+            if result.get("phase") == "moving":
+                state = game.get_state()
+            else:
+                state = wait(state, _last_message_seq(state, result))
             continue
 
         if state.is_current_actor:
-            legal = game.get_legal_actions()
-            legal_actions = [LegalAction.from_dict(a) for a in legal.get("actions") or []]
-            state.legal_actions = legal_actions
-            state.state_version = int(legal.get("state_version", state.state_version))
+            if state.raw.get("legal_actions") is None:
+                # The server omits legal_actions when a move landed between
+                # its state and legal-actions reads; fetch them directly.
+                legal = game.get_legal_actions()
+                state.legal_actions = [
+                    LegalAction.from_dict(a) for a in legal.get("actions") or []
+                ]
+                state.state_version = int(legal.get("state_version", state.state_version))
 
             decision = _validate_decision(
-                _invoke_decision(decision_fn, state, context), legal_actions
+                _invoke_decision(decision_fn, state, context), state.legal_actions
             )
             try:
                 if decision is RESIGN:
                     result = game.resign()
                     return _terminal_game_state(state, result)
-                game.play_action(
+                result = game.play_action(
                     action_id=decision.action_id,
                     action=decision.action,
                     state_version=state.state_version,
@@ -480,11 +549,17 @@ def run_game(
                         f"{context.session_id!r}: {exc}"
                     ) from exc
                 raise
-            state = game.get_state()
+            # While the game continues, play_action returns the post-move
+            # state; once it's over (or on an older server) it doesn't.
+            post_move = result.get("state") if isinstance(result, dict) else None
+            state = (
+                GameState.from_mcp_state(post_move)
+                if isinstance(post_move, dict)
+                else game.get_state()
+            )
             continue
 
-        sleep(wait_seconds)
-        state = game.get_state()
+        state = wait(state, _last_message_seq(state))
 
 
 def run_match(
