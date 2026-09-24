@@ -85,11 +85,11 @@ from .models import DecisionContext, GameState, LegalAction, Match
 # The longest a single wait lasts: wait_for_update's long-poll timeout (it
 # returns earlier as soon as anything changes), or the sleep between reads
 # against a server without that tool. Kept short rather than the server's
-# 20 s default because wait_for_update compares whose-turn/phase against the
-# moment the call *starts*: a change that lands between our last read and
-# the call (e.g. a Pokémon battle turn resolving — its per-seat
-# state_version doesn't move) isn't seen as a change, so the call runs to
-# its timeout. 5 s bounds that to the old polling interval.
+# 20 s default for servers that predate since_is_current_actor/since_phase:
+# those compare whose-turn/phase against the moment the call *starts*, so a
+# change that lands between our last read and the call (e.g. a Pokémon
+# battle turn resolving — its per-seat state_version doesn't move) runs the
+# call to its timeout. 5 s bounds that to the old polling interval.
 DEFAULT_WAIT_SECONDS = 5.0
 
 # Confirmed exact codes against Agent_ACP's gameapi/src/gameapi/mcp_server/errors.py
@@ -448,6 +448,8 @@ def run_game(
                 return game.wait_for_update(
                     since_version=current.state_version,
                     since_message_seq=message_seq,
+                    since_is_current_actor=bool(current.is_current_actor),
+                    since_phase=current.phase,
                     timeout_seconds=wait_seconds,
                 )
             except MCPToolError as exc:

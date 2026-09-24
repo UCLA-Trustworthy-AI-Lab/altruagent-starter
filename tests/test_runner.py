@@ -90,7 +90,15 @@ class FakeMCPGameSession:
         self.get_state_calls += 1
         return self._pop(self._state_queue)
 
-    def wait_for_update(self, *, since_version, since_message_seq=None, timeout_seconds=None) -> GameState:
+    def wait_for_update(
+        self,
+        *,
+        since_version,
+        since_message_seq=None,
+        since_is_current_actor=None,
+        since_phase=None,
+        timeout_seconds=None,
+    ) -> GameState:
         """Pops from the same state queue as get_state — a wait's result is
         just the next state.
         """
@@ -98,6 +106,8 @@ class FakeMCPGameSession:
             {
                 "since_version": since_version,
                 "since_message_seq": since_message_seq,
+                "since_is_current_actor": since_is_current_actor,
+                "since_phase": since_phase,
                 "timeout_seconds": timeout_seconds,
             }
         )
@@ -404,8 +414,16 @@ def test_wait_for_opponent_does_not_invoke_decision_or_fetch_legal_actions():
 
     assert result.is_terminal is True
     # Long-polls the server rather than sleeping client-side.
+    # Sends what it last saw, so a turn/phase change that lands before the
+    # call still wakes it.
     assert game.wait_calls == [
-        {"since_version": 4, "since_message_seq": None, "timeout_seconds": 5.0}
+        {
+            "since_version": 4,
+            "since_message_seq": None,
+            "since_is_current_actor": False,
+            "since_phase": "moving",
+            "timeout_seconds": 5.0,
+        }
     ]
     assert sleep_calls == []
     assert game.get_legal_actions_calls == 0
@@ -600,7 +618,13 @@ def test_custom_choose_message_sends_chat():
     # Phase stayed "messaging" -> waits (past this agent's own message)
     # instead of busy-polling.
     assert game.wait_calls == [
-        {"since_version": 2, "since_message_seq": 11, "timeout_seconds": 5.0}
+        {
+            "since_version": 2,
+            "since_message_seq": 11,
+            "since_is_current_actor": True,
+            "since_phase": "messaging",
+            "timeout_seconds": 5.0,
+        }
     ]
 
 

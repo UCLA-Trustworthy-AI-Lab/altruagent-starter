@@ -72,6 +72,8 @@ class MCPGameSession:
         *,
         since_version: int,
         since_message_seq: int | None = None,
+        since_is_current_actor: bool | None = None,
+        since_phase: str | None = None,
         timeout_seconds: float | None = None,
     ) -> GameState:
         """``wait_for_update`` — server-side long-poll. Returns as soon as
@@ -80,10 +82,20 @@ class MCPGameSession:
         game ends; otherwise after ``timeout_seconds`` (server default 20,
         max 25). Same payload as ``get_state()`` plus ``updated`` (in
         ``raw``), so the result can be used directly as the new state.
+
+        ``since_is_current_actor``/``since_phase`` are what the caller last
+        saw: whose turn it is and the phase can change without
+        ``state_version`` moving, and without them the server compares
+        against its own reading when the call arrives, missing a change that
+        landed just before. Servers predating these parameters ignore them.
         """
         arguments: dict = {"session_id": self.session_id, "since_version": since_version}
         if since_message_seq is not None:
             arguments["since_message_seq"] = since_message_seq
+        if since_is_current_actor is not None:
+            arguments["since_is_current_actor"] = since_is_current_actor
+        if since_phase is not None:
+            arguments["since_phase"] = since_phase
         if timeout_seconds is not None:
             arguments["timeout_seconds"] = timeout_seconds
         return GameState.from_mcp_state(self._call("wait_for_update", arguments))

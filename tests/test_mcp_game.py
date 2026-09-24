@@ -92,12 +92,25 @@ def test_wait_for_update_sends_cursors_and_parses_state(monkeypatch):
         return {"session_id": SESSION_ID, "state_version": 9, "updated": True}
 
     patch_call_tool(monkeypatch, fake_call_tool)
-    state = make_session().wait_for_update(since_version=8, since_message_seq=4, timeout_seconds=20.0)
+    state = make_session().wait_for_update(
+        since_version=8,
+        since_message_seq=4,
+        since_is_current_actor=False,
+        since_phase="moving",
+        timeout_seconds=20.0,
+    )
 
     assert calls == [
         (
             "wait_for_update",
-            {"session_id": SESSION_ID, "since_version": 8, "since_message_seq": 4, "timeout_seconds": 20.0},
+            {
+                "session_id": SESSION_ID,
+                "since_version": 8,
+                "since_message_seq": 4,
+                "since_is_current_actor": False,
+                "since_phase": "moving",
+                "timeout_seconds": 20.0,
+            },
         )
     ]
     assert state.state_version == 9
