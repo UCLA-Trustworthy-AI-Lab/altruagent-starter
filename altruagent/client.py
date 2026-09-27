@@ -1,7 +1,9 @@
 """Synchronous control-plane client for the AltruAgent competition platform.
 
-Handles configuration, API-key -> JWT login, and the platform's one-retry-
-after-401 convention. Wraps the control-plane auth endpoints directly:
+Handles configuration, token login (API key -> JWT by default; see
+``auth.py`` for the pluggable strategies, including a claimed Testing seat),
+and the platform's one-retry-after-401 convention. Wraps the control-plane
+auth endpoints directly:
 
 - ``POST /auth/agent/login`` (Agent_ACP backend/src/index.ts:133,
   services/agentService.ts:81 ``loginAgent``)
@@ -30,6 +32,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from dotenv import load_dotenv
 
+from ._responses import _parse_error_body, _parse_json_body
+from .auth import ApiKeyAuth, AuthStrategy
 from .errors import AuthenticationError, ConfigurationError, PlatformError
 from .models import Agent, AgentSessions, Tournament
 
@@ -47,6 +51,12 @@ class AltruAgentClient:
 
         client = AltruAgentClient()  # reads ALTRUAGENT_CONTROL_URL / ALTRUAGENT_API_KEY
         agent = client.me()
+
+    ``auth=`` swaps how the bearer token is obtained (see ``altruagent.auth``)
+    — e.g. ``AltruAgentClient(auth=SeatGrantAuth(claim_token))`` for one
+    self-hosted Testing seat, which needs no API key at all. Omitted, the
+    client uses ``ApiKeyAuth`` with ``api_key``/``ALTRUAGENT_API_KEY``,
+    exactly as before.
     """
 
     def __init__(
@@ -54,6 +64,7 @@ class AltruAgentClient:
         control_url: str | None = None,
         api_key: str | None = None,
         *,
+        auth: AuthStrategy | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         load_env_file: bool = True,
         transport: httpx.BaseTransport | None = None,
@@ -63,22 +74,27 @@ class AltruAgentClient:
             # always take precedence over anything loaded from it.
             load_dotenv()
 
+        if auth is not None and api_key is not None:
+            raise ConfigurationError("Pass either api_key= or auth=, not both.")
+
         control_url = control_url or os.environ.get("ALTRUAGENT_CONTROL_URL")
-        api_key = api_key or os.environ.get("ALTRUAGENT_API_KEY")
 
         if not control_url:
             raise ConfigurationError(
                 "ALTRUAGENT_CONTROL_URL is not set. Copy .env.example to .env and fill it "
                 "in, or pass control_url= explicitly."
             )
-        if not api_key:
-            raise ConfigurationError(
-                "ALTRUAGENT_API_KEY is not set. Copy .env.example to .env and fill it in, "
-                "or pass api_key= explicitly."
-            )
+        if auth is None:
+            api_key = api_key or os.environ.get("ALTRUAGENT_API_KEY")
+            if not api_key:
+                raise ConfigurationError(
+                    "ALTRUAGENT_API_KEY is not set. Copy .env.example to .env and fill it in, "
+                    "or pass api_key= explicitly."
+                )
+            auth = ApiKeyAuth(api_key)
 
         self.control_url = control_url.rstrip("/")
-        self._api_key = api_key
+        self.auth = auth
         self._access_token: str | None = None
         self._http = httpx.Client(base_url=self.control_url, timeout=timeout, transport=transport)
 
@@ -94,38 +110,15 @@ class AltruAgentClient:
     # -- public API -----------------------------------------------------
 
     def login(self) -> None:
-        """``POST /auth/agent/login`` — exchange the API key for a fresh JWT.
+        """Obtain a fresh bearer token through this client's auth strategy —
+        by default ``POST /auth/agent/login`` with the API key (``ApiKeyAuth``);
+        for a Testing seat, a claim/renewal (``SeatGrantAuth``).
 
-        The JWT is kept only in memory on this instance; it is never written
+        The token is kept only in memory on this instance; it is never written
         to disk or logged. Safe to call again at any time — a fresh login
-        mints a new token that still resolves to the same agent identity.
+        mints a new token that still resolves to the same identity.
         """
-        try:
-            response = self._http.post("/auth/agent/login", json={"api_key": self._api_key})
-        except httpx.RequestError as exc:
-            raise PlatformError(
-                f"Could not reach the control plane at {self.control_url}: {exc}",
-                status_code=None,
-            ) from exc
-
-        if response.status_code != 200:
-            parsed = _parse_error_body(response)
-            message = parsed["detail"] or parsed["error"] or "Login failed."
-            raise AuthenticationError(
-                message,
-                status_code=response.status_code,
-                error_code=parsed["error"],
-                detail=parsed["detail"],
-            )
-
-        body = _parse_json_body(response)
-        token = body.get("access_token") if isinstance(body, dict) else None
-        if not token:
-            raise AuthenticationError(
-                "Login response did not include an access_token.",
-                status_code=response.status_code,
-            )
-        self._access_token = token
+        self._access_token = self.auth.login(self._http, self.control_url)
 
     def _current_access_token(self, *, force_relogin: bool = False) -> str:
         """Return this client's current JWT — the single source of auth
@@ -317,38 +310,3 @@ class AltruAgentClient:
         except httpx.RequestError as exc:
             raise PlatformError(f"Could not reach {url}: {exc}", status_code=None) from exc
 
-
-def _parse_json_body(response: httpx.Response) -> Any:
-    try:
-        return response.json()
-    except ValueError:
-        return {}
-
-
-def _parse_error_body(response: httpx.Response) -> dict:
-    """Best-effort parse of an error response body.
-
-    Tolerates the platform's inconsistent error envelopes: a `next_actions`
-    array, a `recovery_action` object instead, a plain `{"error": "..."}`
-    with no `detail`, or a non-JSON body (e.g. an upstream gateway error
-    page), which is captured as text rather than raised.
-    """
-    try:
-        body = response.json()
-    except ValueError:
-        return {"error": None, "detail": response.text[:500] or None, "next_action": None}
-
-    if not isinstance(body, dict):
-        return {"error": None, "detail": str(body), "next_action": None}
-
-    next_action = body.get("recovery_action")
-    if next_action is None:
-        next_actions = body.get("next_actions")
-        if isinstance(next_actions, list) and next_actions:
-            next_action = next_actions[0]
-
-    return {
-        "error": body.get("error"),
-        "detail": body.get("detail"),
-        "next_action": next_action,
-    }

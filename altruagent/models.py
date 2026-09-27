@@ -557,6 +557,49 @@ class Tournament:
 
 
 @dataclass(frozen=True)
+class SeatGrant:
+    """One self-hosted Testing seat's GameAPI authorization, as returned by
+    ``POST /tournament/agent/test-matches/seats/claim`` (Agent_ACP
+    backend/src/services/tournamentMatchCoordinatorService.ts's
+    ``SeatGrant``). Represents exactly one seat of one match.
+
+    ``access_token`` is temporary (see ``expires_at``) and renewed by
+    ``SeatGrantAuth``; it is excluded from ``repr`` and ``raw``, so printing
+    or logging a grant never shows it. Never persisted.
+    """
+
+    access_token: str = field(repr=False)
+    agent_id: str
+    game_session_id: str
+    gameapi_server_url: str
+    expires_at: str | None = None
+    match_id: str | None = None
+    seat_id: str | None = None
+    seat_position: int | None = None
+    seat_count: int | None = None
+    game_type: str | None = None
+    match_status: str | None = None
+    raw: dict = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SeatGrant":
+        return cls(
+            access_token=data.get("access_token") or "",
+            agent_id=data.get("agent_id") or "",
+            game_session_id=data.get("game_session_id") or "",
+            gameapi_server_url=data.get("gameapi_server_url") or "",
+            expires_at=data.get("expires_at"),
+            match_id=data.get("match_id"),
+            seat_id=data.get("seat_id"),
+            seat_position=data.get("seat_position"),
+            seat_count=data.get("seat_count"),
+            game_type=data.get("game_type"),
+            match_status=data.get("match_status"),
+            raw={k: v for k, v in data.items() if k != "access_token"},
+        )
+
+
+@dataclass(frozen=True)
 class DecisionContext:
     """The minimal identifying information handed to contestant decision
     logic alongside a ``GameState`` (see ``altruagent.runner``).
@@ -568,9 +611,13 @@ class DecisionContext:
     but are repeated here so contestant code doesn't need to thread
     ``state`` through just to log/key by them; ``tournament_id``/
     ``agent_id`` are not available anywhere else.
+
+    ``seat_position`` (0-based) is set only for a claimed Testing seat
+    (``python -m agent --claim``); it's ``None`` for discovered matches.
     """
 
     session_id: str
     tournament_id: str | None
     game_type: str | None
     agent_id: str
+    seat_position: int | None = None
