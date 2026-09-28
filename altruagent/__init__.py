@@ -117,6 +117,7 @@ from .runner import (
     RunnerError,
     SendMessage,
     UnsupportedGameFlowError,
+    WithReasoning,
     run_game,
     run_match,
 )
@@ -153,6 +154,7 @@ __all__ = [
     "DecisionError",
     "SendMessage",
     "UnsupportedGameFlowError",
+    "WithReasoning",
     "run_game",
     "run_match",
     "run_forever",

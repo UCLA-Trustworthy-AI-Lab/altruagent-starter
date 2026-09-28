@@ -110,7 +110,14 @@ class MCPGameSession:
         """
         return self._call("get_legal_actions", {"session_id": self.session_id})
 
-    def play_action(self, *, action_id: str | None = None, action: dict | None = None, state_version: int) -> dict:
+    def play_action(
+        self,
+        *,
+        action_id: str | None = None,
+        action: dict | None = None,
+        state_version: int,
+        reasoning_summary: str | None = None,
+    ) -> dict:
         """``play_action`` — submit a move. Exactly one of ``action_id``
         (matched from ``get_legal_actions``) or ``action`` (a structured
         payload for constructive actions, e.g. Pokémon's ``submit_team``)
@@ -129,6 +136,8 @@ class MCPGameSession:
             arguments["action"] = action
         if action_id is not None:
             arguments["action_id"] = action_id
+        if reasoning_summary is not None:
+            arguments["reasoning_summary"] = reasoning_summary
         return self._call("play_action", arguments)
 
     def send_message(self, *, message_type: str, content: str | None = None, recipients: list[int] | None = None) -> dict:

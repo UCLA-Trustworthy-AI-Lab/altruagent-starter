@@ -40,7 +40,8 @@ from typing import Callable
 from altruagent.auth import SeatClaimError, SeatGrantAuth
 from altruagent.client import AltruAgentClient
 from altruagent.errors import AltruAgentError, ConfigurationError
-from altruagent.models import DecisionContext, SeatGrant
+from altruagent.mcp_game import MCPGameSession
+from altruagent.models import DecisionContext, GameState, SeatGrant
 from altruagent.runner import RunnerError, _resolve_decision_fn, run_game
 from altruagent.supervisor import run_forever_concurrent
 
@@ -181,6 +182,46 @@ def _describe_seat(grant: SeatGrant) -> list[str]:
     return [seat, f"Game: {grant.game_type or 'unknown'}", match]
 
 
+class _ProgressGameSession(MCPGameSession):
+    """Claim mode's game session: identical calls and results, plus a few
+    lifecycle lines so a long match doesn't look idle — "Connected" after
+    the first successful state read, one line per phase change, and a count
+    of submitted decisions. Never prints state contents, actions, or tokens.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.decisions = 0
+        self._connected = False
+        self._phase: str | None = None
+
+    def _observe(self, phase: str | None) -> None:
+        if not self._connected:
+            self._connected = True
+            print("Connected. Playing — press Ctrl+C to stop.", flush=True)
+        if phase and phase != self._phase:
+            self._phase = phase
+            print(f"Phase: {phase}", flush=True)
+
+    def get_state(self) -> GameState:
+        state = super().get_state()
+        self._observe(state.phase)
+        return state
+
+    def wait_for_update(self, **kwargs) -> GameState:
+        state = super().wait_for_update(**kwargs)
+        self._observe(state.phase)
+        return state
+
+    def play_action(self, **kwargs) -> dict:
+        result = super().play_action(**kwargs)
+        self.decisions += 1
+        post_move = result.get("state") if isinstance(result, dict) else None
+        if isinstance(post_move, dict):
+            self._observe(post_move.get("phase"))
+        return result
+
+
 def _run_claim(claim_token: str, create_agent: Callable) -> int:
     """Claim one Testing seat and play it to completion in this process."""
     try:
@@ -216,9 +257,11 @@ def _run_claim(claim_token: str, create_agent: Callable) -> int:
         grant = auth.grant
         for line in _describe_seat(grant):
             print(line)
-        print("Connecting to GameAPI... Press Ctrl+C to stop.\n")
+        print("Connecting to GameAPI...", flush=True)
 
-        game = client.mcp_game(session_id=grant.game_session_id, game_server_url=grant.gameapi_server_url)
+        game = _ProgressGameSession(
+            client, session_id=grant.game_session_id, game_server_url=grant.gameapi_server_url
+        )
         context = DecisionContext(
             session_id=grant.game_session_id,
             tournament_id=None,
@@ -228,9 +271,12 @@ def _run_claim(claim_token: str, create_agent: Callable) -> int:
         )
         final_state = run_game(game, context, contestant)
         print(
-            f"Match finished: termination_reason={final_state.termination_reason} "
-            f"returns={final_state.returns}"
+            f"Match finished (termination_reason={final_state.termination_reason}) "
+            f"after {game.decisions} decision(s)."
         )
+        returns = final_state.returns or {}
+        if grant.agent_id in returns:
+            print(f"Your score: {returns[grant.agent_id]}")
         return 0
     except KeyboardInterrupt:
         print("\nStopped. This seat stays claimed and can't be claimed again by another process.")

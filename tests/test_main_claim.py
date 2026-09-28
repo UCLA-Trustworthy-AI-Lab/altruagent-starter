@@ -413,6 +413,84 @@ def test_two_claim_invocations_are_fully_independent(monkeypatch, tmp_path):
     assert len(sys.modules["counting_agent"].created) == 2  # create_agent() once per invocation
 
 
+# -- lifecycle output ----------------------------------------------------------------------
+
+
+def _draft_state(version, *, my_turn, phase="draft", action_id="draft_pick:a"):
+    state = {
+        "session_id": "game-session-match-1",
+        "status": "in_progress",
+        "phase": phase,
+        "is_current_actor": my_turn,
+        "state_version": version,
+        "observation": "FULL OBSERVATION TEXT",
+    }
+    if my_turn:
+        state["legal_actions"] = {
+            "session_id": "game-session-match-1",
+            "state_version": version,
+            "actions": [{"action_id": action_id, "label": action_id, "input": {}}],
+        }
+    return state
+
+
+def test_claim_mode_prints_lifecycle_through_real_runner(monkeypatch, capsys):
+    """Real run_game against a scripted MCP server: draft (with a wait for the
+    opponent in between) -> battle -> terminal result.
+    """
+    import altruagent.mcp_game as mcp_game_module
+    from altruagent.runner import run_game as real_run_game
+
+    ClaimHarness(monkeypatch)
+    monkeypatch.setattr(agent_main, "run_game", real_run_game)
+
+    script = [
+        ("get_game_state", _draft_state(1, my_turn=True)),
+        ("play_action", {"accepted": True, "state_version": 2, "state": _draft_state(2, my_turn=False)}),
+        ("wait_for_update", {**_draft_state(3, my_turn=True, action_id="draft_pick:b"), "updated": True}),
+        ("play_action", {"accepted": True, "state_version": 4,
+                         "state": _draft_state(4, my_turn=True, phase="moving", action_id="move:0")}),
+        ("play_action", {"accepted": True, "state_version": 5, "status": "completed"}),
+        ("get_game_state", {**_draft_state(5, my_turn=False, phase="moving"), "is_terminal": True}),
+        ("get_result", {"is_terminal": True, "status": "completed", "termination_reason": "normal",
+                        "returns": {"synthetic-agent-1": 1.0, "synthetic-agent-0": 0.0}}),
+    ]
+    calls = []
+
+    def fake_call_tool(client, url, tool, arguments):
+        expected_tool, response = script[len(calls)]
+        calls.append(tool)
+        assert tool == expected_tool
+        return response
+
+    monkeypatch.setattr(mcp_game_module, "call_tool", fake_call_tool)
+
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 0
+
+    assert calls == [tool for tool, _ in script]  # no extra/changed gameplay calls
+    assert capsys.readouterr().out.splitlines() == [
+        "Claimed seat 2/2",
+        "Game: pokemon_vgc_doubles_draft",
+        "Match: match-1 (waiting for the other seats to be claimed)",
+        "Connecting to GameAPI...",
+        "Connected. Playing — press Ctrl+C to stop.",
+        "Phase: draft",
+        "Phase: moving",
+        "Match finished (termination_reason=normal) after 3 decision(s).",
+        "Your score: 1.0",
+    ]
+
+
+def test_claim_mode_omits_score_when_result_has_no_entry_for_this_seat(monkeypatch, capsys):
+    ClaimHarness(monkeypatch)  # fake run_game returns returns keyed "0"/"1"
+
+    agent_main.main(["--claim", CLAIM_TOKEN])
+
+    out = capsys.readouterr().out
+    assert "Match finished (termination_reason=normal) after 0 decision(s)." in out
+    assert "Your score" not in out
+
+
 # -- the normal no-argument workflow is unchanged ---------------------------------------
 
 

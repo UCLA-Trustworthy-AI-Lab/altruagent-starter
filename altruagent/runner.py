@@ -41,6 +41,9 @@ guessing or fuzzy-coercing:
       can't be enumerated as one of `state.legal_actions` — the SDK performs
       no game-specific validation of it; the server is authoritative
     - `altruagent.RESIGN`
+    - `altruagent.WithReasoning(<any of the above except RESIGN>, "...")` —
+      the same move plus a short public `reasoning_summary`, sent through
+      MCP `play_action`'s own optional argument of that name
 
 Turn detection is driven by `GameState.is_current_actor`/`phase`/
 `is_terminal` (plus Werewolf's `eliminated` flag) rather than MCP's
@@ -188,7 +191,30 @@ class SendMessage:
         return f"SendMessage(content={self.content!r}, recipients={self.recipients!r})"
 
 
-Decision = Union[int, str, LegalAction, dict, _Resign]
+class WithReasoning:
+    """Returned from ``choose_action`` to attach a short PUBLIC explanation to
+    a move: ``return WithReasoning(state.legal_actions[0], "Fake Out to stall.")``.
+
+    ``action`` is anything ``choose_action`` may return on its own except
+    ``RESIGN``. ``reasoning_summary`` is sent as MCP ``play_action``'s own
+    optional ``reasoning_summary`` argument, which GameAPI records alongside
+    the move (e.g. a Pokémon draft pick's ``public_reason``) for spectators
+    — so write it for the audience; never put secrets or hidden
+    deliberation in it.
+    """
+
+    __slots__ = ("action", "reasoning_summary")
+
+    def __init__(self, action: Any, reasoning_summary: str | None) -> None:
+        self.action = action
+        text = reasoning_summary.strip() if isinstance(reasoning_summary, str) else ""
+        self.reasoning_summary = text or None
+
+    def __repr__(self) -> str:
+        return f"WithReasoning(action={self.action!r}, reasoning_summary={self.reasoning_summary!r})"
+
+
+Decision = Union[int, str, LegalAction, dict, _Resign, WithReasoning]
 MessageDecision = Union[SendMessage, _TerminateMessaging]
 
 
@@ -242,6 +268,7 @@ class _PlayAction(NamedTuple):
 
     action_id: str | None
     action: dict | None
+    reasoning_summary: str | None = None
 
 
 def _resolve_decision_fn(choose_action: Any) -> DecisionFn:
@@ -304,6 +331,17 @@ def _invoke_message_decision(
 
 
 def _validate_decision(decision: Any, legal_actions: list[LegalAction]) -> Union[_Resign, _PlayAction]:
+    if isinstance(decision, WithReasoning):
+        inner = decision.action
+        if inner is RESIGN or isinstance(inner, WithReasoning):
+            raise DecisionError(
+                "WithReasoning(...) must wrap a move (a LegalAction, action_id, "
+                f"int, or structured dict), not {inner!r}."
+            )
+        return _validate_decision(inner, legal_actions)._replace(
+            reasoning_summary=decision.reasoning_summary
+        )
+
     if decision is RESIGN:
         return RESIGN
 
@@ -531,10 +569,18 @@ def run_game(
                 if decision is RESIGN:
                     result = game.resign()
                     return _terminal_game_state(state, result)
+                # Only passed when the contestant supplied one, so agents
+                # that never use WithReasoning send exactly what they did before.
+                reasoning = (
+                    {"reasoning_summary": decision.reasoning_summary}
+                    if decision.reasoning_summary
+                    else {}
+                )
                 result = game.play_action(
                     action_id=decision.action_id,
                     action=decision.action,
                     state_version=state.state_version,
+                    **reasoning,
                 )
             except MCPToolError as exc:
                 if exc.error_code in _RACE_ERROR_CODES:
