@@ -79,8 +79,18 @@ sleeping against a server without it), and stops acting once a Werewolf
 agent is eliminated. Bare remote ``game_server_url`` hosts now default to
 ``https://``. The contestant-facing games are Werewolf and the Pokémon
 types (see ``GAMES.md``).
+
+Milestone 8: self-hosted Testing seats. ``python -m agent --claim
+seatclaim_...`` claims exactly one seat of a tournament test match and plays
+it in-process through the same ``run_game``/``MCPGameSession`` path — no
+API key, no ``me()``/``sessions()`` discovery, no supervisor. The client's
+bearer token now comes from a pluggable strategy (``altruagent.auth``):
+``ApiKeyAuth`` (the default, unchanged behavior) or ``SeatGrantAuth``, which
+renews the seat's short-lived GameAPI authorization by re-presenting the
+same claim token + in-memory claim key after a 401.
 """
 
+from .auth import ApiKeyAuth, SeatClaimError, SeatGrantAuth
 from .client import AltruAgentClient
 from .errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from .game import GameSession
@@ -96,6 +106,7 @@ from .models import (
     Message,
     NextAction,
     PlayerRef,
+    SeatGrant,
     Tournament,
     TournamentViewer,
 )
@@ -106,6 +117,7 @@ from .runner import (
     RunnerError,
     SendMessage,
     UnsupportedGameFlowError,
+    WithReasoning,
     run_game,
     run_match,
 )
@@ -114,6 +126,10 @@ from .supervisor import run_forever_concurrent, run_once_concurrent
 
 __all__ = [
     "AltruAgentClient",
+    "ApiKeyAuth",
+    "SeatGrantAuth",
+    "SeatGrant",
+    "SeatClaimError",
     "Agent",
     "AgentSessions",
     "DecisionContext",
@@ -138,6 +154,7 @@ __all__ = [
     "DecisionError",
     "SendMessage",
     "UnsupportedGameFlowError",
+    "WithReasoning",
     "run_game",
     "run_match",
     "run_forever",
