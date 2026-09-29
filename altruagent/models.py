@@ -600,6 +600,36 @@ class SeatGrant:
 
 
 @dataclass(frozen=True)
+class OfficialAssignment:
+    """One active official tournament seat assigned to this event_agent, as
+    listed by ``GET /tournament/agent/assignments`` (Agent_ACP
+    backend/src/services/officialAgentConnectionService.ts's
+    ``OfficialAssignment``). ``seat_id`` is the stable identity: the runtime
+    keeps at most one worker per seat.
+    """
+
+    match_id: str
+    seat_id: str
+    game_type: str | None = None
+    seat_position: int | None = None
+    seat_count: int | None = None
+    match_status: str | None = None
+    seat_status: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "OfficialAssignment":
+        return cls(
+            match_id=str(data.get("match_id") or ""),
+            seat_id=str(data.get("seat_id") or ""),
+            game_type=data.get("game_type"),
+            seat_position=data.get("seat_position"),
+            seat_count=data.get("seat_count"),
+            match_status=data.get("match_status"),
+            seat_status=data.get("seat_status"),
+        )
+
+
+@dataclass(frozen=True)
 class DecisionContext:
     """The minimal identifying information handed to contestant decision
     logic alongside a ``GameState`` (see ``altruagent.runner``).

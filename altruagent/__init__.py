@@ -88,6 +88,13 @@ bearer token now comes from a pluggable strategy (``altruagent.auth``):
 ``ApiKeyAuth`` (the default, unchanged behavior) or ``SeatGrantAuth``, which
 renews the seat's short-lived GameAPI authorization by re-presenting the
 same claim token + in-memory claim key after a 401.
+
+Milestone 9: official tournament runtime. ``python -m agent --tournament``
+authenticates with the contestant's persistent Official Agent Key
+(``ALTRUAGENT_OFFICIAL_AGENT_KEY``, ``altruagent.official``), polls its
+official assignments, and keeps one worker process per assigned seat, each
+building its own contestant and playing through the same ``run_game`` with
+that seat's SeatGrant. ``--check-tournament`` verifies the setup.
 """
 
 from .auth import ApiKeyAuth, SeatClaimError, SeatGrantAuth
@@ -96,6 +103,7 @@ from .errors import AltruAgentError, AuthenticationError, ConfigurationError, Pl
 from .game import GameSession
 from .mcp_game import MCPGameSession
 from .mcp_transport import MCPToolError
+from .official import OfficialAgentAuth, OfficialAgentClient, OfficialAgentError, OfficialSeatAuth
 from .models import (
     Agent,
     AgentSessions,
@@ -105,6 +113,7 @@ from .models import (
     Match,
     Message,
     NextAction,
+    OfficialAssignment,
     PlayerRef,
     SeatGrant,
     Tournament,
@@ -122,7 +131,7 @@ from .runner import (
     run_match,
 )
 from .runtime import run_forever, run_once
-from .supervisor import run_forever_concurrent, run_once_concurrent
+from .supervisor import run_forever_concurrent, run_once_concurrent, run_tournament_forever
 
 __all__ = [
     "AltruAgentClient",
@@ -130,6 +139,11 @@ __all__ = [
     "SeatGrantAuth",
     "SeatGrant",
     "SeatClaimError",
+    "OfficialAgentAuth",
+    "OfficialAgentClient",
+    "OfficialAgentError",
+    "OfficialAssignment",
+    "OfficialSeatAuth",
     "Agent",
     "AgentSessions",
     "DecisionContext",
@@ -161,4 +175,5 @@ __all__ = [
     "run_once",
     "run_forever_concurrent",
     "run_once_concurrent",
+    "run_tournament_forever",
 ]

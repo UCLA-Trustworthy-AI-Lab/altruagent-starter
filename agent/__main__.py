@@ -16,6 +16,12 @@ isolation boundary, so self-play is simply one terminal per seat.
 `--agent MODULE[:FACTORY]` picks a different factory than
 `agent.agent:create_agent` for that one seat.
 
+Official tournament mode — `python -m agent --tournament` (with
+`ALTRUAGENT_OFFICIAL_AGENT_KEY` set) — authenticates as the contestant's
+registered tournament agent and keeps one worker process per active official
+assignment until Ctrl+C (`altruagent.supervisor.run_tournament_forever`).
+`--check-tournament` verifies the connection and the agent without playing.
+
 This file is deliberately thin — discovery/worker lifecycle lives in
 `altruagent.supervisor`, one match's play loop in `altruagent.runner`, and
 each worker's own setup in `altruagent.worker`.
@@ -32,18 +38,20 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import importlib
 import os
 import sys
 from typing import Callable
 
+from altruagent.agent_loader import DEFAULT_AGENT_SPEC
+from altruagent.agent_loader import load_agent_factory as _load_agent_factory
 from altruagent.auth import SeatClaimError, SeatGrantAuth
 from altruagent.client import AltruAgentClient
-from altruagent.errors import AltruAgentError, ConfigurationError
+from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError
 from altruagent.mcp_game import MCPGameSession
 from altruagent.models import DecisionContext, GameState, SeatGrant
+from altruagent.official import OFFICIAL_AGENT_KEY_ENV, OfficialAgentClient, OfficialAgentError
 from altruagent.runner import RunnerError, _resolve_decision_fn, run_game
-from altruagent.supervisor import run_forever_concurrent
+from altruagent.supervisor import WAITING_MESSAGE, run_forever_concurrent, run_tournament_forever
 
 from . import agent as agent_module
 
@@ -118,44 +126,6 @@ def _run_discovery() -> int:
 
 CLAIM_TOKEN_ENV = "ALTRUAGENT_CLAIM_TOKEN"
 _PROMPT = "-"
-
-
-def _load_agent_factory(spec: str) -> Callable:
-    """Import ``MODULE[:FACTORY]`` (``FACTORY`` defaults to ``create_agent``)
-    and return the factory without calling it. Raises ``ValueError`` with a
-    human-readable message for every way that can go wrong.
-    """
-    module_name, _, factory_name = spec.partition(":")
-    factory_name = factory_name or "create_agent"
-    if (
-        not module_name
-        or not all(part.isidentifier() for part in module_name.split("."))
-        or not factory_name.isidentifier()
-    ):
-        raise ValueError(
-            "--agent expects MODULE[:FACTORY] — a dotted module path such as "
-            f"examples.messaging_agent or my_agents.v2:build_agent — got {spec!r}."
-        )
-    try:
-        module = importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name and (module_name == exc.name or module_name.startswith(exc.name + ".")):
-            raise ValueError(
-                f"Could not find agent module {module_name!r}. Run from the starter's "
-                "root directory and pass a dotted module path, not a file path."
-            ) from exc
-        raise ValueError(f"Importing agent module {module_name!r} failed: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 - any import-time failure in contestant code
-        raise ValueError(f"Importing agent module {module_name!r} raised {exc!r}.") from exc
-
-    factory = getattr(module, factory_name, None)
-    if not callable(factory):
-        raise ValueError(
-            f"{module_name}:{factory_name} is missing or not callable. It must be a "
-            "function returning your decision logic (a function, or an object "
-            "exposing choose_action(state, context))."
-        )
-    return factory
 
 
 def _resolve_claim_token(arg: str | None, *, prompt: Callable[[str], str]) -> str | None:
@@ -291,16 +261,115 @@ def _run_claim(claim_token: str, create_agent: Callable) -> int:
         client.close()
 
 
+def _run_tournament(agent_spec: str) -> int:
+    """Official tournament runtime: authenticate with the Official Agent Key,
+    then keep one worker process per active official assignment until Ctrl+C.
+    """
+    try:
+        _load_agent_factory(agent_spec)  # validated eagerly; built once per match, in its worker
+    except ValueError as exc:
+        print(f"Startup error: {exc}")
+        return 1
+
+    try:
+        official = OfficialAgentClient()
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}")
+        return 1
+
+    try:
+        try:
+            official.authenticate()
+        except AltruAgentError as exc:
+            print(f"Could not connect as official tournament agent: {exc}")
+            return 1
+        print("Connected as official tournament agent.")
+        print(f"{WAITING_MESSAGE} (Press Ctrl+C to stop.)", flush=True)
+        run_tournament_forever(official, agent_spec=agent_spec)
+        return 0
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
+    except AltruAgentError as exc:
+        print(f"\nStopped due to an unrecoverable error: {exc}")
+        return 1
+    finally:
+        official.close()
+
+
+def _mark(symbol: str, fallback: str) -> str:
+    """``symbol`` if the console can print it (a redirected Windows console may not)."""
+    try:
+        symbol.encode(sys.stdout.encoding or "ascii")
+        return symbol
+    except (UnicodeEncodeError, LookupError):
+        return fallback
+
+
+def _check_tournament(agent_spec: str) -> int:
+    """Pre-tournament connection check. Needs no assigned match; never prints
+    the key or any token. Returns 0 only if every step passes.
+    """
+    ok_mark, fail_mark = _mark("✓", "[ok]"), _mark("✗", "[FAIL]")
+
+    def ok(message: str) -> None:
+        print(f"{ok_mark} {message}")
+
+    def fail(message: str) -> int:
+        print(f"{fail_mark} {message}")
+        return 1
+
+    try:
+        official = OfficialAgentClient()
+    except ConfigurationError as exc:
+        return fail(str(exc))
+
+    try:
+        try:
+            official.authenticate()
+        except OfficialAgentError as exc:
+            ok("Control plane reachable")
+            if exc.status_code in (400, 401):
+                return fail(f"Official Agent Key rejected: {exc}")
+            return fail(f"Official agent authentication failed: {exc}")
+        except AltruAgentError as exc:
+            return fail(f"Control plane not reachable at {official.control_url}: {exc}")
+        ok("Control plane reachable")
+        ok("Official Agent Key accepted")
+
+        try:
+            assignments = official.assignments()
+        except AuthenticationError as exc:
+            return fail(f"Tournament agent session was not accepted: {exc}")
+        except AltruAgentError as exc:
+            ok("Tournament agent authenticated")
+            return fail(f"Assignment discovery failed: {exc}")
+        ok("Tournament agent authenticated")
+        ok(f"Assignment discovery available ({len(assignments)} active assignment(s))")
+
+        try:
+            _resolve_decision_fn(_load_agent_factory(agent_spec)())
+        except Exception as exc:  # noqa: BLE001 - contestant code
+            return fail(f"Agent {agent_spec} could not be created: {exc}")
+        ok(f"Agent ready ({agent_spec})")
+        ok("Ready for tournament")
+        return 0
+    finally:
+        official.close()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent",
         description=(
             "With no arguments: play every match assigned to your registered agent "
             "(ALTRUAGENT_API_KEY). With --claim: claim and play one tournament "
-            "test-match seat (no API key needed)."
+            "test-match seat (no API key needed). With --tournament: play your "
+            f"official tournament assignments ({OFFICIAL_AGENT_KEY_ENV})."
         ),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--claim",
         metavar="TOKEN",
         help=(
@@ -308,10 +377,20 @@ def _build_parser() -> argparse.ArgumentParser:
             f"'-' prompts for the token without echo (or set {CLAIM_TOKEN_ENV})"
         ),
     )
+    mode.add_argument(
+        "--tournament",
+        action="store_true",
+        help=f"official tournament mode: wait for and play your official assignments ({OFFICIAL_AGENT_KEY_ENV})",
+    )
+    mode.add_argument(
+        "--check-tournament",
+        action="store_true",
+        help="check your official tournament connection and agent without playing anything",
+    )
     parser.add_argument(
         "--agent",
         metavar="MODULE[:FACTORY]",
-        help="claim mode only: agent factory to use (default: agent.agent:create_agent)",
+        help=f"with --claim/--tournament/--check-tournament: agent factory to use (default: {DEFAULT_AGENT_SPEC})",
     )
     return parser
 
@@ -320,10 +399,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args([] if argv is None else argv)
 
+    if args.tournament or args.check_tournament:
+        agent_spec = args.agent or DEFAULT_AGENT_SPEC
+        return _check_tournament(agent_spec) if args.check_tournament else _run_tournament(agent_spec)
+
     claim_token = _resolve_claim_token(args.claim, prompt=getpass.getpass)
     if claim_token is None:
         if args.agent is not None:
-            parser.error("--agent is only supported together with --claim")
+            parser.error("--agent is only supported together with --claim, --tournament, or --check-tournament")
         return _run_discovery()
 
     if not claim_token.strip():

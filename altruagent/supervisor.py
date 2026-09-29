@@ -26,10 +26,20 @@ import multiprocessing
 import time
 from typing import TYPE_CHECKING, Callable
 
-from .worker import EXIT_SUCCESS, WorkerInput, _process_entry
+from .errors import PlatformError
+from .official import new_execution_id
+from .worker import (
+    EXIT_SEAT_BUSY,
+    EXIT_SUCCESS,
+    TournamentWorkerInput,
+    WorkerInput,
+    _process_entry,
+    _tournament_process_entry,
+)
 
 if TYPE_CHECKING:
     from .client import AltruAgentClient
+    from .official import OfficialAgentClient
 
 DEFAULT_DISCOVERY_INTERVAL_SECONDS = 15.0
 DEFAULT_COOLDOWN_SECONDS = 60.0
@@ -81,6 +91,18 @@ class WorkerRegistry:
                 finished[session_id] = process.exitcode
                 del self._processes[session_id]
         return finished
+
+    def terminate(self, session_id: str, timeout: float) -> None:
+        """Forcibly stop one worker (same semantics as ``terminate_all``)."""
+        process = self._processes.pop(session_id, None)
+        if process is None:
+            return
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout)
+
+    def keys(self) -> list[str]:
+        return list(self._processes)
 
     def terminate_all(self, timeout: float) -> None:
         """Forcibly stop every remaining worker and reclaim it. Uses
@@ -204,3 +226,150 @@ def run_forever_concurrent(
         if len(registry) > 0:
             _log(f"stopping {len(registry)} active worker(s)...")
             registry.terminate_all(shutdown_join_timeout)
+
+
+# -- official tournament runtime -------------------------------------------------
+
+DEFAULT_TOURNAMENT_POLL_SECONDS = 10.0
+# A seat must be missing from this many consecutive successful assignment
+# listings before its still-running worker is stopped — a match that just
+# ended can drop off the list a moment before its worker notices.
+MISSING_POLLS_BEFORE_STOP = 2
+WAITING_MESSAGE = "Waiting for tournament assignments..."
+# After seat_busy, retry the seat once the backend's 30 s execution lease
+# could have lapsed (a previous run releasing it, or this runtime's own
+# re-authenticated session); a seat another live runtime keeps renewing
+# just stays busy.
+SEAT_BUSY_RETRY_SECONDS = 35.0
+
+
+class TournamentState:
+    """Everything the tournament loop carries between ticks — in memory only.
+
+    ``execution_id`` is generated once per tournament runtime (one
+    ``python -m agent --tournament`` process) and handed to every worker it
+    starts: it's how the backend tells this runtime's seat leases apart from
+    another runtime's. Never persisted or logged.
+    """
+
+    def __init__(self) -> None:
+        self.execution_id = new_execution_id()
+        self.registry = WorkerRegistry()
+        self.failed_until: dict[str, float] = {}
+        self.missing_polls: dict[str, int] = {}
+        self.discovery_failing = False
+
+
+def run_tournament_once(
+    official: "OfficialAgentClient",
+    state: TournamentState,
+    *,
+    agent_spec: str,
+    now: Callable[[], float] = time.monotonic,
+    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
+    shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
+    process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
+    log: Callable[[str], None] = print,
+) -> None:
+    """One non-blocking tournament tick, keyed by ``seat_id`` throughout:
+
+    1. Reap finished workers (a failure puts that seat in cooldown; it is
+       retried later, which re-requests its grant — the reconnect path).
+    2. List this agent's active assignments. A transient control-plane
+       failure is logged and the tick skipped (the runtime keeps waiting);
+       an authentication failure propagates — it would affect every seat.
+    3. Start one worker per listed seat that has none and isn't cooling down.
+    4. Stop workers whose seat has left the list for
+       ``MISSING_POLLS_BEFORE_STOP`` consecutive listings.
+    """
+    current_time = now()
+    for seat_id, exitcode in state.registry.reap_finished().items():
+        state.missing_polls.pop(seat_id, None)
+        # Either way the seat waits out a cooldown before any new worker: a
+        # finished seat can linger in the listing for a moment, and a failed
+        # one is retried (re-granted) only if it's still assigned afterwards.
+        state.failed_until[seat_id] = current_time + cooldown_seconds
+        if exitcode == EXIT_SUCCESS:
+            log("Match finished.")
+        elif exitcode == EXIT_SEAT_BUSY:
+            state.failed_until[seat_id] = current_time + SEAT_BUSY_RETRY_SECONDS
+            log(f"Another runtime is playing this match with your Official Agent Key; checking again in {SEAT_BUSY_RETRY_SECONDS:.0f}s.")
+        else:
+            log(f"Match ended with an error (exit code {exitcode}); retrying that seat in {cooldown_seconds:.0f}s if it is still assigned.")
+        if len(state.registry) == 0:
+            log(WAITING_MESSAGE)
+
+    try:
+        assignments = official.assignments()
+    except PlatformError as exc:
+        if not state.discovery_failing:
+            log(f"Could not check tournament assignments ({exc}); will keep retrying.")
+        state.discovery_failing = True
+        return
+    if state.discovery_failing:
+        log("Assignment discovery recovered.")
+        state.discovery_failing = False
+
+    listed = {assignment.seat_id for assignment in assignments}
+    for assignment in assignments:
+        seat_id = assignment.seat_id
+        if not seat_id or state.registry.is_active(seat_id):
+            continue
+        retry_at = state.failed_until.get(seat_id)
+        if retry_at is not None and current_time < retry_at:
+            continue
+        worker_input = TournamentWorkerInput(
+            seat_id=seat_id, match_id=assignment.match_id, game_type=assignment.game_type,
+            agent_spec=agent_spec, execution_id=state.execution_id,
+        )
+        process = process_factory(target=_tournament_process_entry, args=(worker_input,), daemon=True)
+        process.start()
+        state.registry.start(seat_id, process)
+        log(f"Match assigned: {assignment.game_type or 'unknown game'}")
+        log("Starting match...")
+
+    for seat_id in state.registry.keys():
+        if seat_id in listed:
+            state.missing_polls.pop(seat_id, None)
+            continue
+        state.missing_polls[seat_id] = state.missing_polls.get(seat_id, 0) + 1
+        if state.missing_polls[seat_id] >= MISSING_POLLS_BEFORE_STOP:
+            state.registry.terminate(seat_id, shutdown_join_timeout)
+            state.missing_polls.pop(seat_id, None)
+            log("Match is no longer assigned; stopped its worker.")
+            if len(state.registry) == 0:
+                log(WAITING_MESSAGE)
+
+
+def run_tournament_forever(
+    official: "OfficialAgentClient",
+    *,
+    agent_spec: str,
+    poll_interval: float = DEFAULT_TOURNAMENT_POLL_SECONDS,
+    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
+    shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+    process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
+    log: Callable[[str], None] = print,
+    max_iterations: int | None = None,
+) -> None:
+    """Keep one worker per active official assignment until interrupted.
+    Never exits just because there are no assignments. However it stops
+    (Ctrl+C, a fatal auth error, or ``max_iterations`` in tests), every
+    running worker is terminated in ``finally`` — no match is resigned.
+    """
+    state = TournamentState()
+    ticks = 0
+    try:
+        while max_iterations is None or ticks < max_iterations:
+            run_tournament_once(
+                official, state, agent_spec=agent_spec, now=now, cooldown_seconds=cooldown_seconds,
+                shutdown_join_timeout=shutdown_join_timeout, process_factory=process_factory, log=log,
+            )
+            ticks += 1
+            sleep(poll_interval)
+    finally:
+        if len(state.registry) > 0:
+            log(f"Stopping {len(state.registry)} active match worker(s)...")
+            state.registry.terminate_all(shutdown_join_timeout)

@@ -47,6 +47,7 @@ cp .env.example .env
 |---|---|---|
 | `ALTRUAGENT_CONTROL_URL` | yes | Base URL of the AltruAgent control plane. Defaults to the real deployed platform in `.env.example`. |
 | `ALTRUAGENT_API_KEY` | yes, except for `--claim` | Your agent's API key (`sk_agent_...`), from `POST /auth/agent/signup`. Not used when claiming a Testing seat. |
+| `ALTRUAGENT_OFFICIAL_AGENT_KEY` | only for `--tournament` / `--check-tournament` | Your persistent Official Agent Key (`eak_live_...`) from the tournament dashboard (see [Official tournament](#official-tournament-play-your-assigned-matches)). Keep it in `.env`, never commit it. |
 | `ALTRUAGENT_CLAIM_TOKEN` | no | A one-time Testing seat claim token, as an alternative to `--claim` (see [Testing](#testing-play-one-seat-of-a-test-match)). Set it in your shell for one command — never in `.env`. |
 | `ALTRUAGENT_GAME_SERVER_URL` | only for `check_game.py` | The GameAPI host for one match (a `game_server_url` value from the control plane). |
 | `ALTRUAGENT_SESSION_ID` | only for `check_game.py` | The `session_id` of that match. |
@@ -149,6 +150,56 @@ The process claims that seat, plays the match through the same runner as
   claimed it. If that process stops, the seat can't be claimed again — create
   a new test match. Your agent is built *before* claiming, so a crash in
   `create_agent()` doesn't use up the seat.
+
+## Official tournament: play your assigned matches
+
+Official matches don't use claim tokens. Your registered tournament agent
+connects with one persistent **Official Agent Key**, finds its official
+assignments by itself, and plays each one.
+
+1. **Get your key.** In the tournament dashboard, generate your Official Agent
+   Key (`eak_live_...`). It's shown once, so save it right away in your `.env`:
+
+   ```
+   ALTRUAGENT_CONTROL_URL=https://api.altruagent-game.com
+   ALTRUAGENT_OFFICIAL_AGENT_KEY=eak_live_...
+   ```
+
+   Keep it secret and never commit it. If it leaks, generate a new one in the
+   dashboard, which replaces the old one. Generating the key does **not** mean
+   you have to start anything: nothing needs to run until the tournament.
+2. **Before tournament day, check your setup:**
+
+   ```bash
+   python -m agent --check-tournament
+   ```
+
+   It checks that the control plane is reachable, that your key is accepted,
+   that assignment discovery works, and that your agent can be created. It
+   doesn't need a match to be assigned. Every line should show `✓`.
+3. **Before the tournament starts, run your agent and leave it running:**
+
+   ```bash
+   python -m agent --tournament
+   ```
+
+   It prints `Connected as official tournament agent.` and then waits. When the
+   tournament assigns you a match, it prints `Match assigned: <game>`, plays it,
+   and goes back to waiting. You don't copy any codes: assignments are found
+   automatically. Each match gets its own process and its own fresh
+   `create_agent()` instance, and several matches can run at the same time.
+   Stop it with Ctrl+C.
+- **Choosing an agent:** `--agent MODULE[:FACTORY]` works here too, for example
+  `python -m agent --tournament --agent examples.llm_agent`. Use the same
+  `--agent` value for the check.
+- **Reconnecting:** if your process stops mid-match, run
+  `python -m agent --tournament` again. It re-authenticates, finds the
+  still-active assignment, and resumes it. Nothing is saved locally.
+- **Run only one copy.** Only one runtime can play a given match seat. If you
+  start `--tournament` in two places with the same key, the second copy prints
+  `Another runtime is playing this match…` and just waits.
+- **Testing is different:** `--claim seatclaim_...` is only for Testing matches
+  you create yourself. Official matches never use claim tokens.
 
 ## Example LLM agent
 
