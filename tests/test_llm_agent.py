@@ -747,3 +747,67 @@ def test_create_agent_builds_an_llm_agent_with_the_pokemon_adapters(monkeypatch)
 
     assert isinstance(agent, LLMAgent)
     assert set(llm_agent.STRUCTURED_ADAPTERS) == {"select_lineup", "doubles_turn"}
+
+
+def _named_move(move_id, target_options):
+    move = _move(move_id, [t["target"] for t in target_options])
+    move["target_options"] = target_options
+    return move
+
+
+def test_pokemon_prompt_names_every_target_and_sends_the_integer_back():
+    # The real turn-4 board: own [Dondozo, Chien-Pao] vs [Hatterene, Cresselia].
+    # The model once attacked its own Dondozo reading -1 as a foe.
+    wave_crash = _named_move("wavecrash", [
+        {"target": -2, "side": "ally", "species": "chienpao"},
+        {"target": 1, "side": "opponent", "species": "hatterene"},
+        {"target": 2, "side": "opponent", "species": "cresselia"},
+    ])
+    sacred_sword = _named_move("sacredsword", [
+        {"target": -1, "side": "ally", "species": "dondozo"},
+        {"target": 1, "side": "opponent", "species": "hatterene"},
+        {"target": 2, "side": "opponent", "species": "cresselia"},
+    ])
+    provider = FakeProvider(_answer(slot_0={"option": 0, "target": 1}, slot_1={"option": 0, "target": -1}))
+
+    decision = _agent(provider).choose_action(_state(_doubles([wave_crash], [sacred_sword])), POKEMON)
+
+    prompt = provider.prompt()
+    slot_1_targets = prompt["slots"][1]["options"][0]["targets"]
+    assert slot_1_targets == [
+        {"target": -1, "is": "ALLY dondozo — your OTHER active Pokémon (legal, but it hits your own side)"},
+        {"target": 1, "is": "OPPONENT hatterene"},
+        {"target": 2, "is": "OPPONENT cresselia"},
+    ]
+    assert "target_options" not in prompt["slots"][1]["options"][0]
+    for word in ("SELF", "ALLY", "OPPONENT"):
+        assert word in prompt["instructions"]
+    # Ally targeting stays legal, and GameAPI still receives the plain integer.
+    assert decision.action["slot_0"] == {"type": "move", "move_id": "wavecrash", "target": 1}
+    assert decision.action["slot_1"] == {"type": "move", "move_id": "sacredsword", "target": -1}
+
+
+def test_pokemon_self_and_targetless_moves_are_named_too():
+    acupressure = _named_move("acupressure", [
+        {"target": -1, "side": "self", "species": "dondozo"},
+        {"target": -2, "side": "ally", "species": "chienpao"},
+    ])
+    protect = _named_move("protect", [{"target": 0, "side": "none", "species": None}])
+    provider = FakeProvider(_answer(slot_0={"option": 0, "target": -1}, slot_1={"option": 0, "target": 0}))
+
+    _agent(provider).choose_action(_state(_doubles([acupressure], [protect])), POKEMON)
+
+    slots = provider.prompt()["slots"]
+    assert slots[0]["options"][0]["targets"][0]["is"] == "SELF dondozo — this Pokémon itself"
+    assert slots[1]["options"][0]["targets"] == [
+        {"target": 0, "is": "no target needed (self, field or spread move)"}
+    ]
+
+
+def test_pokemon_prompt_without_target_options_keeps_the_raw_integers():
+    # An older GameAPI that sends no target_options: unchanged behaviour.
+    provider = FakeProvider(_answer(slot_0={"option": 0, "target": 2}, slot_1={"option": 0, "target": None}))
+
+    _agent(provider).choose_action(_state(_doubles([_move("fakeout", [1, 2])], [PASS])), POKEMON)
+
+    assert provider.prompt()["slots"][0]["options"][0]["targets"] == [1, 2]

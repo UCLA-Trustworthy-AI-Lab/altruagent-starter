@@ -45,6 +45,50 @@ def lineup_choice(action: LegalAction, state: GameState) -> Choice:
     )
 
 
+# How each legal target is spelled out to the model. In real play a model
+# reading only the raw ints (-2/-1 own side, 1/2 opponent) attacked its own
+# ally repeatedly, believing -1 was a foe. GameAPI names every target for the
+# acting slot (`target_options`), so the model reads who it is, not a number.
+_TARGET_SIDE = {
+    "self": "SELF {species} — this Pokémon itself",
+    "ally": "ALLY {species} — your OTHER active Pokémon (legal, but it hits your own side)",
+    "opponent": "OPPONENT {species}",
+    "none": "no target needed (self, field or spread move)",
+}
+
+TARGET_GUIDE = (
+    "Each move lists its legal targets with who they are: SELF is the Pokémon "
+    "using the move, ALLY is your other active Pokémon, OPPONENT is a foe. "
+    "Answer with the target's integer exactly as listed next to it. Targeting "
+    "your ALLY or SELF is allowed but affects your own side, so only do it on "
+    "purpose. In reasoning_summary, name the target as listed (e.g. "
+    "'OPPONENT cresselia')."
+)
+
+
+def _describe_target(target_option: dict) -> str:
+    template = _TARGET_SIDE.get(target_option.get("side"), "target {target}")
+    species = target_option.get("species") or "(empty position)"
+    return template.format(species=species, target=target_option.get("target"))
+
+
+def _prompt_option(option: dict) -> dict:
+    """A slot option as the model sees it: every legal target named.
+
+    Only the prompt changes — `build` still validates against GameAPI's own
+    numeric `targets`, and the integer is what gets sent back. A server too
+    old to send `target_options` gets the raw ints, as before.
+    """
+    target_options = option.get("target_options")
+    if option.get("type") != "move" or not isinstance(target_options, list):
+        return option
+    shown = {k: v for k, v in option.items() if k not in ("targets", "target_options")}
+    shown["targets"] = [
+        {"target": t.get("target"), "is": _describe_target(t)} for t in target_options
+    ]
+    return shown
+
+
 def doubles_choice(action: LegalAction, state: GameState) -> Choice:
     fallback = smoke_agent.choose_action(state, None)  # validates the template
     template = action.input["action"]
@@ -93,7 +137,9 @@ def doubles_choice(action: LegalAction, state: GameState) -> Choice:
                     "slot": number,
                     "active": slot.get("active"),
                     "force_switch": slot.get("force_switch"),
-                    "options": [{"option": index, **option} for index, option in enumerate(slot["options"])],
+                    "options": [
+                        {"option": index, **_prompt_option(option)} for index, option in enumerate(slot["options"])
+                    ],
                 }
                 for number, slot in enumerate(slots)
             ],
@@ -102,6 +148,7 @@ def doubles_choice(action: LegalAction, state: GameState) -> Choice:
                 "For each of slot_0 and slot_1, pick one option index from that slot's options. "
                 "For a move whose targets list is non-empty, target must be one of those integers; "
                 "otherwise target is null. Both slots cannot switch into the same Pokémon. "
+                f"{TARGET_GUIDE} "
                 f"Server instructions: {template.get('instructions')}"
             ),
         },
