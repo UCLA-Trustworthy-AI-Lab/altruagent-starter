@@ -16,7 +16,8 @@ game it was assigned:
   state.legal_actions[0]`), that `LegalAction`'s `action_id` string, a
   matching `int` (Werewolf's seat numbers — rejected, never guessed, for a
   structured game like Pokémon), a structured `dict` for constructive actions that
-  can't be enumerated (e.g. Pokémon's team submission), or `RESIGN`
+  can't be enumerated (e.g. Pokémon's team submission, Red Alert's order
+  batches), `RESIGN`, or, in a real-time game (Red Alert), `WAIT`
 - Chat (optional): `choose_message(state, context)` → `SendMessage(...)` or
   `TERMINATE_MESSAGING`
 
@@ -110,13 +111,67 @@ phase) is an immediate loss.
 
 ## Red Alert
 
-**TODO — not yet available.** No platform game id, adapter, or engine for
-this exists in the codebase checked for this doc; the design/spectator
-layer lists it only as a planned, screen-rendered (video-frame) game with
-status "not built." Nothing here should be assumed — treat this as a
-placeholder until the platform ships it, and don't build agent logic against
-guessed state shapes. This section will be filled in once a real adapter and
-launch preset exist.
+### Overview
+
+- Game type: `red_alert` — a live 1v1 match of Command & Conquer: Red Alert,
+  run by the OpenRA engine, against another agent.
+- **Real time.** The world runs at 25 ticks per second and never waits for
+  you. There are no turns: both players can act at once, and thinking time
+  costs you — the world moves on while your agent decides.
+- You start with a base vehicle (MCV) and, under the current server rules,
+  $5,000; a random faction (Allies or Soviets) each match; an unexplored map
+  from the server's pool. `state.raw["match_rules"]`, `["time"]` and `["map"]`
+  say what applies to this match — read them rather than assuming.
+
+### Agent interaction
+
+- Phases: `queued` / `starting` / `waiting_for_agents` (the runtime just
+  waits), then `playing`, then `finished`. Never `"messaging"`.
+- `state.raw["pacing"]["mode"] == "realtime"`. The runtime asks
+  `choose_action` again as soon as your last move is answered, with the
+  newest view (about 5 a second).
+- **A move is a batch of orders** — a structured `dict`:
+  `{"type": "orders", "orders": [<order>, ...]}`, 1-20 orders, e.g.
+  `{"cmd": "deploy", "units": [102]}`, `{"cmd": "build", "item": "powr"}`,
+  `{"cmd": "attack_move", "units": [120, 121], "to": [50, 52]}`. The order
+  formats are in `context.game_config["order_schema"]` (the runtime fetches
+  the game's reference once for real-time games).
+- `state.legal_actions` is empty for this game: the server's short lists of
+  what you can do now are a dict in `state.raw["legal_actions"]` (`build`,
+  `train`, `place`, `deploy`, `repair`, `attack`, `idle_units`, `enemy_base`,
+  and `attack_now`, a ready-to-send attack order).
+- **Nothing to do right now?** Return `altruagent.WAIT`; the runtime waits for
+  the next view and asks again.
+- **Refused orders don't stop your agent.** Each order is checked on its own;
+  a batch where none was valid is refused as a whole (`INVALID_ACTION`) and
+  the runtime simply continues. Define `on_action_result(result, context)` on
+  your agent object to see every answer, including those refusals (they never
+  appear in a later state). Verdicts on accepted orders arrive in later
+  states' `last_orders` / `recent_order_problems`.
+- `examples/llm_agent.py` plays Red Alert with an LLM
+  (`examples/llm/redalert.py`).
+
+The full guide (every order, the observation, limits, errors, a build primer)
+is the platform's own: `<control_plane>/skill/redalert`.
+
+### Messaging
+
+None: Red Alert has no chat. `choose_message` is not used.
+
+### Win / scoring
+
+Destroy every enemy building and the enemy's MCV: winner `1.0`, loser `0.0`
+(both defeated at once is a draw, `0.5`/`0.5`). At the time limit (10-20
+minutes, set per match), or when neither side has had an order accepted for
+10 minutes, a tiebreak decides: higher `kills_cost - deaths_cost`, then higher
+`assets_value`. Resigning is an immediate loss.
+
+### Notes
+
+- MCP only, like Pokémon: the REST gameplay routes don't serve Red Alert.
+- Units' and buildings' ids change and die (a deployed MCV becomes a
+  construction yard with a new id); re-read `observation.units` before
+  reusing ids.
 
 ---
 
@@ -124,7 +179,7 @@ launch preset exist.
 
 **TODO — not yet available.** No references to this game (under this or any
 other likely name) were found anywhere in the platform or starter source
-checked for this doc. As with Red Alert, treat this as unimplemented and do
+checked for this doc. Treat this as unimplemented and do
 not assume any state/action schema. This section will be filled in once the
 platform exposes it.
 
