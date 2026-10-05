@@ -100,6 +100,13 @@ class MCPGameSession:
             arguments["timeout_seconds"] = timeout_seconds
         return GameState.from_mcp_state(self._call("wait_for_update", arguments))
 
+    def get_game_config(self, game_type: str) -> dict:
+        """``get_game_config`` — the game's static reference (rules, action or
+        order formats, timeouts, maps). The runner fetches it once per
+        real-time match for ``DecisionContext.game_config``.
+        """
+        return self._call("get_game_config", {"game_type": game_type})
+
     def get_legal_actions(self) -> dict:
         """``get_legal_actions`` — the actions available right now, plus the
         ``state_version`` to use for the next ``play_action`` call. Usually

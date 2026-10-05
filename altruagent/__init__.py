@@ -122,6 +122,7 @@ from .models import (
 from .runner import (
     RESIGN,
     TERMINATE_MESSAGING,
+    WAIT,
     DecisionError,
     RunnerError,
     SendMessage,
@@ -164,6 +165,7 @@ __all__ = [
     "PlatformError",
     "RESIGN",
     "TERMINATE_MESSAGING",
+    "WAIT",
     "RunnerError",
     "DecisionError",
     "SendMessage",

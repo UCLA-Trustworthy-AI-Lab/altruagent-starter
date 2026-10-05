@@ -41,6 +41,7 @@ guessing or fuzzy-coercing:
       can't be enumerated as one of `state.legal_actions` — the SDK performs
       no game-specific validation of it; the server is authoritative
     - `altruagent.RESIGN`
+    - `altruagent.WAIT`, only in a real-time game (see below)
     - `altruagent.WithReasoning(<any of the above except RESIGN>, "...")` —
       the same move plus a short public `reasoning_summary`, sent through
       MCP `play_action`'s own optional argument of that name
@@ -71,6 +72,30 @@ per day) can be played move-only with zero new contestant code. `choose_message`
 never reports `phase == "messaging"` (confirmed: Pokémon's phases are
 `draft`/`draft_complete`/`teambuild`/`moving`, never `"messaging"`).
 
+Real-time games (a state whose `pacing.mode` is `"realtime"`, e.g. Red
+Alert) have no turns: both players are "current" at once and the world keeps
+moving while an agent thinks. The loop is the same, with three differences,
+all keyed on that pacing field rather than on a game name:
+
+    - `choose_action` may return `altruagent.WAIT`: nothing to send right
+      now; the runner waits for the next state (`wait_for_update`, which in
+      real time returns as soon as a newer view exists) and asks again.
+    - A move the server refuses as a whole (`INVALID_ACTION`, e.g. every
+      unit in an order died between the read and the send) is a race, not a
+      contestant bug: the runner re-reads the state and continues instead of
+      raising `DecisionError`. `RUNTIME_TEMPORARILY_UNAVAILABLE` is retried
+      after `REALTIME_RETRY_SECONDS`.
+    - Before the first decision the runner fetches the game's reference
+      (`get_game_config`) once, best-effort, and hands it to decision logic
+      as `context.game_config`.
+
+An agent object may also define `on_action_result(result, context)`: the
+runner calls it after every `play_action` with the server's answer, or with
+`{"error": <code>, "detail": <message>}` when the server refused the move
+and the runner recovered. That is how an agent learns that a move it sent
+was refused, for any game. It is optional; a plain function agent never
+needs it.
+
 `state_version` (MCP's optimistic-concurrency counter) is entirely
 runner-owned: taken from the same read that produced `state.legal_actions`
 (the server only embeds legal actions whose `state_version` matches the
@@ -80,6 +105,7 @@ state's), never something `choose_action`/`choose_message` supply or manage.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any, Callable, NamedTuple, Protocol, Union
 
 from .mcp_game import MCPGameSession
@@ -133,6 +159,12 @@ _MESSAGE_SCOPED_ERROR_CODES = frozenset(
 # Contestant-caused action failures.
 _ACTION_SCOPED_ERROR_CODES = frozenset({"INVALID_ACTION"})
 
+# Real-time games only (``pacing.mode == "realtime"``): the server could not
+# deliver the move right now (nothing was applied). Retried after a short pause.
+_REALTIME_TRANSIENT_ERROR_CODES = frozenset({"RUNTIME_TEMPORARILY_UNAVAILABLE"})
+REALTIME_RETRY_SECONDS = 1.0
+_REALTIME_PACING = "realtime"
+
 # The runner believed messaging/a capability was available (phase said so)
 # but the adapter disagrees — a genuine runner/adapter mismatch, not a
 # contestant bug and not a race; never silently retried.
@@ -153,6 +185,24 @@ class _Resign:
 
 
 RESIGN = _Resign()
+
+
+class _Wait:
+    """Unique sentinel type, analogous to ``_Resign``. Never instantiate
+    another one — always use the exported ``WAIT`` singleton and compare
+    with ``is``.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "WAIT"
+
+
+# Returned from ``choose_action`` in a real-time game: nothing to send right
+# now. The runner waits for the next state and asks again. A turn-based game
+# has no such option (the turn waits for you), so there it's a DecisionError.
+WAIT = _Wait()
 
 
 class _TerminateMessaging:
@@ -214,7 +264,7 @@ class WithReasoning:
         return f"WithReasoning(action={self.action!r}, reasoning_summary={self.reasoning_summary!r})"
 
 
-Decision = Union[int, str, LegalAction, dict, _Resign, WithReasoning]
+Decision = Union[int, str, LegalAction, dict, _Resign, _Wait, WithReasoning]
 MessageDecision = Union[SendMessage, _TerminateMessaging]
 
 
@@ -330,10 +380,47 @@ def _invoke_message_decision(
         ) from exc
 
 
-def _validate_decision(decision: Any, legal_actions: list[LegalAction]) -> Union[_Resign, _PlayAction]:
+def _is_realtime(state: GameState) -> bool:
+    """Whether the match runs in real time: the state's ``pacing.mode``."""
+    pacing = state.raw.get("pacing")
+    return isinstance(pacing, dict) and pacing.get("mode") == _REALTIME_PACING
+
+
+def _resolve_result_hook(choose_action: Any) -> Callable[[dict, DecisionContext], Any] | None:
+    """An optional ``on_action_result(result, context)`` on the agent object
+    (resolved from the original value, like ``choose_message``)."""
+    method = getattr(choose_action, "on_action_result", None)
+    return method if callable(method) else None
+
+
+def _report_result(hook, result: dict, context: DecisionContext) -> None:
+    if hook is None:
+        return
+    try:
+        hook(result, context)
+    except Exception as exc:
+        raise DecisionError(
+            f"on_action_result raised {exc!r} for session {context.session_id!r}."
+        ) from exc
+
+
+def _with_game_config(game: Any, context: DecisionContext) -> DecisionContext:
+    """``context`` with ``game_config`` from ``get_game_config``, fetched once
+    and best-effort: a server or session without it leaves ``None``."""
+    getter = getattr(game, "get_game_config", None)
+    if context.game_config is not None or not context.game_type or not callable(getter):
+        return context
+    try:
+        config = getter(context.game_type)
+    except MCPToolError:
+        return context
+    return replace(context, game_config=config) if isinstance(config, dict) else context
+
+
+def _validate_decision(decision: Any, legal_actions: list[LegalAction]) -> Union[_Resign, _Wait, _PlayAction]:
     if isinstance(decision, WithReasoning):
         inner = decision.action
-        if inner is RESIGN or isinstance(inner, WithReasoning):
+        if inner is RESIGN or inner is WAIT or isinstance(inner, WithReasoning):
             raise DecisionError(
                 "WithReasoning(...) must wrap a move (a LegalAction, action_id, "
                 f"int, or structured dict), not {inner!r}."
@@ -344,6 +431,9 @@ def _validate_decision(decision: Any, legal_actions: list[LegalAction]) -> Union
 
     if decision is RESIGN:
         return RESIGN
+
+    if decision is WAIT:
+        return WAIT
 
     # bool is a subclass of int in Python (isinstance(True, int) is True) —
     # reject it explicitly before the int branch below would otherwise treat
@@ -466,6 +556,13 @@ def run_game(
        the unchanged state (the loop just waits again). Against a server without that tool,
        sleeps ``wait_seconds`` and re-reads instead.
 
+    In a real-time game (``pacing.mode == "realtime"``), ``WAIT`` waits as
+    in step 6, ``INVALID_ACTION`` re-reads the state like a race, and
+    ``RUNTIME_TEMPORARILY_UNAVAILABLE`` re-reads it after
+    ``REALTIME_RETRY_SECONDS``; ``context.game_config`` is fetched once
+    before the first decision. ``on_action_result`` (optional, on the agent
+    object) gets every ``play_action`` answer and every recovered refusal.
+
     A race error (``STALE_STATE``/``NOT_YOUR_TURN``/``WRONG_PHASE``/
     ``GAME_ALREADY_COMPLETE``/``PLAYER_ELIMINATED`` — the state changed
     between our last read and this submit, not a contestant bug) refetches
@@ -479,7 +576,9 @@ def run_game(
     """
     decision_fn = _resolve_decision_fn(choose_action)
     message_decision_fn = _resolve_message_decision_fn(choose_action)
+    result_hook = _resolve_result_hook(choose_action)
     long_poll_supported = True
+    config_fetched = False
 
     def wait(current: GameState, message_seq: int | None) -> GameState:
         nonlocal long_poll_supported
@@ -553,6 +652,10 @@ def run_game(
             continue
 
         if state.is_current_actor:
+            realtime = _is_realtime(state)
+            if realtime and not config_fetched:
+                config_fetched = True
+                context = _with_game_config(game, context)
             if state.raw.get("legal_actions") is None:
                 # The server omits legal_actions when a move landed between
                 # its state and legal-actions reads; fetch them directly.
@@ -565,6 +668,15 @@ def run_game(
             decision = _validate_decision(
                 _invoke_decision(decision_fn, state, context), state.legal_actions
             )
+            if decision is WAIT:
+                if not realtime:
+                    raise DecisionError(
+                        "choose_action returned altruagent.WAIT in a turn-based game "
+                        f"(session {context.session_id!r}); WAIT is only for real-time "
+                        "games, where nothing needs to be sent right now."
+                    )
+                state = wait(state, _last_message_seq(state))
+                continue
             try:
                 if decision is RESIGN:
                     result = game.resign()
@@ -583,7 +695,14 @@ def run_game(
                     **reasoning,
                 )
             except MCPToolError as exc:
-                if exc.error_code in _RACE_ERROR_CODES:
+                recovered = exc.error_code in _RACE_ERROR_CODES or (
+                    realtime
+                    and exc.error_code in _ACTION_SCOPED_ERROR_CODES | _REALTIME_TRANSIENT_ERROR_CODES
+                )
+                if recovered:
+                    _report_result(result_hook, {"error": exc.error_code, "detail": str(exc)}, context)
+                    if exc.error_code in _REALTIME_TRANSIENT_ERROR_CODES:
+                        sleep(REALTIME_RETRY_SECONDS)
                     state = game.get_state()
                     continue
                 if exc.error_code == _CAPABILITY_ERROR_CODE:
@@ -599,8 +718,11 @@ def run_game(
                         f"{context.session_id!r}: {exc}"
                     ) from exc
                 raise
+            if isinstance(result, dict):
+                _report_result(result_hook, result, context)
             # While the game continues, play_action returns the post-move
-            # state; once it's over (or on an older server) it doesn't.
+            # state; once it's over (or on an older server or in a real-time
+            # game, whose answer carries verdicts only) it doesn't.
             post_move = result.get("state") if isinstance(result, dict) else None
             state = (
                 GameState.from_mcp_state(post_move)

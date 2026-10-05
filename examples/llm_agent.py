@@ -24,6 +24,15 @@ Two kinds of move exist on the platform:
   a template with no adapter raises ``UnsupportedStructuredAction`` rather
   than guessing a payload.
 
+Real-time games are a third kind: no turns, and a move is a batch of orders
+sent whenever the agent is ready (Red Alert). A state whose ``pacing.mode``
+is ``"realtime"`` goes to the game's real-time player, registered by game
+type in ``REALTIME_PLAYERS``; it answers each view with a batch, or
+``altruagent.WAIT`` when there is nothing to send, and learns from every
+``play_action`` answer through ``on_action_result``. The Red Alert player is
+in ``examples/llm/redalert.py``. A real-time game with no player raises
+``UnsupportedStructuredAction`` rather than guessing.
+
 Every move carries the model's short public ``reasoning_summary`` via
 ``altruagent.WithReasoning`` (sent as ``play_action``'s ``reasoning_summary``).
 In-game chat is separate: in a messaging phase the runtime calls
@@ -42,7 +51,7 @@ Configuration (environment or the starter's gitignored ``.env``):
 from __future__ import annotations
 
 import json
-from typing import Callable
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -54,13 +63,18 @@ from altruagent import (
     SendMessage,
     WithReasoning,
 )
-from examples.llm import pokemon
+from examples.llm import pokemon, redalert
 from examples.llm.base import AdapterFactory, Choice, InvalidChoice, UnsupportedStructuredAction, object_schema
 from examples.llm.providers import LLMProvider, ProviderError, provider_from_env
 
 # Structured-action adapters, by template type. A future game that needs one
 # adds its module's adapters here; ordinary-action games need nothing.
 STRUCTURED_ADAPTERS: dict[str, AdapterFactory] = {**pokemon.ADAPTERS}
+
+# Real-time games, by game type: a factory for one match's player, called as
+# factory(provider, log=...). The player answers choose_action with a move or
+# WAIT and gets every play_action answer through on_action_result.
+REALTIME_PLAYERS: dict[str, Callable[..., Any]] = {"red_alert": redalert.RedAlertPlayer}
 
 MAX_ATTEMPTS = 2  # the first answer plus one retry with the validation error
 MESSAGE_REQUESTS_PER_ROUND = 2  # model calls per discussion round before auto-ending it
@@ -100,10 +114,13 @@ class LLMAgent:
         provider: LLMProvider,
         *,
         adapters: dict[str, AdapterFactory] | None = None,
+        realtime_players: dict[str, Callable[..., Any]] | None = None,
         log: Callable[[str], None] = print,
     ) -> None:
         self._provider = provider
         self._adapters = STRUCTURED_ADAPTERS if adapters is None else adapters
+        self._realtime_players = REALTIME_PLAYERS if realtime_players is None else realtime_players
+        self._realtime: Any = None  # this match's real-time player, created on first use
         self._log = log
         self._transcript: list[dict] = []
         self._seen_messages: set[int] = set()
@@ -115,7 +132,9 @@ class LLMAgent:
 
     # -- moves ------------------------------------------------------------------
 
-    def choose_action(self, state: GameState, context: DecisionContext) -> WithReasoning:
+    def choose_action(self, state: GameState, context: DecisionContext):
+        if _is_realtime(state):
+            return self._realtime_player(context).choose_action(state, context)
         self._remember(state)
         choice = self._action_choice(state)
         value, answer = self._ask(choice, state, context, counter="decision_calls")
@@ -141,6 +160,24 @@ class LLMAgent:
                 "examples/llm_agent.py's STRUCTURED_ADAPTERS (see examples/llm/pokemon.py)."
             )
         return factory(templates[0], state)
+
+    def on_action_result(self, result: dict, context: DecisionContext) -> None:
+        """The runner's report of each play_action answer; only a real-time
+        player uses it (to learn which orders were refused)."""
+        if self._realtime is not None:
+            self._realtime.on_action_result(result, context)
+
+    def _realtime_player(self, context: DecisionContext) -> Any:
+        if self._realtime is None:
+            factory = self._realtime_players.get(context.game_type or "")
+            if factory is None:
+                raise UnsupportedStructuredAction(
+                    f"{context.game_type!r} is a real-time game this example agent has no player for; "
+                    "it won't guess orders. Add one to examples/llm_agent.py's REALTIME_PLAYERS "
+                    "(see examples/llm/redalert.py)."
+                )
+            self._realtime = factory(self._provider, log=self._log)
+        return self._realtime
 
     # -- messaging -----------------------------------------------------------------
 
@@ -210,6 +247,12 @@ class LLMAgent:
                 {"from": f"Player{message.sender}", "to": [f"Player{r}" for r in message.recipients] or "everyone",
                  "text": message.content}
             )
+
+
+def _is_realtime(state: GameState) -> bool:
+    """A real-time game: the state's ``pacing.mode`` (no turns; see altruagent.runner)."""
+    pacing = state.raw.get("pacing")
+    return isinstance(pacing, dict) and pacing.get("mode") == "realtime"
 
 
 def _is_template(action: LegalAction) -> bool:

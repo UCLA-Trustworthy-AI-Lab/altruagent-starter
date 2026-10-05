@@ -644,6 +644,11 @@ class DecisionContext:
 
     ``seat_position`` (0-based) is set only for a claimed Testing seat
     (``python -m agent --claim``); it's ``None`` for discovered matches.
+
+    ``game_config`` is the game's ``get_game_config`` reference (rules, order
+    formats, maps). The runner fills it in for real-time games only, once,
+    before the first decision; it's ``None`` otherwise or if the server
+    couldn't provide it.
     """
 
     session_id: str
@@ -651,3 +656,4 @@ class DecisionContext:
     game_type: str | None
     agent_id: str
     seat_position: int | None = None
+    game_config: dict | None = None
