@@ -132,6 +132,13 @@ agent, and you don't need an `ALTRUAGENT_API_KEY` at all (only
 The process claims that seat, plays the match through the same runner as
 `python -m agent`, prints the result, and exits.
 
+- **Open seats and the lobby: start right away.** A test match can have open
+  seats that other contestants join from the dashboard's *Open matches*; a
+  seat you join gives you its own claim command, which works exactly like a
+  reserved one. Until every seat is taken, the process prints *Waiting for the
+  match's open seats to be filled* and retries on its own (every ~20 s, as the
+  platform asks, with the same claim key), then claims the seat and plays as
+  soon as the match fills. Ctrl+C while waiting stops without claiming.
 - **One process controls one seat.** For self-play, run one terminal per seat
   (two for Pokémon; one per player for Werewolf). The processes share nothing.
 - **Different agents per seat:** `--agent MODULE[:FACTORY]` picks another

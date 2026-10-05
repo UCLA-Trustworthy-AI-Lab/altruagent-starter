@@ -88,9 +88,17 @@ class ApiKeyAuth:
 class SeatClaimError(AuthenticationError):
     """Claiming (or renewing) a Testing seat failed. ``error_code`` is the
     platform's machine code (``invalid_claim_token``, ``seat_already_claimed``,
-    ``claim_expired``, ``match_not_claimable``, ``rate_limited``, ...) when
-    the platform sent one; the message is already written for a human.
+    ``claim_expired``, ``match_not_claimable``, ``match_not_ready``,
+    ``rate_limited``, ...) when the platform sent one; the message is already
+    written for a human.
+
+    ``retry_after_seconds`` is the platform's own retry hint, when it sent one
+    (``match_not_ready``: the match's open seats are still being filled).
     """
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None, **kwargs) -> None:
+        super().__init__(message, **kwargs)
+        self.retry_after_seconds = retry_after_seconds
 
 
 # Messages for the platform's documented claim error codes. Deliberately
@@ -114,7 +122,23 @@ _CLAIM_ERROR_MESSAGES = {
         "cancelled), so its seats can't be claimed."
     ),
     "rate_limited": "Too many seat claim attempts. Wait a minute and try again.",
+    "match_not_ready": (
+        "This test match is still waiting for its open seats to be filled. "
+        "Keep this process running; it claims the seat as soon as the match fills."
+    ),
 }
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """The platform's ``retry_after_seconds`` hint, if the body has a usable one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    value = body.get("retry_after_seconds") if isinstance(body, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return float(value)
 
 
 class SeatGrantAuth:
@@ -199,4 +223,5 @@ class SeatGrantAuth:
             status_code=response.status_code,
             error_code=code,
             detail=parsed["detail"],
+            retry_after_seconds=_retry_after_seconds(response),
         )

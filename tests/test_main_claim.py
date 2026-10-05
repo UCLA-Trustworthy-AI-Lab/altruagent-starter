@@ -471,7 +471,7 @@ def test_claim_mode_prints_lifecycle_through_real_runner(monkeypatch, capsys):
     assert capsys.readouterr().out.splitlines() == [
         "Claimed seat 2/2",
         "Game: pokemon_vgc_doubles_draft",
-        "Match: match-1 (waiting for the other seats to be claimed)",
+        "Match: match-1 (waiting for every seat's agent to connect)",
         "Connecting to GameAPI...",
         "Connected. Playing — press Ctrl+C to stop.",
         "Phase: draft",
@@ -520,3 +520,124 @@ def test_no_arguments_still_runs_discovery_supervisor(monkeypatch):
     assert agent_main.main() == 0
     assert constructed == [((), {})]  # default API-key client, no auth= override
     assert calls == [("supervisor", "agent-123"), "close"]
+
+
+# -- waiting for the Testing lobby to fill (409 match_not_ready) ---------------------
+
+
+def _not_ready(retry_after=20):
+    body = {"error": "match_not_ready", "detail": "waiting for open seats"}
+    if retry_after is not None:
+        body["retry_after_seconds"] = retry_after
+    return httpx.Response(409, json=body, headers={"Retry-After": str(retry_after or 20)})
+
+
+def _sequence(*responses):
+    queue = list(responses)
+    return lambda body: queue.pop(0) if len(queue) > 1 else queue[0]
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    calls: list[float] = []
+    monkeypatch.setattr(agent_main.time, "sleep", lambda s: calls.append(s))
+    monkeypatch.setattr(agent_main.random, "uniform", lambda a, b: 0.0)
+    return calls
+
+
+def test_waits_while_the_lobby_fills_then_claims_with_the_same_key(monkeypatch, capsys, sleeps):
+    harness = ClaimHarness(
+        monkeypatch,
+        response=_sequence(_not_ready(), _not_ready(), httpx.Response(200, json=_grant())),
+    )
+
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 0
+
+    assert len(harness.claims) == 3
+    assert len({c["claim_key"] for c in harness.claims}) == 1  # one SeatGrantAuth, one key
+    assert all(c["claim_token"] == CLAIM_TOKEN for c in harness.claims)
+    assert sleeps == [20.0, 20.0]
+    assert len(harness.runs) == 1
+    out = capsys.readouterr().out
+    assert out.count("Waiting for the match's open seats to be filled") == 1
+
+
+def test_honours_the_server_retry_hint(monkeypatch, sleeps):
+    ClaimHarness(monkeypatch, response=_sequence(_not_ready(retry_after=7), httpx.Response(200, json=_grant())))
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 0
+    assert sleeps == [7.0]
+
+
+def test_falls_back_to_twenty_seconds_without_a_hint(monkeypatch, sleeps):
+    ClaimHarness(monkeypatch, response=_sequence(_not_ready(retry_after=None), httpx.Response(200, json=_grant())))
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 0
+    assert sleeps == [agent_main.CLAIM_WAIT_DEFAULT_S]
+
+
+def test_rate_limited_while_waiting_retries(monkeypatch, sleeps):
+    harness = ClaimHarness(
+        monkeypatch,
+        response=_sequence(
+            _not_ready(),
+            httpx.Response(429, json={"error": "rate_limited", "detail": "slow down"}),
+            httpx.Response(200, json=_grant()),
+        ),
+    )
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 0
+    assert len(harness.claims) == 3
+    assert sleeps == [20.0, agent_main.CLAIM_RATE_LIMITED_WAIT_S]
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(404, "invalid_claim_token"), (410, "claim_expired"), (409, "seat_already_claimed"), (409, "match_not_claimable")],
+)
+def test_other_claim_errors_still_exit(monkeypatch, capsys, sleeps, status, code):
+    harness = ClaimHarness(monkeypatch, response=lambda body: httpx.Response(status, json={"error": code}))
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 1
+    assert len(harness.claims) == 1
+    assert sleeps == []
+    assert "Could not claim seat" in capsys.readouterr().out
+
+
+def test_ctrl_c_while_waiting_stops_cleanly_without_claiming(monkeypatch, capsys):
+    ClaimHarness(monkeypatch, response=lambda body: _not_ready())
+
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_main.time, "sleep", interrupted)
+    assert agent_main.main(["--claim", CLAIM_TOKEN]) == 0
+    out = capsys.readouterr().out
+    assert "Stopped before the seat was claimed." in out
+    assert "stays claimed" not in out
+
+
+def test_waiting_never_prints_secrets(monkeypatch, capsys, sleeps):
+    harness = ClaimHarness(
+        monkeypatch,
+        response=_sequence(_not_ready(), httpx.Response(200, json=_grant(access_token="seat-jwt-SECRET"))),
+    )
+    agent_main.main(["--claim", CLAIM_TOKEN])
+    out = capsys.readouterr().out
+    assert CLAIM_TOKEN not in out
+    assert "seat-jwt-SECRET" not in out
+    assert harness.claims[0]["claim_key"] not in out
+
+
+def test_login_itself_is_still_a_single_attempt():
+    auth = SeatGrantAuth(CLAIM_TOKEN)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return _not_ready()
+
+    http = httpx.Client(base_url=CONTROL_URL, transport=httpx.MockTransport(handler))
+    from altruagent.auth import SeatClaimError
+
+    with pytest.raises(SeatClaimError) as info:
+        auth.login(http, CONTROL_URL)
+    assert len(calls) == 1
+    assert info.value.error_code == "match_not_ready"
+    assert info.value.retry_after_seconds == 20.0

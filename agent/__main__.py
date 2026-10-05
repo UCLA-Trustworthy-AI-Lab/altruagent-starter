@@ -39,14 +39,16 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import random
 import sys
+import time
 from typing import Callable
 
 from altruagent.agent_loader import DEFAULT_AGENT_SPEC
 from altruagent.agent_loader import load_agent_factory as _load_agent_factory
 from altruagent.auth import SeatClaimError, SeatGrantAuth
 from altruagent.client import AltruAgentClient
-from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError
+from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from altruagent.mcp_game import MCPGameSession
 from altruagent.models import DecisionContext, GameState, SeatGrant
 from altruagent.official import OFFICIAL_AGENT_KEY_ENV, OfficialAgentClient, OfficialAgentError
@@ -148,7 +150,7 @@ def _describe_seat(grant: SeatGrant) -> list[str]:
         seat = "Claimed seat"
     match = f"Match: {grant.match_id or 'unknown'}"
     if grant.match_status == "starting":
-        match += " (waiting for the other seats to be claimed)"
+        match += " (waiting for every seat's agent to connect)"
     return [seat, f"Game: {grant.game_type or 'unknown'}", match]
 
 
@@ -192,6 +194,64 @@ class _ProgressGameSession(MCPGameSession):
         return result
 
 
+# Waiting for a match whose open seats are still being filled (the platform's
+# 409 match_not_ready): its own retry_after_seconds, else this, plus jitter so
+# several local seats don't retry in lockstep.
+CLAIM_WAIT_DEFAULT_S = 20.0
+CLAIM_WAIT_JITTER_S = 2.0
+# rate_limited while waiting: the platform allows 30 claim requests a minute.
+CLAIM_RATE_LIMITED_WAIT_S = 30.0
+# The control plane unreachable while waiting: a few spaced retries, then stop.
+CLAIM_NETWORK_WAIT_S = 10.0
+CLAIM_NETWORK_RETRIES = 5
+
+
+class _StoppedBeforeClaim(Exception):
+    """Ctrl+C while waiting to claim: nothing was claimed."""
+
+
+def _claim_with_wait(client: AltruAgentClient) -> None:
+    """Claim the seat, waiting while the match's open seats are being filled.
+
+    ``SeatGrantAuth.login()`` stays a single attempt; this loop decides when to
+    call it again. Every attempt goes through the same client, so the same
+    ``SeatGrantAuth`` and therefore the same claim_key. Waits only on
+    ``match_not_ready`` and ``rate_limited`` (and a few network failures);
+    every other error is raised, as before. Prints nothing secret.
+    """
+    announced = False
+    network_failures = 0
+    while True:
+        try:
+            try:
+                client.login()
+                return
+            except SeatClaimError as exc:
+                if exc.error_code == "match_not_ready":
+                    if not announced:
+                        print(
+                            "Waiting for the match's open seats to be filled — "
+                            "this seat is claimed as soon as the match fills (Ctrl+C to stop)...",
+                            flush=True,
+                        )
+                        announced = True
+                    wait = exc.retry_after_seconds or CLAIM_WAIT_DEFAULT_S
+                    time.sleep(wait + random.uniform(0, CLAIM_WAIT_JITTER_S))
+                    continue
+                if exc.error_code == "rate_limited":
+                    time.sleep(CLAIM_RATE_LIMITED_WAIT_S)
+                    continue
+                raise
+            except PlatformError as exc:
+                if exc.status_code is None and network_failures < CLAIM_NETWORK_RETRIES:
+                    network_failures += 1
+                    time.sleep(CLAIM_NETWORK_WAIT_S)
+                    continue
+                raise
+        except KeyboardInterrupt:
+            raise _StoppedBeforeClaim() from None
+
+
 def _run_claim(claim_token: str, create_agent: Callable) -> int:
     """Claim one Testing seat and play it to completion in this process."""
     try:
@@ -219,7 +279,10 @@ def _run_claim(claim_token: str, create_agent: Callable) -> int:
             return 1
 
         try:
-            client.login()  # the claim itself
+            _claim_with_wait(client)  # the claim itself, waiting for the lobby if needed
+        except _StoppedBeforeClaim:
+            print("\nStopped before the seat was claimed.")
+            return 0
         except AltruAgentError as exc:
             print(f"Could not claim seat: {exc}")
             return 1
