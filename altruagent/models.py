@@ -558,14 +558,14 @@ class Tournament:
 
 @dataclass(frozen=True)
 class SeatGrant:
-    """One self-hosted Testing seat's GameAPI authorization, as returned by
-    ``POST /tournament/agent/test-matches/seats/claim`` (Agent_ACP
-    backend/src/services/tournamentMatchCoordinatorService.ts's
-    ``SeatGrant``). Represents exactly one seat of one match.
+    """One assigned seat's GameAPI authorization, as returned by
+    ``POST /tournament/agent/assignments/:seatId/grant`` (Agent_ACP
+    backend/src/services/officialAgentConnectionService.ts's
+    ``buildSeatGrant``). Represents exactly one seat of one match.
 
     ``access_token`` is temporary (see ``expires_at``) and renewed by
-    ``SeatGrantAuth``; it is excluded from ``repr`` and ``raw``, so printing
-    or logging a grant never shows it. Never persisted.
+    ``OfficialSeatAuth``; it is excluded from ``repr`` and ``raw``, so
+    printing or logging a grant never shows it. Never persisted.
     """
 
     access_token: str = field(repr=False)
@@ -599,13 +599,41 @@ class SeatGrant:
         )
 
 
+def _text_or_none(value: Any) -> str | None:
+    """A non-empty string from the server, else ``None`` (tolerates any type)."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _opponent_names(value: Any) -> tuple[str, ...]:
+    """``[{"name": ...}, ...]`` (or plain strings) -> a tuple of names."""
+    if not isinstance(value, list):
+        return ()
+    names = []
+    for item in value:
+        name = item.get("name") if isinstance(item, dict) else item
+        if isinstance(name, str) and name.strip():
+            names.append(name)
+    return tuple(names)
+
+
 @dataclass(frozen=True)
 class OfficialAssignment:
-    """One active official tournament seat assigned to this event_agent, as
-    listed by ``GET /tournament/agent/assignments`` (Agent_ACP
+    """One active game seat assigned to this event agent, as listed by
+    ``GET /tournament/agent/assignments`` (Agent_ACP
     backend/src/services/officialAgentConnectionService.ts's
     ``OfficialAssignment``). ``seat_id`` is the stable identity: the runtime
     keeps at most one worker per seat.
+
+    The newer fields are optional and only for display; an older backend
+    simply leaves them out:
+
+    - ``context``: ``"testing"`` (a Testing game) or ``"tournament"``.
+    - ``tournament_id``/``tournament_name``/``round_label``: which tournament
+      and round this game belongs to (tournament games only).
+    - ``opponents``: the other agents' display names, as a tuple of strings
+      (the server sends ``[{"name": ...}]``).
+    - ``connect_deadline_at``: ISO 8601 time by which this agent must have
+      connected; an agent that isn't connected by then forfeits the game.
     """
 
     match_id: str
@@ -615,6 +643,12 @@ class OfficialAssignment:
     seat_count: int | None = None
     match_status: str | None = None
     seat_status: str | None = None
+    context: str | None = None
+    tournament_id: str | None = None
+    tournament_name: str | None = None
+    round_label: str | None = None
+    opponents: tuple[str, ...] = ()
+    connect_deadline_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "OfficialAssignment":
@@ -626,6 +660,12 @@ class OfficialAssignment:
             seat_count=data.get("seat_count"),
             match_status=data.get("match_status"),
             seat_status=data.get("seat_status"),
+            context=_text_or_none(data.get("context")),
+            tournament_id=_text_or_none(data.get("tournament_id")),
+            tournament_name=_text_or_none(data.get("tournament_name")),
+            round_label=_text_or_none(data.get("round_label")),
+            opponents=_opponent_names(data.get("opponents")),
+            connect_deadline_at=_text_or_none(data.get("connect_deadline_at")),
         )
 
 
@@ -642,8 +682,9 @@ class DecisionContext:
     ``state`` through just to log/key by them; ``tournament_id``/
     ``agent_id`` are not available anywhere else.
 
-    ``seat_position`` (0-based) is set only for a claimed Testing seat
-    (``python -m agent --claim``); it's ``None`` for discovered matches.
+    ``seat_position`` (0-based) is your seat in the game, set for every game
+    played by ``python -m agent --tournament``. ``tournament_id`` is set for
+    a tournament game and ``None`` for a Testing game.
 
     ``game_config`` is the game's ``get_game_config`` reference (rules, order
     formats, maps). The runner fills it in for real-time games only, once,

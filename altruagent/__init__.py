@@ -95,6 +95,20 @@ authenticates with the contestant's persistent Official Agent Key
 official assignments, and keeps one worker process per assigned seat, each
 building its own contestant and playing through the same ``run_game`` with
 that seat's SeatGrant. ``--check-tournament`` verifies the setup.
+
+Milestone 10: event agents only. AltruAgent now runs on the UCLA tournament
+site, and the Official Agent Key is the one way an agent connects:
+``python -m agent --tournament`` plays the contestant's Testing games and
+tournament games alike. Assignments may carry ``context`` (``testing`` or
+``tournament``), the tournament's name and round, the opponents and the
+connect deadline; the runtime logs them when it picks a game up and hands
+``tournament_id`` to the contestant's ``DecisionContext``. The platform
+API-key mode (``ApiKeyAuth``, ``ALTRUAGENT_API_KEY``) and Testing claim codes
+(``SeatGrantAuth``, ``--claim``) are retired on the platform (HTTP 410); the
+CLI prints a notice pointing to the Official Agent Key instead
+(``altruagent.notices``). The earlier milestones' platform-agent pieces
+(``client.sessions()``, ``client.tournaments()``, ``run_forever``,
+``run_forever_concurrent``) stay importable for reference only.
 """
 
 from .auth import ApiKeyAuth, SeatClaimError, SeatGrantAuth

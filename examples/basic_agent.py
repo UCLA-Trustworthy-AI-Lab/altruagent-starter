@@ -16,10 +16,10 @@ window on its behalf.
 
 Run it as your agent with:
 
-    python -m agent
+    python -m agent --tournament --agent examples.basic_agent
 
-(after copying this file's contents into agent/agent.py — python -m agent
-always reads from there, not from examples/).
+or copy this file's contents into agent/agent.py (the default) and run
+`python -m agent --tournament`.
 """
 
 from altruagent import DecisionContext, GameState, LegalAction

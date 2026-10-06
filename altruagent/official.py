@@ -1,12 +1,11 @@
-"""Official tournament identity: a self-hosted event_agent's persistent
-Official Agent Key (``eak_live_...``, from the tournament dashboard).
+"""Your agent's identity: a self-hosted event agent's persistent Official
+Agent Key (``eak_live_...``, from the tournament dashboard). It is the only
+way an agent connects now: the same key plays the contestant's Testing games
+and tournament games (``python -m agent --tournament``).
 
-Deliberately separate from the other two identities in this SDK:
-
-- ``ApiKeyAuth`` (``sk_agent_...``): a generic platform agent.
-- ``SeatGrantAuth`` (``seatclaim_...``): one Testing seat.
-- here: the contestant's registered tournament agent, which discovers its own
-  official assignments and obtains a SeatGrant for each.
+The SDK's two older identities are retired on the platform (see
+``altruagent.notices``): ``ApiKeyAuth`` (``sk_agent_...``, a platform agent)
+and ``SeatGrantAuth`` (``seatclaim_...``, one Testing seat).
 
 Two tokens, never mixed up:
 
@@ -34,6 +33,7 @@ from ._responses import _parse_error_body, _parse_json_body
 from .client import AltruAgentClient
 from .errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from .models import OfficialAssignment, SeatGrant
+from .notices import DASHBOARD_URL
 
 OFFICIAL_AGENT_KEY_ENV = "ALTRUAGENT_OFFICIAL_AGENT_KEY"
 AUTHENTICATE_PATH = "/tournament/agent/authenticate"
@@ -42,8 +42,13 @@ _KEY_PATTERN = re.compile(r"^eak_live_[0-9a-f]{64}$")
 
 _ERROR_MESSAGES = {
     "invalid_official_agent_key": (
-        "The Official Agent Key was not accepted. Copy it again from the tournament "
+        "The Official Agent Key was not accepted. Check that your agent is set to "
+        "Self-hosted in Agent Configuration, then copy the key again from the tournament "
         "dashboard (or generate a new one there) and update ALTRUAGENT_OFFICIAL_AGENT_KEY."
+    ),
+    "registration_incomplete": (
+        f"Your event registration isn't complete yet. Finish it on the tournament dashboard "
+        f"({DASHBOARD_URL}), then run this again."
     ),
     "rate_limited": "Too many authentication attempts. Wait a minute and try again.",
     "assignment_not_found": "That tournament assignment was not found for this agent.",
@@ -155,7 +160,8 @@ class OfficialAgentClient:
             self._client.login()
 
     def assignments(self) -> list[OfficialAssignment]:
-        """``GET /tournament/agent/assignments`` — this agent's active official seats."""
+        """``GET /tournament/agent/assignments`` — this agent's active seats
+        (Testing and tournament games)."""
         with self._lock:
             data = self._client.request("GET", ASSIGNMENTS_PATH)
         rows = data.get("assignments") if isinstance(data, dict) else None

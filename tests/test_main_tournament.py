@@ -1,7 +1,7 @@
 """CLI tests for ``python -m agent --tournament`` / ``--check-tournament``.
 The official client and the supervisor loop are replaced by fakes; no
-network, no processes. Generic and claim modes are covered by
-tests/test_main.py and tests/test_main_claim.py, unchanged.
+network, no processes. The retired modes (no mode, ``--claim``) are covered
+by tests/test_main.py.
 """
 
 from __future__ import annotations
@@ -56,8 +56,6 @@ def _install(monkeypatch, official=None, *, supervisor=None):
             supervisor()
 
     monkeypatch.setattr(agent_main, "run_tournament_forever", fake_supervisor)
-    monkeypatch.setattr(agent_main, "run_forever_concurrent", lambda *a, **k: pytest.fail("generic supervisor started"))
-    monkeypatch.setattr(agent_main, "_run_claim", lambda *a, **k: pytest.fail("claim mode started"))
     return official, calls
 
 
@@ -72,8 +70,8 @@ def test_tournament_mode_authenticates_and_runs_the_tournament_supervisor(env, m
     assert official.authenticated and official.closed
     assert calls == [(official, "agent.agent:create_agent")]
     out = capsys.readouterr().out.splitlines()
-    assert out[:2] == ["Connected as official tournament agent.",
-                       "Waiting for tournament assignments... (Press Ctrl+C to stop.)"]
+    assert out[:2] == ["Connected with your Official Agent Key.",
+                       "Waiting for your next game... (Press Ctrl+C to stop.)"]
 
 
 def test_tournament_mode_passes_agent_override(env, monkeypatch):
@@ -105,7 +103,7 @@ def test_tournament_mode_authentication_failure(env, monkeypatch, capsys):
     official, calls = _install(monkeypatch, FakeOfficial(auth_error=OfficialAgentError("The Official Agent Key was not accepted.")))
 
     assert agent_main.main(["--tournament"]) == 1
-    assert "Could not connect as official tournament agent" in capsys.readouterr().out
+    assert "Could not connect with your Official Agent Key" in capsys.readouterr().out
     assert calls == [] and official.closed
 
 
@@ -131,6 +129,13 @@ def test_tournament_mode_fatal_auth_error_during_run(env, monkeypatch, capsys):
 
 def test_tournament_mode_ignores_a_stray_claim_token_env(env, monkeypatch):
     monkeypatch.setenv("ALTRUAGENT_CLAIM_TOKEN", "seatclaim_should_be_ignored")
+    _, calls = _install(monkeypatch)
+
+    assert agent_main.main(["--tournament"]) == 0 and len(calls) == 1
+
+
+def test_tournament_mode_ignores_a_stray_platform_api_key(env, monkeypatch):
+    monkeypatch.setenv("ALTRUAGENT_API_KEY", "sk_agent_old_platform_key")
     _, calls = _install(monkeypatch)
 
     assert agent_main.main(["--tournament"]) == 0 and len(calls) == 1
@@ -165,7 +170,7 @@ def test_check_tournament_success(env, monkeypatch, capsys):
         "✓ Tournament agent authenticated",
         "✓ Assignment discovery available (0 active assignment(s))",
         "✓ Agent ready (agent.agent:create_agent)",
-        "✓ Ready for tournament",
+        "✓ Ready to play Testing and tournament games",
     ]
     assert KEY not in out
 
@@ -215,7 +220,7 @@ def test_check_tournament_failures_are_nonzero_and_specific(env, monkeypatch, ca
 
     assert code == 1
     assert out.splitlines()[-1].startswith(last_line)
-    assert "Ready for tournament" not in out
+    assert "Ready to play" not in out
 
 
 def test_check_tournament_agent_factory_failure(env, monkeypatch, capsys):

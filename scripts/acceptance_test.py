@@ -2,6 +2,10 @@
 as part of `pytest` or CI; invoke it by hand, deliberately, against the real
 deployed platform.
 
+RETIRED: like scripts/smoke_game.py, this drives the platform-agent APIs
+(signup, claim, /competitions), which the platform turned off (HTTP 410). It
+no longer runs against the deployed platform; it is kept for reference.
+
 Proves the messaging-enabled contestant workflow works through the actual
 contestant-facing entry point, `python -m agent` — never by calling
 `run_match`/`run_game`/`run_once_concurrent` directly (those are proven at

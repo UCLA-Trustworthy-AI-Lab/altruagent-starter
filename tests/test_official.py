@@ -184,6 +184,25 @@ def test_invalid_key_raises_clear_error_without_the_key():
     assert "dashboard" in str(exc_info.value) and KEY not in str(exc_info.value)
 
 
+def test_invalid_key_message_mentions_self_hosted():
+    with pytest.raises(OfficialAgentError) as exc_info:
+        official(Backend(key_valid=False)).authenticate()
+
+    assert "Self-hosted" in str(exc_info.value)
+
+
+def test_incomplete_registration_is_explained():
+    def backend(request):
+        return httpx.Response(403, json={"error": "registration_incomplete", "detail": "rules", "next_step": "rules"})
+
+    with pytest.raises(OfficialAgentError) as exc_info:
+        official(backend).authenticate()
+
+    error = exc_info.value
+    assert (error.status_code, error.error_code) == (403, "registration_incomplete")
+    assert "registration isn't complete" in str(error) and "platform.altruagent-game.com" in str(error)
+
+
 def test_key_revoked_mid_run_fails_after_one_reauth_attempt():
     backend = Backend()
     client = official(backend)
@@ -221,6 +240,26 @@ def test_one_and_many_assignments_parse():
     assert [(a.seat_id, a.match_id, a.game_type) for a in result] == [
         ("seat-1", "match-1", "pokemon_vgc_doubles_draft"), ("seat-2", "match-2", "werewolf")]
     assert (result[1].seat_position, result[1].seat_count, result[1].seat_status) == (5, 7, "pending")
+
+
+def test_assignments_parse_the_optional_tournament_and_testing_fields():
+    backend = Backend(assignments=[
+        assignment("seat-1", game_type="werewolf", context="tournament", tournament_id="t-1",
+                   tournament_name="Fall Cup", round_label="Swiss round 2 of 3",
+                   opponents=[{"name": "Alpha"}, {"name": "Beta"}],
+                   connect_deadline_at="2026-10-16T15:04:00.000Z"),
+        assignment("seat-2", match_id="match-2", context="testing"),
+    ])
+
+    tournament, testing = official(backend).assignments()
+
+    assert (tournament.context, tournament.tournament_id, tournament.tournament_name, tournament.round_label) == (
+        "tournament", "t-1", "Fall Cup", "Swiss round 2 of 3")
+    assert tournament.opponents == ("Alpha", "Beta")
+    assert tournament.connect_deadline_at == "2026-10-16T15:04:00.000Z"
+    assert testing.context == "testing"
+    assert (testing.tournament_id, testing.tournament_name, testing.round_label, testing.opponents,
+            testing.connect_deadline_at) == (None, None, None, (), None)
 
 
 def test_grant_returns_seat_grant():

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import textwrap
 import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +22,7 @@ from altruagent.supervisor import (
     MISSING_POLLS_BEFORE_STOP,
     WAITING_MESSAGE,
     TournamentState,
+    describe_assignment,
     run_tournament_forever,
     run_tournament_once,
 )
@@ -36,11 +38,23 @@ from test_supervisor import FakeProcessFactory
 
 SPEC = "agent.agent:create_agent"
 EXEC = "exec-" + "q" * 40
+NOW = datetime(2026, 10, 16, 15, 0, 0, tzinfo=timezone.utc)
 
 
-def a(seat_id, match_id=None, game_type="pokemon_vgc_doubles_draft"):
+def a(seat_id, match_id=None, game_type="pokemon_vgc_doubles_draft", **extra):
     return OfficialAssignment(match_id=match_id or f"match-{seat_id}", seat_id=seat_id, game_type=game_type,
-                              seat_position=0, seat_count=2, match_status="in_progress", seat_status="running")
+                              seat_position=0, seat_count=2, match_status="in_progress", seat_status="running",
+                              **extra)
+
+
+def tournament_game(seat_id="seat-1", **overrides):
+    fields = dict(
+        game_type="werewolf", context="tournament", tournament_id="t-1", tournament_name="Fall Cup",
+        round_label="Swiss round 1 of 3", opponents=("Alpha", "Beta"),
+        connect_deadline_at="2026-10-16T15:03:40.000Z",
+    )
+    fields.update(overrides)
+    return a(seat_id, **fields)
 
 
 class FakeOfficial:
@@ -72,6 +86,7 @@ class Harness:
         run_tournament_once(
             self.official, self.state, agent_spec=SPEC, now=lambda: self.clock["t"],
             cooldown_seconds=self.cooldown, process_factory=self.factory, log=self.log.append,
+            wall_now=lambda: NOW,
         )
 
     def started(self):
@@ -100,6 +115,102 @@ def test_one_assignment_starts_one_worker_with_primitive_input():
     assert process.args == (TournamentWorkerInput("seat-1", "match-seat-1", "pokemon_vgc_doubles_draft", SPEC,
                                                   h.state.execution_id),)
     assert h.log == ["Match assigned: pokemon_vgc_doubles_draft", "Starting match..."]
+
+
+def test_a_tournament_game_logs_its_tournament_round_opponents_and_deadline():
+    h = Harness([tournament_game()])
+
+    h.tick()
+
+    assert h.log == [
+        "Match assigned: werewolf (tournament)",
+        "  Tournament: Fall Cup, Swiss round 1 of 3",
+        "  Opponents: Alpha, Beta",
+        "  Connect by: 2026-10-16 15:03:40 UTC (3m 40s left)",
+        "Starting match...",
+    ]
+
+
+def test_a_testing_game_is_labelled_as_testing():
+    h = Harness([a("seat-1", game_type="werewolf", context="testing")])
+
+    h.tick()
+
+    assert h.log == ["Match assigned: werewolf (Testing)", "Starting match..."]
+
+
+def test_the_tournament_id_is_handed_to_the_worker():
+    h = Harness([tournament_game("seat-1"), a("seat-2", context="testing")])
+
+    h.tick()
+
+    assert [p.args[0].tournament_id for p in h.factory.processes] == ["t-1", None]
+    assert "t-1" in repr(h.factory.processes[0].args[0])
+
+
+def test_describe_assignment_without_the_optional_fields_is_one_line():
+    assert describe_assignment(a("seat-1", game_type=None), now=NOW) == ["Match assigned: unknown game"]
+
+
+def test_describe_assignment_round_without_tournament_name():
+    lines = describe_assignment(a("seat-1", round_label="Final"), now=NOW)
+
+    assert lines[1:] == ["  Round: Final"]
+
+
+def test_describe_assignment_tournament_name_without_round():
+    lines = describe_assignment(a("seat-1", tournament_name="Fall Cup"), now=NOW)
+
+    assert lines[1:] == ["  Tournament: Fall Cup"]
+
+
+@pytest.mark.parametrize(
+    "deadline, expected",
+    [
+        ("2026-10-16T15:00:45Z", "  Connect by: 2026-10-16 15:00:45 UTC (45s left)"),
+        ("2026-10-16T16:30:00+00:00", "  Connect by: 2026-10-16 16:30:00 UTC (1h 30m left)"),
+        ("2026-10-16T08:04:00-07:00", "  Connect by: 2026-10-16 15:04:00 UTC (4m 00s left)"),
+        ("2026-10-16T15:04:00", "  Connect by: 2026-10-16 15:04:00 UTC (4m 00s left)"),
+        ("2026-10-16T14:59:00Z", "  Connect by: 2026-10-16 14:59:00 UTC (deadline passed)"),
+        ("2026-10-16T15:00:00Z", "  Connect by: 2026-10-16 15:00:00 UTC (deadline passed)"),
+        ("soon", "  Connect by: soon"),
+    ],
+)
+def test_describe_assignment_connect_deadline(deadline, expected):
+    lines = describe_assignment(a("seat-1", connect_deadline_at=deadline), now=NOW)
+
+    assert lines[-1] == expected
+
+
+def test_describe_assignment_uses_the_wall_clock_by_default():
+    deadline = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+
+    (line,) = describe_assignment(a("seat-1", connect_deadline_at=deadline))[1:]
+
+    assert line.endswith("left)") and ("9m" in line or "10m" in line)
+
+
+def test_describe_assignment_cleans_server_text_before_printing():
+    lines = describe_assignment(
+        tournament_game(
+            tournament_name="Cup\x1b[31mRED\x1b[0m",
+            opponents=("Evil\x1b]0;title\x07Bot", "\n\t", "L" * 200),
+        ),
+        now=NOW,
+    )
+
+    joined = "\n".join(lines)
+    assert "\x1b" not in joined and "\x07" not in joined
+    assert lines[1] == "  Tournament: Cup[31mRED[0m, Swiss round 1 of 3"
+    opponents = lines[2].removeprefix("  Opponents: ").split(", ")
+    assert opponents[0] == "Evil]0;titleBot"
+    assert len(opponents) == 2 and opponents[1] == "L" * 77 + "..."
+
+
+def test_describe_assignment_never_prints_ids():
+    joined = "\n".join(describe_assignment(tournament_game(), now=NOW))
+
+    assert "seat-1" not in joined and "match-seat-1" not in joined and "t-1" not in joined
 
 
 def test_multiple_simultaneous_assignments_each_get_a_worker():
@@ -330,6 +441,27 @@ def test_worker_grants_the_seat_and_plays_it_through_run_game(capsys):
     out = capsys.readouterr().out
     assert "finished termination_reason=normal score=1.0" in out
     assert "seat-jwt" not in out
+
+
+def test_worker_hands_the_tournament_id_to_the_contestant():
+    runs = []
+
+    def fake_run_game(game, context, contestant):
+        runs.append(context)
+        return types.SimpleNamespace(termination_reason="normal", returns={})
+
+    code = run_tournament_worker(
+        TournamentWorkerInput("seat-1", "match-1", "werewolf", SPEC, EXEC, tournament_id="t-1"),
+        official_factory=lambda: FakeWorkerOfficial(None), run_game_fn=fake_run_game,
+    )
+
+    assert code == EXIT_SUCCESS and runs[0].tournament_id == "t-1"
+
+
+def test_worker_testing_game_has_no_tournament_id():
+    _, runs, _ = _worker()
+
+    assert runs[0][1].tournament_id is None
 
 
 def test_each_worker_builds_its_own_contestant(monkeypatch, tmp_path):

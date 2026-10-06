@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import multiprocessing
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
 from .errors import PlatformError
@@ -39,6 +40,7 @@ from .worker import (
 
 if TYPE_CHECKING:
     from .client import AltruAgentClient
+    from .models import OfficialAssignment
     from .official import OfficialAgentClient
 
 DEFAULT_DISCOVERY_INTERVAL_SECONDS = 15.0
@@ -235,12 +237,83 @@ DEFAULT_TOURNAMENT_POLL_SECONDS = 10.0
 # listings before its still-running worker is stopped — a match that just
 # ended can drop off the list a moment before its worker notices.
 MISSING_POLLS_BEFORE_STOP = 2
-WAITING_MESSAGE = "Waiting for tournament assignments..."
+WAITING_MESSAGE = "Waiting for your next game..."
 # After seat_busy, retry the seat once the backend's 30 s execution lease
 # could have lapsed (a previous run releasing it, or this runtime's own
 # re-authenticated session); a seat another live runtime keeps renewing
 # just stays busy.
 SEAT_BUSY_RETRY_SECONDS = 35.0
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# Names and labels come from the server (opponent names are chosen by other
+# contestants), so they're cleaned before reaching the terminal: no control
+# or escape characters, and a bounded length.
+_MAX_TEXT = 80
+
+
+def _clean(text: str | None) -> str:
+    cleaned = "".join(ch for ch in (text or "") if ch.isprintable()).strip()
+    return cleaned if len(cleaned) <= _MAX_TEXT else cleaned[: _MAX_TEXT - 3].rstrip() + "..."
+
+
+def _parse_utc(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_wait(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | None = None) -> list[str]:
+    """The lines logged when a game is picked up: the game, then (when the
+    server sent them) Testing vs tournament, the tournament and round, the
+    opponents, and the connect deadline with the time left. Never prints ids
+    or tokens.
+    """
+    game = _clean(assignment.game_type) or "unknown game"
+    context = (assignment.context or "").lower()
+    kind = {"testing": " (Testing)", "tournament": " (tournament)"}.get(context, "")
+    lines = [f"Match assigned: {game}{kind}"]
+
+    name, round_label = _clean(assignment.tournament_name), _clean(assignment.round_label)
+    if name and round_label:
+        lines.append(f"  Tournament: {name}, {round_label}")
+    elif name:
+        lines.append(f"  Tournament: {name}")
+    elif round_label:
+        lines.append(f"  Round: {round_label}")
+
+    opponents = [cleaned for cleaned in (_clean(o) for o in assignment.opponents) if cleaned]
+    if opponents:
+        lines.append(f"  Opponents: {', '.join(opponents)}")
+
+    if assignment.connect_deadline_at:
+        deadline = _parse_utc(assignment.connect_deadline_at)
+        if deadline is None:
+            lines.append(f"  Connect by: {_clean(assignment.connect_deadline_at)}")
+        else:
+            at = deadline.strftime("%Y-%m-%d %H:%M:%S UTC")
+            left = (deadline - (now or _utc_now())).total_seconds()
+            when = f"{_format_wait(left)} left" if left > 0 else "deadline passed"
+            lines.append(f"  Connect by: {at} ({when})")
+    return lines
 
 
 class TournamentState:
@@ -270,6 +343,7 @@ def run_tournament_once(
     shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
     log: Callable[[str], None] = print,
+    wall_now: Callable[[], datetime] = _utc_now,
 ) -> None:
     """One non-blocking tournament tick, keyed by ``seat_id`` throughout:
 
@@ -278,7 +352,8 @@ def run_tournament_once(
     2. List this agent's active assignments. A transient control-plane
        failure is logged and the tick skipped (the runtime keeps waiting);
        an authentication failure propagates — it would affect every seat.
-    3. Start one worker per listed seat that has none and isn't cooling down.
+    3. Start one worker per listed seat that has none and isn't cooling down,
+       logging what was picked up (``describe_assignment``).
     4. Stop workers whose seat has left the list for
        ``MISSING_POLLS_BEFORE_STOP`` consecutive listings.
     """
@@ -321,11 +396,13 @@ def run_tournament_once(
         worker_input = TournamentWorkerInput(
             seat_id=seat_id, match_id=assignment.match_id, game_type=assignment.game_type,
             agent_spec=agent_spec, execution_id=state.execution_id,
+            tournament_id=assignment.tournament_id,
         )
         process = process_factory(target=_tournament_process_entry, args=(worker_input,), daemon=True)
         process.start()
         state.registry.start(seat_id, process)
-        log(f"Match assigned: {assignment.game_type or 'unknown game'}")
+        for line in describe_assignment(assignment, now=wall_now()):
+            log(line)
         log("Starting match...")
 
     for seat_id in state.registry.keys():

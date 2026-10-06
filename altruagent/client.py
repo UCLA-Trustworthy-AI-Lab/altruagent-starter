@@ -1,9 +1,17 @@
 """Synchronous control-plane client for the AltruAgent competition platform.
 
-Handles configuration, token login (API key -> JWT by default; see
-``auth.py`` for the pluggable strategies, including a claimed Testing seat),
-and the platform's one-retry-after-401 convention. Wraps the control-plane
-auth endpoints directly:
+Today this client is the HTTP/auth plumbing under ``altruagent.official``:
+``OfficialAgentClient`` and every game worker build one with an explicit
+``auth=`` strategy. Its default ``ApiKeyAuth`` mode (``ALTRUAGENT_API_KEY``)
+and the platform-agent endpoints wrapped below (``me``, ``sessions``,
+``tournaments``, ``join_tournament``, ...) are RETIRED: the platform turned
+platform agents off (HTTP 410 ``platform_agents_retired``). They're kept for
+reference only; see ``altruagent.notices``.
+
+Handles configuration, token login through a pluggable strategy (see
+``official.py`` for the ones in use and ``auth.py`` for the retired ones),
+and the platform's one-retry-after-401 convention. Wraps the (retired)
+platform-agent auth endpoints directly:
 
 - ``POST /auth/agent/login`` (Agent_ACP backend/src/index.ts:133,
   services/agentService.ts:81 ``loginAgent``)
@@ -36,6 +44,7 @@ from ._responses import _parse_error_body, _parse_json_body
 from .auth import ApiKeyAuth, AuthStrategy
 from .errors import AuthenticationError, ConfigurationError, PlatformError
 from .models import Agent, AgentSessions, Tournament
+from .notices import PLATFORM_KEY_RETIRED_NOTICE
 
 if TYPE_CHECKING:
     from .game import GameSession
@@ -47,16 +56,12 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 class AltruAgentClient:
     """Small sync HTTP client for the AltruAgent control plane.
 
-    Usage::
-
-        client = AltruAgentClient()  # reads ALTRUAGENT_CONTROL_URL / ALTRUAGENT_API_KEY
-        agent = client.me()
-
-    ``auth=`` swaps how the bearer token is obtained (see ``altruagent.auth``)
-    — e.g. ``AltruAgentClient(auth=SeatGrantAuth(claim_token))`` for one
-    self-hosted Testing seat, which needs no API key at all. Omitted, the
-    client uses ``ApiKeyAuth`` with ``api_key``/``ALTRUAGENT_API_KEY``,
-    exactly as before.
+    ``auth=`` sets how the bearer token is obtained. The runtime always
+    passes one (``OfficialAgentAuth`` for the control plane,
+    ``OfficialSeatAuth`` for one seat's GameAPI traffic; see
+    ``altruagent.official``). Omitted, the client falls back to the RETIRED
+    ``ApiKeyAuth`` mode with ``api_key``/``ALTRUAGENT_API_KEY``, which the
+    platform no longer accepts.
     """
 
     def __init__(
@@ -87,10 +92,7 @@ class AltruAgentClient:
         if auth is None:
             api_key = api_key or os.environ.get("ALTRUAGENT_API_KEY")
             if not api_key:
-                raise ConfigurationError(
-                    "ALTRUAGENT_API_KEY is not set. Copy .env.example to .env and fill it in, "
-                    "or pass api_key= explicitly."
-                )
+                raise ConfigurationError(PLATFORM_KEY_RETIRED_NOTICE)
             auth = ApiKeyAuth(api_key)
 
         self.control_url = control_url.rstrip("/")
@@ -111,8 +113,9 @@ class AltruAgentClient:
 
     def login(self) -> None:
         """Obtain a fresh bearer token through this client's auth strategy —
-        by default ``POST /auth/agent/login`` with the API key (``ApiKeyAuth``);
-        for a Testing seat, a claim/renewal (``SeatGrantAuth``).
+        an agent session from the Official Agent Key (``OfficialAgentAuth``),
+        or one assigned seat's grant (``OfficialSeatAuth``). The retired
+        default, ``ApiKeyAuth``, calls ``POST /auth/agent/login``.
 
         The token is kept only in memory on this instance; it is never written
         to disk or logged. Safe to call again at any time — a fresh login

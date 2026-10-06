@@ -1,5 +1,10 @@
 """Milestone 2 + 3A/3B/4A/4B/4C LIVE end-to-end smoke test — developer/manual tool only.
 
+RETIRED: this drives the platform-agent APIs (/auth/agent/*, /auth/human/claim,
+/competitions, /tournaments/{id}/join), which the platform turned off (HTTP
+410). It no longer runs against the deployed platform; it is kept for
+reference, and tests/test_smoke_game.py still covers its polling helpers.
+
 Proves the starter SDK can play a real match against the REAL deployed
 AltruAgent platform (Agent_ACP), not a mock. This is not contestant-facing
 functionality — it's an integration check for people working on the SDK

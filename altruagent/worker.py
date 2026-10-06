@@ -143,9 +143,10 @@ def run_worker(
 
 
 class TournamentWorkerInput(NamedTuple):
-    """Primitive, picklable description of one official tournament seat.
-    Carries no credential: the worker reads the Official Agent Key from its
-    own inherited environment/.env, exactly like ``WorkerInput`` above.
+    """Primitive, picklable description of one assigned seat (a Testing or
+    tournament game). Carries no credential: the worker reads the Official
+    Agent Key from its own inherited environment/.env, exactly like
+    ``WorkerInput`` above.
     """
 
     seat_id: str
@@ -155,11 +156,15 @@ class TournamentWorkerInput(NamedTuple):
     # The supervisor's one execution id, shared by all of its workers (the
     # seat lease owner). Kept out of repr so it never lands in a log.
     execution_id: str
+    # The assignment's tournament, if the server named one (None for Testing);
+    # handed to the contestant as DecisionContext.tournament_id.
+    tournament_id: str | None = None
 
     def __repr__(self) -> str:
         return (
             f"TournamentWorkerInput(seat_id={self.seat_id!r}, match_id={self.match_id!r}, "
-            f"game_type={self.game_type!r}, agent_spec={self.agent_spec!r})"
+            f"game_type={self.game_type!r}, agent_spec={self.agent_spec!r}, "
+            f"tournament_id={self.tournament_id!r})"
         )
 
 
@@ -171,7 +176,7 @@ def run_tournament_worker(
     lease_renew_seconds: float | None = None,
     lease_retry_seconds: float | None = None,
 ) -> int:
-    """Play one official seat: build the contestant from ``agent_spec``
+    """Play one assigned seat: build the contestant from ``agent_spec``
     (``create_agent()`` exactly once, in this process), request the seat's
     SeatGrant, and hand the seat to the existing ``run_game`` loop. GameAPI
     only ever sees the SeatGrant token; renewing it after a 401 re-requests
@@ -236,7 +241,7 @@ def run_tournament_worker(
         )
         context = DecisionContext(
             session_id=grant.game_session_id,
-            tournament_id=None,
+            tournament_id=worker_input.tournament_id,
             game_type=grant.game_type,
             agent_id=grant.agent_id,
             seat_position=grant.seat_position,

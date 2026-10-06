@@ -209,6 +209,43 @@ def test_claim_errors_map_to_clear_seat_claim_errors(status, code, phrase):
     assert client._access_token is None
 
 
+def test_retired_claim_codes_point_to_the_official_agent_key():
+    server = ClaimServer(httpx.Response(410, json={
+        "error": "claim_codes_retired",
+        "detail": "Testing now uses your Official Agent Key: run your agent with --tournament.",
+    }))
+
+    with pytest.raises(SeatClaimError) as exc_info:
+        seat_client(server).login()
+
+    error = exc_info.value
+    assert (error.status_code, error.error_code) == (410, "claim_codes_retired")
+    assert str(error).startswith("Testing claim codes were retired; run with --tournament and your Official Agent Key")
+    assert "ALTRUAGENT_OFFICIAL_AGENT_KEY" in str(error) and CLAIM_TOKEN not in str(error)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(410, json={"error": "platform_agents_retired", "detail": "AltruAgent now runs on the UCLA site."}),
+        httpx.Response(410, text="Gone"),
+    ],
+)
+def test_retired_platform_api_key_login_points_to_the_official_agent_key(response):
+    client = AltruAgentClient(
+        control_url=CONTROL_URL, api_key="sk_agent_old_platform_key",
+        transport=httpx.MockTransport(lambda request: response), load_env_file=False,
+    )
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        client.login()
+
+    message = str(exc_info.value)
+    assert exc_info.value.status_code == 410
+    assert "API-key mode (ALTRUAGENT_API_KEY) was retired" in message
+    assert "python -m agent --tournament" in message and "sk_agent_old_platform_key" not in message
+
+
 def test_unknown_claim_error_still_raises_seat_claim_error():
     server = ClaimServer(httpx.Response(500, json={"error": "internal_error", "detail": "boom"}))
 
