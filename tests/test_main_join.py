@@ -25,10 +25,15 @@ class FakeClient:
         self._me, self._me_error, self._tournament = me, me_error, tournament
         self.closed = False
         self.tournament_ids: list[str] = []
+        self.me_calls = 0
 
     def me(self):
-        if self._me_error:
-            raise self._me_error
+        self.me_calls += 1
+        error = self._me_error
+        if isinstance(error, list):  # one answer per call; then me
+            error = error.pop(0) if error else None
+        if error:
+            raise error
         return self._me
 
     def tournament(self, tournament_id):
@@ -171,9 +176,67 @@ def test_join_refuses_an_unclaimed_agent(env, monkeypatch, capsys):
 
 def test_join_authentication_failure(env, monkeypatch, capsys):
     client, calls = _install(monkeypatch, FakeClient(me_error=AuthenticationError("Invalid API key", status_code=401)))
+    monkeypatch.setattr(agent_main, "_sleep", pytest.fail)
 
     assert agent_main.main(["--join", "game-7"]) == 1
     assert calls["join"] == [] and "Could not authenticate: Invalid API key" in capsys.readouterr().out
+
+
+def _login_unavailable():
+    return AuthenticationError("Failed to create session", status_code=401, transient=True)
+
+
+@pytest.mark.parametrize("argv", [["--join", "game-7"], ["--tournament-auto"]])
+def test_startup_waits_out_a_login_the_platform_could_not_complete(env, monkeypatch, capsys, argv):
+    """'Failed to create session' (the auth service's sign-in limit, an
+    outage) at startup: retried with a doubling delay, not an exit."""
+    client, calls = _install(monkeypatch, FakeClient(me_error=[
+        _login_unavailable(), PlatformError("Service Unavailable", status_code=503), _login_unavailable()]))
+    sleeps = []
+    monkeypatch.setattr(agent_main, "_sleep", sleeps.append)
+
+    assert agent_main.main(argv) == 0
+
+    assert sleeps == [15.0, 30.0, 60.0] and client.me_calls == 4
+    assert len(calls["join"]) + len(calls["auto"]) == 1
+    out = capsys.readouterr().out
+    assert "Could not authenticate yet (Failed to create session)" in out
+    assert "Authenticated as agent 'Alpha' (agent-a)." in out
+
+
+def test_startup_gives_up_on_a_login_outage_after_the_retry_window(env, monkeypatch, capsys):
+    client, calls = _install(monkeypatch, FakeClient(me_error=[_login_unavailable()] * 10))
+    monkeypatch.setattr(agent_main, "STARTUP_LOGIN_RETRY_SECONDS", 20.0)
+    monkeypatch.setattr(agent_main.time, "monotonic", lambda: 0.0)
+    sleeps = []
+    monkeypatch.setattr(agent_main, "_sleep", sleeps.append)
+
+    assert agent_main.main(["--join", "game-7"]) == 1
+
+    assert sleeps == [15.0] and calls["join"] == [] and client.closed
+    assert "Could not authenticate: Failed to create session" in capsys.readouterr().out
+
+
+def test_startup_does_not_wait_when_the_platform_cannot_be_reached(env, monkeypatch, capsys):
+    """No answer at all is most likely a wrong ALTRUAGENT_CONTROL_URL: say so now."""
+    client, calls = _install(monkeypatch, FakeClient(me_error=PlatformError("Could not reach", status_code=None)))
+    monkeypatch.setattr(agent_main, "_sleep", pytest.fail)
+
+    assert agent_main.main(["--join", "game-7"]) == 1
+    assert calls["join"] == [] and "Could not authenticate: Could not reach" in capsys.readouterr().out
+
+
+def test_startup_ctrl_c_while_waiting_to_log_in(env, monkeypatch, capsys):
+    client, calls = _install(monkeypatch, FakeClient(me_error=[_login_unavailable()]))
+
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_main, "_sleep", interrupted)
+
+    assert agent_main.main(["--join", "game-7"]) == 1
+    assert calls["join"] == [] and client.closed
+    assert "Stopped before anything was joined." in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

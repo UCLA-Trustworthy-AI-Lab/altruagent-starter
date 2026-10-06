@@ -62,6 +62,7 @@ from altruagent.autojoin import (
     describe_final_standing,
     is_transient,
     join_and_play,
+    next_login_backoff,
     run_autojoin_forever,
 )
 from altruagent.client import AltruAgentClient
@@ -438,9 +439,22 @@ def _check_tournament(agent_spec: str) -> int:
         official.close()
 
 
+# --join / --tournament-auto: a first login the platform couldn't complete
+# (its login service down or rate-limited, a 5xx) is retried with a doubling
+# delay for at most this long before giving up.
+STARTUP_LOGIN_RETRY_SECONDS = 600.0
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _api_key_client() -> tuple[AltruAgentClient | None, object | None]:
     """An API-key client and its claimed agent (``me()``), or ``(None, None)``
-    after printing why not.
+    after printing why not. A temporary failure on the platform's side (the
+    login service failing, a 5xx or 429) is retried with a doubling delay for
+    up to ``STARTUP_LOGIN_RETRY_SECONDS``; a rejected API key is not, and
+    neither is no answer at all (most likely a wrong ``ALTRUAGENT_CONTROL_URL``).
     """
     try:
         client = AltruAgentClient()
@@ -448,12 +462,28 @@ def _api_key_client() -> tuple[AltruAgentClient | None, object | None]:
         print(f"Configuration error: {exc}")
         print("Copy .env.example to .env and fill in ALTRUAGENT_API_KEY.")
         return None, None
-    try:
-        me = client.me()
-    except AltruAgentError as exc:
-        print(f"Could not authenticate: {exc}")
-        client.close()
-        return None, None
+    give_up_at = time.monotonic() + STARTUP_LOGIN_RETRY_SECONDS
+    delay = 0.0
+    while True:
+        try:
+            me = client.me()
+            break
+        except AltruAgentError as exc:
+            delay = next_login_backoff(delay)
+            answered = getattr(exc, "status_code", None) is not None
+            if answered and is_transient(exc) and time.monotonic() + delay <= give_up_at:
+                print(f"Could not authenticate yet ({exc}); this looks like a temporary problem on the "
+                      f"platform's side. Trying again in {delay:.0f}s...", flush=True)
+                try:
+                    _sleep(delay)
+                except KeyboardInterrupt:
+                    print("\nStopped before anything was joined.")
+                    client.close()
+                    return None, None
+                continue
+            print(f"Could not authenticate: {exc}")
+            client.close()
+            return None, None
     if not me.is_claimed:
         print(
             f"Agent '{me.name}' is not claimed yet (status={me.status}). "

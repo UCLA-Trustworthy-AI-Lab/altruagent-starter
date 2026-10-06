@@ -59,6 +59,49 @@ KNOWN_MCP_URLS = {
 # route is tried instead.
 _MCP_JOIN_FALLBACK_CODES = frozenset({None, "BACKEND_UNAVAILABLE"})
 
+# GameAPI's catch-all for a failed join (and the backend's own, over REST):
+# a real refusal, *or* a temporary failure behind it (a database blip, a
+# Lambda error, a Red Alert start that got no answer). Only the message tells
+# them apart, so these are treated as "maybe temporary" — over MCP the join
+# is made once more through the control plane's REST route, and the
+# auto-join runtimes keep retrying until the game's join deadline (after
+# which the platform answers join_deadline_passed, a final refusal).
+AMBIGUOUS_JOIN_ERROR_CODES = frozenset({"SESSION_JOIN_FAILED", "join_failed"})
+
+# The control plane's final join refusals that only arrive as one of the
+# codes above, recognizable by their message (Agent_ACP
+# backend/src/services/competitionService.ts joinCompetitionAsAgent).
+_FINAL_JOIN_FAILURE_MESSAGES = (
+    "Competition not found",
+    "Competition is not accepting participants",
+    "Competition is full",
+    "Agent not found",
+    "Agent must be claimed",
+)
+
+# What a backend token rejection looks like when it arrives *inside* a
+# join_session answer instead of as an HTTP 401 (GameAPI accepted the token,
+# the control plane then didn't): the backend's own 401 strings, passed
+# through as the tool's error code, or a standard code for them. The client's
+# usual re-login-after-401 never sees these, so join_competition logs in
+# again and makes the join through the REST route.
+MCP_AUTH_ERROR_CODES = frozenset({
+    "UNAUTHENTICATED",
+    "Invalid or expired token",
+    "Agent authentication required",
+    "Invalid token",
+    "Missing or invalid authorization header",
+})
+
+
+def is_final_join_failure(exc: BaseException) -> bool:
+    """True when an ambiguous join failure (``AMBIGUOUS_JOIN_ERROR_CODES``)
+    carries one of the control plane's known final refusal messages
+    (competition not found, not accepting participants, full, ...).
+    """
+    text = f"{getattr(exc, 'detail', None) or ''} {exc}"
+    return any(message in text for message in _FINAL_JOIN_FAILURE_MESSAGES)
+
 
 def _normalize_mcp_url(value: str) -> str:
     """``ALTRUAGENT_MCP_URL`` may be a bare GameAPI host or its full ``/mcp``
@@ -161,6 +204,20 @@ class AltruAgentClient:
             self.login()
         return self._access_token
 
+    def cached_access_token(self) -> str | None:
+        """The JWT this client currently holds, without logging in (``None``
+        before the first login). ``--tournament-auto`` hands it to each game
+        worker it starts, so a worker needn't sign in again just to begin.
+        """
+        return self._access_token
+
+    def use_access_token(self, token: str) -> None:
+        """Start from ``token`` (a JWT minted for this same agent, e.g. by a
+        parent process) instead of logging in first. Nothing changes after
+        that: a 401 still means one fresh login and one retry.
+        """
+        self._access_token = token
+
     def me(self) -> Agent:
         """``GET /auth/agent/me`` — the authenticated agent's profile."""
         data = self.request("GET", "/auth/agent/me")
@@ -237,8 +294,14 @@ class AltruAgentClient:
         the platform's ``error_code`` — for tournament games:
         ``not_in_this_match`` (this game is reserved for other agents) and
         ``join_deadline_passed`` (its join window closed; the game counts as
-        a loss). Over MCP a backend refusal without its own code arrives as
-        ``SESSION_JOIN_FAILED``; over REST as ``join_failed``.
+        a loss). Over MCP a backend failure without its own code arrives as
+        ``SESSION_JOIN_FAILED``; over REST as ``join_failed``. Those two can
+        also hide a temporary failure, so over MCP the join is made once more
+        through the REST route, unless the message is a known final refusal
+        (``is_final_join_failure``). A token the control plane rejected
+        inside a ``join_session`` answer (``MCP_AUTH_ERROR_CODES``) means one
+        fresh login, then the REST route — which re-logs in once more on a
+        401 and raises ``AuthenticationError`` only if that 401 persists.
         """
         mcp_url = self.mcp_url
         if mcp_url:
@@ -246,7 +309,17 @@ class AltruAgentClient:
                 payload = call_tool(self, mcp_url, "join_session", {"session_id": session_id})
                 return JoinResult.from_dict(payload, session_id=session_id, transport="mcp")
             except PlatformError as exc:
-                if exc.error_code not in _MCP_JOIN_FALLBACK_CODES:
+                if exc.error_code in MCP_AUTH_ERROR_CODES:
+                    # The control plane rejected the token GameAPI accepted
+                    # (it expired in between, or the auth service blipped):
+                    # a fresh token, then the join made directly.
+                    self.login()
+                elif exc.error_code in AMBIGUOUS_JOIN_ERROR_CODES:
+                    if is_final_join_failure(exc):
+                        raise  # a real refusal; the REST route would say the same
+                    # Maybe temporary (a backend blip GameAPI could only
+                    # report generically): ask the control plane directly.
+                elif exc.error_code not in _MCP_JOIN_FALLBACK_CODES:
                     raise  # the platform answered: a real refusal, the REST route would say the same
                 # No tool answer (endpoint unreachable, HTTP error), or GameAPI
                 # couldn't reach the control plane: the join itself is a
@@ -307,6 +380,9 @@ class AltruAgentClient:
             response = self._send(method, url, **kwargs)
 
         if response.status_code == 401:
+            # Rejected again with a token a login has *just* minted: the key
+            # was accepted, so this is the platform's token check failing
+            # (its auth service briefly unreachable), not a bad key.
             parsed = _parse_error_body(response)
             message = parsed["detail"] or parsed["error"] or "Not authenticated."
             raise AuthenticationError(
@@ -314,6 +390,7 @@ class AltruAgentClient:
                 status_code=401,
                 error_code=parsed["error"],
                 detail=parsed["detail"],
+                transient=True,
             )
         if response.status_code >= 400:
             parsed = _parse_error_body(response)

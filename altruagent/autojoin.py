@@ -25,8 +25,12 @@ Agent Key and never needs a join.
   uses (``altruagent.worker``), so several games can run at once.
 
 Both survive transient trouble (the control plane or GameAPI briefly
-unreachable, a 5xx): they wait and retry instead of giving up. An expired
-token is renewed by the client itself (one re-login after a 401).
+unreachable, a 5xx, the login service briefly failing): they wait and retry
+instead of giving up. An expired token is renewed by the client itself (one
+re-login after a 401). A join that fails without saying why
+(``SESSION_JOIN_FAILED``) is retried until the game's join deadline, since
+it can hide a temporary failure; a real refusal (``not_in_this_match``,
+``join_deadline_passed``) is not.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
+from .client import AMBIGUOUS_JOIN_ERROR_CODES, MCP_AUTH_ERROR_CODES, is_final_join_failure
 from .errors import AltruAgentError, AuthenticationError, PlatformError
 from .mcp_game import MCPGameSession
 from .models import AgentSessions, AgentTournamentMatch, DecisionContext, JoinResult, Match, TournamentDetail
@@ -68,6 +73,14 @@ PLAY_RESUME_WAIT_SECONDS = 5.0
 # --tournament-auto
 AUTO_POLL_SECONDS = 5.0
 AUTO_COOLDOWN_SECONDS = 10.0
+# A join that failed without saying why (SESSION_JOIN_FAILED) is tried again
+# this often while the game is still listed as join_now.
+JOIN_FAILED_RETRY_SECONDS = 10.0
+# A login the platform couldn't complete (its auth service down or
+# rate-limited) is retried after a delay that doubles each time, from the
+# first value up to the second, so retrying doesn't keep a rate limit tripped.
+LOGIN_BACKOFF_START_SECONDS = 15.0
+LOGIN_BACKOFF_MAX_SECONDS = 120.0
 STATUS_CHECK_SECONDS = 15.0
 FINISH_GRACE_SECONDS = 60.0
 # Consecutive non-transient discovery failures (e.g. the API key rejected even
@@ -87,7 +100,14 @@ def _say(message: str) -> None:
 
 # Codes that mean "not now", never "no": retried.
 _TRANSIENT_CODES = frozenset(
-    {"BACKEND_UNAVAILABLE", "game_temporarily_unavailable", "rate_limited", "RUNTIME_TEMPORARILY_UNAVAILABLE"}
+    {
+        "BACKEND_UNAVAILABLE",
+        "game_temporarily_unavailable",
+        "rate_limited",
+        "RUNTIME_TEMPORARILY_UNAVAILABLE",
+        "join_temporarily_failed",
+        "login_temporarily_unavailable",
+    }
 )
 
 # Plain-language explanations for the join refusals worth explaining.
@@ -124,10 +144,13 @@ class GameNeverStarted(AltruAgentError):
 
 def is_transient(exc: BaseException) -> bool:
     """True for a failure worth retrying: no answer at all (network failure,
-    timeout), a 5xx or 429, or a platform code that means "not right now".
+    timeout), a 5xx or 429, a platform code that means "not right now", or a
+    login the platform couldn't complete (``AuthenticationError.transient``).
     False for a real answer — a refusal, a game-level MCP error, a rejected
     API key.
     """
+    if getattr(exc, "transient", False):
+        return True
     code = getattr(exc, "error_code", None)
     if code in _TRANSIENT_CODES:
         return True
@@ -136,6 +159,33 @@ def is_transient(exc: BaseException) -> bool:
         return status >= 500 or status == 429
     # MCP game-level errors carry a code and no HTTP status: a real answer.
     return code is None
+
+
+def join_failure_is_retryable(exc: BaseException) -> bool:
+    """True when a failed join is worth trying again, until the game's join
+    deadline: a transient failure (``is_transient``), a join that failed
+    without saying why (``SESSION_JOIN_FAILED`` / ``join_failed``, unless the
+    message is a known final refusal), or a token the control plane rejected
+    inside a ``join_session`` answer. Once the window has closed, the
+    platform answers ``join_deadline_passed`` — a refusal, never retried.
+    """
+    if is_transient(exc):
+        return True
+    if isinstance(exc, AuthenticationError):
+        return False  # the API key itself was rejected
+    code = getattr(exc, "error_code", None)
+    if code in MCP_AUTH_ERROR_CODES:
+        return True
+    return code in AMBIGUOUS_JOIN_ERROR_CODES and not is_final_join_failure(exc)
+
+
+def next_login_backoff(previous: float) -> float:
+    """The wait before the next login attempt after one more failure:
+    ``LOGIN_BACKOFF_START_SECONDS``, doubling up to ``LOGIN_BACKOFF_MAX_SECONDS``.
+    """
+    if previous <= 0:
+        return LOGIN_BACKOFF_START_SECONDS
+    return min(previous * 2, LOGIN_BACKOFF_MAX_SECONDS)
 
 
 def refusal_from(exc: PlatformError) -> JoinRefused:
@@ -192,6 +242,15 @@ def _names(row: AgentTournamentMatch) -> str:
     return ", ".join(o.agent_name or o.agent_id for o in row.opponents) or "unknown"
 
 
+def _cached_token(client: "AltruAgentClient") -> str | None:
+    """The parent's current JWT for a game worker to start from (``None`` if
+    the client can't say), so each game doesn't cost a fresh login.
+    """
+    cached = getattr(client, "cached_access_token", None)
+    token = cached() if callable(cached) else None
+    return token if isinstance(token, str) and token else None
+
+
 def _find(matches: list[Match], session_id: str) -> Match | None:
     return next((m for m in matches if m.session_id == session_id), None)
 
@@ -214,8 +273,10 @@ def join_with_retry(
     log: Callable[[str], None] = _say,
 ) -> JoinResult:
     """Join ``session_id`` (``client.join_competition``, MCP first). A
-    temporary failure is retried every ``retry_seconds`` for up to
-    ``retry_window``; a refusal raises ``JoinRefused`` straight away.
+    temporary failure — or one that doesn't say why
+    (``join_failure_is_retryable``) — is retried every ``retry_seconds`` for
+    up to ``retry_window``; a refusal raises ``JoinRefused`` straight away
+    (and so does a failure that never said why, once the window is over).
     ``AuthenticationError`` (the API key rejected) propagates.
     """
     give_up_at = now() + retry_window
@@ -228,10 +289,12 @@ def join_with_retry(
                 raise
             failure: PlatformError | AuthenticationError = exc
         except PlatformError as exc:
-            if not is_transient(exc):
+            if not join_failure_is_retryable(exc):
                 raise refusal_from(exc) from exc
             if now() >= give_up_at:
-                raise
+                if is_transient(exc):
+                    raise
+                raise refusal_from(exc) from exc
             failure = exc
         if not announced:
             log(f"Could not join yet ({failure}); retrying every {retry_seconds:.0f}s...")
@@ -500,6 +563,13 @@ class AutoJoinState:
         self.failed_until: dict[str, float] = {}
         # session_id -> error_code of a refused join: never retried.
         self.refused: dict[str, str | None] = {}
+        # session_id -> when to try again a join that failed without saying
+        # why (retried while the game is still listed as join_now).
+        self.join_retry_at: dict[str, float] = {}
+        # A login the platform couldn't complete: no request is made before
+        # login_retry_at; login_backoff is the current (doubling) delay.
+        self.login_backoff = 0.0
+        self.login_retry_at = 0.0
         # Tournament games seen this run (joined, listed or played): their
         # results are reported once they're over.
         self.watched: set[str] = set()
@@ -521,6 +591,7 @@ def run_autojoin_once(
     tournament_id: str | None = None,
     now: Callable[[], float] = time.monotonic,
     cooldown_seconds: float = AUTO_COOLDOWN_SECONDS,
+    join_retry_seconds: float = JOIN_FAILED_RETRY_SECONDS,
     process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
     log: Callable[[str], None] = _say,
 ) -> AgentSessions | None:
@@ -531,10 +602,14 @@ def run_autojoin_once(
        ``cooldown_seconds`` if its game is still running).
     2. Read this agent's sessions. A transient failure is logged and the tick
        skipped; ``MAX_FATAL_FAILURES`` non-transient ones in a row (e.g. the
-       API key rejected after a fresh login) raise.
+       API key rejected) raise. A login the platform couldn't complete (its
+       auth service down or rate-limited) pauses every request for a delay
+       that doubles each time (``LOGIN_BACKOFF_*``), with no overall limit.
     3. Join every ``join_now`` tournament game (only ``tournament_id``'s, if
        given), straight away. A refused join is reported and never retried;
-       a temporary failure is retried next tick.
+       a temporary failure is retried next tick; a join that failed without
+       saying why is retried every ``JOIN_FAILED_RETRY_SECONDS`` while the
+       game is still listed as ``join_now`` (until its join deadline).
     4. Start a worker for every running tournament game without one.
     5. Report the result of every watched game that has finished.
     """
@@ -547,9 +622,22 @@ def run_autojoin_once(
             log(f"The worker for game {session_id} stopped with an error (exit code {exitcode}); "
                 f"retrying in {cooldown_seconds:.0f}s if the game is still running.")
 
+    if current < state.login_retry_at:
+        return None  # backing off after a login the platform couldn't complete
+
+    def login_failed(exc: AuthenticationError) -> None:
+        state.login_backoff = next_login_backoff(state.login_backoff)
+        state.login_retry_at = current + state.login_backoff
+        state.discovery_failing = True
+        log(f"Could not log in ({exc}); this looks like a temporary problem on the platform's side. "
+            f"Trying again in {state.login_backoff:.0f}s.")
+
     try:
         sessions = client.sessions()
     except (PlatformError, AuthenticationError) as exc:
+        if isinstance(exc, AuthenticationError) and is_transient(exc):
+            login_failed(exc)
+            return None
         if is_transient(exc):
             if not state.discovery_failing:
                 log(f"Could not check for tournament games ({exc}); will keep retrying.")
@@ -561,6 +649,7 @@ def run_autojoin_once(
             raise
         return None
     state.fatal_failures = 0
+    state.login_backoff = 0.0
     if state.discovery_failing:
         log("Connection recovered.")
         state.discovery_failing = False
@@ -576,6 +665,7 @@ def run_autojoin_once(
             return
         worker_input = WorkerInput(
             session_id=session_id, tournament_id=tid, game_type=game_type, agent_id=agent_id, agent_spec=agent_spec,
+            access_token=_cached_token(client),
         )
         process = process_factory(target=_process_entry, args=(worker_input,), daemon=True)
         process.start()
@@ -587,26 +677,46 @@ def run_autojoin_once(
             continue
         state.watched.add(row.session_id)
         if not row.needs_join or row.session_id in state.refused:
+            state.join_retry_at.pop(row.session_id, None)
+            continue
+        retry_at = state.join_retry_at.get(row.session_id)
+        if (retry_at is not None and current < retry_at) or current < state.login_retry_at:
             continue
         log(f'{row.round_label} of "{row.tournament_name}": joining game {row.session_id} '
             f"(opponent(s): {_names(row)}; {row.seconds_left}s left to join)...")
         try:
             result = client.join_competition(row.session_id)
         except (PlatformError, AuthenticationError) as exc:
+            if isinstance(exc, AuthenticationError):
+                if not is_transient(exc):
+                    raise
+                login_failed(exc)
+                continue
             if is_transient(exc):
                 log(f"Could not join game {row.session_id} yet ({exc}); trying again in a few seconds.")
                 continue
-            if isinstance(exc, AuthenticationError):
-                raise
+            if join_failure_is_retryable(exc):
+                # Not a clear refusal: maybe a temporary failure on the
+                # platform's side. Keep trying while the game is join_now —
+                # once its window closes, the answer is join_deadline_passed.
+                state.join_retry_at[row.session_id] = current + join_retry_seconds
+                log(f"Could not join game {row.session_id} yet ({exc}); trying again in "
+                    f"{join_retry_seconds:.0f}s, until its join deadline.")
+                continue
             refusal = refusal_from(exc)
             state.refused[row.session_id] = refusal.error_code
             log(f"Could not join game {row.session_id}: {refusal}")
             continue
+        state.join_retry_at.pop(row.session_id, None)
         started = "it has started" if result.status == "in_progress" else "waiting for the other agent(s)"
         log(f"Joined game {row.session_id}{' (already joined)' if result.already_joined else ''}; {started}.")
         if result.status == "in_progress":
             # This join filled the game: play it now rather than next tick.
             start(row.session_id, row.tournament_id, row.game_type)
+
+    listed = {row.session_id for row in sessions.tournament_matches}
+    for session_id in [sid for sid in state.join_retry_at if sid not in listed]:
+        del state.join_retry_at[session_id]  # its game is over or no longer this agent's to join
 
     for match in sessions.active:
         if mine(match.tournament_id):

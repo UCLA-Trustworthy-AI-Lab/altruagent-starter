@@ -7,11 +7,14 @@ actually works for a top-level target function (bottom of file).
 from __future__ import annotations
 
 import multiprocessing
+import pickle
 import types
 
+import httpx
 import pytest
 
-from altruagent.errors import PlatformError
+from altruagent.client import AltruAgentClient
+from altruagent.errors import AuthenticationError, PlatformError
 from altruagent.models import GameState
 from altruagent.runner import RESIGN, TERMINATE_MESSAGING, DecisionError, UnsupportedGameFlowError
 from altruagent.worker import (
@@ -139,6 +142,138 @@ def test_run_worker_bad_agent_spec_is_unexpected():
 
 def test_worker_input_agent_spec_defaults_to_none():
     assert WORKER_INPUT.agent_spec is None
+    assert WORKER_INPUT.access_token is None
+
+
+def test_worker_input_keeps_its_token_out_of_repr_but_pickles_it():
+    worker_input = WORKER_INPUT._replace(access_token="jwt-secret")
+
+    assert "jwt-secret" not in repr(worker_input) and "access_token=<redacted>" in repr(worker_input)
+    assert "access_token" not in repr(WORKER_INPUT)
+    assert pickle.loads(pickle.dumps(worker_input)).access_token == "jwt-secret"
+
+
+class TokenClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seeded: list[str] = []
+
+    def use_access_token(self, token: str) -> None:
+        self.seeded.append(token)
+
+
+def test_run_worker_starts_from_the_parents_token():
+    client = TokenClient()
+
+    exit_code = run_worker(
+        WORKER_INPUT._replace(access_token="jwt-parent"),
+        client_factory=lambda: client,
+        match_factory=lambda data, *, client: "fake-match",
+        agent_module=make_agent_module(create_agent=lambda: (lambda s, c: 0)),
+        run_match_fn=lambda match, agent_id, decision_fn: terminal_state(),
+    )
+
+    assert exit_code == EXIT_SUCCESS and client.seeded == ["jwt-parent"]
+
+
+def test_run_worker_with_the_parents_token_signs_in_only_once_it_is_rejected():
+    """The real client: a valid parent token means no login at all; an
+    expired one means exactly one."""
+    for token, expected_logins in (("jwt-parent", 0), ("jwt-expired", 1)):
+        logins = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/auth/agent/login":
+                logins.append(1)
+                return httpx.Response(200, json={"access_token": "jwt-fresh"})
+            if request.headers["Authorization"] == "Bearer jwt-expired":
+                return httpx.Response(401, json={"error": "Invalid or expired token"})
+            return httpx.Response(200, json={"id": "competition", "status": "in_progress"})
+
+        def run_match_fn(match, agent_id, decision_fn):
+            match.request("GET", "/competitions/s-1")  # what resolving the game server does first
+            return terminal_state()
+
+        exit_code = run_worker(
+            WORKER_INPUT._replace(access_token=token),
+            client_factory=lambda: AltruAgentClient(control_url="https://control.example.test", api_key="sk_agent_x",
+                                                    load_env_file=False, transport=httpx.MockTransport(handler)),
+            match_factory=lambda data, *, client: client,
+            agent_module=make_agent_module(create_agent=lambda: (lambda s, c: 0)),
+            run_match_fn=run_match_fn,
+        )
+
+        assert exit_code == EXIT_SUCCESS and len(logins) == expected_logins
+
+
+def test_run_worker_waits_out_a_login_the_platform_could_not_complete():
+    """'Failed to create session' mid-game (the token's hourly renewal
+    failing): the worker waits and resumes the game with the SAME contestant,
+    instead of exiting to be respawned (a new login every 10 s)."""
+    client = FakeClient()
+    contestants, played_with, sleeps = [], [], []
+
+    def create_agent():
+        contestant = lambda s, c: 0  # noqa: E731
+        contestants.append(contestant)
+        return contestant
+
+    def run_match_fn(match, agent_id, decision_fn):
+        played_with.append(decision_fn)
+        if len(played_with) < 3:
+            raise AuthenticationError("Failed to create session", status_code=401, transient=True)
+        return terminal_state()
+
+    exit_code = run_worker(
+        WORKER_INPUT,
+        client_factory=lambda: client,
+        match_factory=lambda data, *, client: "fake-match",
+        agent_module=make_agent_module(create_agent=create_agent),
+        run_match_fn=run_match_fn,
+        sleep=sleeps.append,
+        now=lambda: sum(sleeps),
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(contestants) == 1 and played_with == [contestants[0]] * 3
+    assert sleeps == [15.0, 30.0]
+    assert client.closed is True
+
+
+def test_run_worker_gives_up_on_a_login_outage_after_the_retry_window():
+    sleeps = []
+
+    def run_match_fn(match, agent_id, decision_fn):
+        raise AuthenticationError("Failed to create session", status_code=401, transient=True)
+
+    exit_code = run_worker(
+        WORKER_INPUT,
+        client_factory=FakeClient,
+        match_factory=lambda data, *, client: "fake-match",
+        agent_module=make_agent_module(create_agent=lambda: (lambda s, c: 0)),
+        run_match_fn=run_match_fn,
+        sleep=sleeps.append,
+        now=lambda: sum(sleeps),
+    )
+
+    assert exit_code == EXIT_UNEXPECTED
+    assert sleeps == [15.0, 30.0, 60.0, 120.0, 120.0, 120.0, 120.0] and sum(sleeps) <= 600
+
+
+def test_run_worker_does_not_retry_a_rejected_api_key():
+    def run_match_fn(match, agent_id, decision_fn):
+        raise AuthenticationError("Invalid API key", status_code=401)
+
+    exit_code = run_worker(
+        WORKER_INPUT,
+        client_factory=FakeClient,
+        match_factory=lambda data, *, client: "fake-match",
+        agent_module=make_agent_module(create_agent=lambda: (lambda s, c: 0)),
+        run_match_fn=run_match_fn,
+        sleep=pytest.fail,
+    )
+
+    assert exit_code == EXIT_UNEXPECTED
 
 
 def test_run_worker_missing_create_agent_fails_clearly_without_touching_client():

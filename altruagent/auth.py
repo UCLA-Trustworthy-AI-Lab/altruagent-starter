@@ -43,6 +43,25 @@ class AuthStrategy(Protocol):
         ...
 
 
+# The only answers to POST /auth/agent/login that mean the key itself is
+# wrong (Agent_ACP backend/src/services/agentService.ts loginAgent). The
+# control plane answers *every* login failure with 401 {"error": message},
+# so anything else under a 401 — "Failed to create session" (the auth
+# service's anonymous sign-in failing or rate-limited), a database error — is
+# the platform's trouble, not the key's.
+_BAD_API_KEY_ERRORS = frozenset({"Invalid API key", "Invalid API key format", "API key is required"})
+
+
+def _login_failure_is_transient(status_code: int, error: str | None) -> bool:
+    """True for a failed login worth retrying later: a 5xx or 429 (newer
+    control planes answer a temporary failure that way), or a 401 that
+    doesn't say the key is wrong.
+    """
+    if status_code >= 500 or status_code == 429:
+        return True
+    return status_code == 401 and error not in _BAD_API_KEY_ERRORS
+
+
 class ApiKeyAuth:
     """A registered agent's API key -> ``POST /auth/agent/login`` -> JWT.
 
@@ -73,6 +92,7 @@ class ApiKeyAuth:
                 status_code=response.status_code,
                 error_code=parsed["error"],
                 detail=parsed["detail"],
+                transient=_login_failure_is_transient(response.status_code, parsed["error"]),
             )
 
         body = _parse_json_body(response)

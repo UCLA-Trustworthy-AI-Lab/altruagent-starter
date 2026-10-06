@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import types
 
+import httpx
 import pytest
 
 from altruagent import autojoin
@@ -22,12 +23,14 @@ from altruagent.autojoin import (
     describe_outcome,
     is_transient,
     join_and_play,
+    join_failure_is_retryable,
     join_with_retry,
     play_to_end,
     run_autojoin_forever,
     run_autojoin_once,
     wait_for_start,
 )
+from altruagent.client import AltruAgentClient
 from altruagent.errors import AuthenticationError, PlatformError
 from altruagent.mcp_transport import MCPToolError
 from altruagent.models import AgentSessions, AgentTournamentMatch, JoinResult, Match, TournamentDetail
@@ -134,10 +137,40 @@ def network_down():
         (MCPToolError("gone", status_code=None, error_code="SESSION_NOT_FOUND"), False),
         (AuthenticationError("bad key", status_code=401), False),
         (AuthenticationError("login 502", status_code=502), True),
+        (AuthenticationError("Failed to create session", status_code=401, transient=True), True),
+        (MCPToolError("busy", status_code=None, error_code="join_temporarily_failed"), True),
+        (MCPToolError("refused?", status_code=None, error_code="SESSION_JOIN_FAILED"), False),
     ],
 )
 def test_is_transient(exc, transient):
     assert is_transient(exc) is transient
+
+
+def session_join_failed(detail="Backend request failed."):
+    return MCPToolError(detail, status_code=None, error_code="SESSION_JOIN_FAILED")
+
+
+@pytest.mark.parametrize(
+    "exc, retryable",
+    [
+        (network_down(), True),
+        (session_join_failed(), True),
+        (PlatformError("TypeError: fetch failed", status_code=400, error_code="join_failed",
+                       detail="TypeError: fetch failed"), True),
+        (MCPToolError("Invalid or expired token", status_code=None, error_code="Invalid or expired token"), True),
+        (MCPToolError("token", status_code=None, error_code="UNAUTHENTICATED"), True),
+        (session_join_failed("Competition is full"), False),
+        (session_join_failed("Competition not found"), False),
+        (PlatformError("Competition is not accepting participants", status_code=400, error_code="join_failed",
+                       detail="Competition is not accepting participants"), False),
+        (MCPToolError("refused", status_code=None, error_code="not_in_this_match"), False),
+        (MCPToolError("refused", status_code=None, error_code="join_deadline_passed"), False),
+        (MCPToolError("refused", status_code=None, error_code="match_start_failed"), False),
+        (AuthenticationError("Invalid API key", status_code=401), False),
+    ],
+)
+def test_join_failure_is_retryable(exc, retryable):
+    assert join_failure_is_retryable(exc) is retryable
 
 
 @pytest.mark.parametrize(
@@ -221,6 +254,49 @@ def test_join_with_retry_unknown_refusal_keeps_the_platform_message():
 
     with pytest.raises(JoinRefused, match="Competition is full"):
         join_with_retry(client, "game-1", sleep=pytest.fail, log=lambda m: None)
+
+
+def test_join_with_retry_retries_a_join_that_failed_without_saying_why():
+    """SESSION_JOIN_FAILED can hide a temporary failure (a database blip
+    behind the control plane): retried, not reported as a refusal."""
+    clock, logs = Clock(), []
+    client = FakeClient(join_answers=[session_join_failed(), session_join_failed(), {"status": "waiting"}])
+
+    result = join_with_retry(client, "game-1", sleep=clock.sleep, now=clock.now, log=logs.append)
+
+    assert result.status == "waiting" and client.joins == ["game-1"] * 3
+    assert len(logs) == 1 and logs[0].startswith("Could not join yet")
+
+
+def test_join_with_retry_reports_an_unexplained_failure_once_the_window_is_over():
+    clock = Clock()
+    client = FakeClient(join_answers=[session_join_failed("Backend request failed.")])
+
+    with pytest.raises(JoinRefused, match="Backend request failed."):
+        join_with_retry(client, "game-1", retry_window=12, sleep=clock.sleep, now=clock.now, log=lambda m: None)
+
+    assert clock.sleeps == [5.0, 5.0, 5.0]
+
+
+def test_join_with_retry_retries_a_token_the_control_plane_rejected_inside_the_join():
+    clock = Clock()
+    client = FakeClient(join_answers=[
+        MCPToolError("Invalid or expired token", status_code=None, error_code="Invalid or expired token"),
+        {"status": "waiting"},
+    ])
+
+    assert join_with_retry(client, "game-1", sleep=clock.sleep, now=clock.now, log=lambda m: None).status == "waiting"
+    assert client.joins == ["game-1", "game-1"]
+
+
+def test_join_with_retry_rides_out_a_login_the_platform_could_not_complete():
+    clock = Clock()
+    client = FakeClient(join_answers=[
+        AuthenticationError("Failed to create session", status_code=401, transient=True),
+        {"status": "waiting"},
+    ])
+
+    assert join_with_retry(client, "game-1", sleep=clock.sleep, now=clock.now, log=lambda m: None).status == "waiting"
 
 
 def test_join_with_retry_rejected_api_key_propagates():
@@ -519,6 +595,83 @@ def test_auto_refused_join_is_reported_once_and_never_retried():
     assert logs[-1].startswith("Could not join game game-1: the join window for this game has closed")
 
 
+def test_auto_join_that_failed_without_saying_why_is_retried_until_the_deadline():
+    """A Supabase blip or a Lambda 500 behind the join arrives as
+    SESSION_JOIN_FAILED: never stored as refused; tried again every 10 s
+    while the game is still listed as join_now."""
+    clock = Clock()
+    client = FakeClient([sessions(rows=[row("game-1")])],
+                        join_answers=[session_join_failed(), session_join_failed(), {"status": "waiting"}])
+    state, _, logs, _ = tick(client, now=clock.now)
+
+    assert state.refused == {} and client.joins == ["game-1"]
+    assert logs[-1] == ("Could not join game game-1 yet (Backend request failed.); trying again in 10s, "
+                        "until its join deadline.")
+
+    clock.value += 5
+    tick(client, state, now=clock.now)
+    assert client.joins == ["game-1"]  # still cooling down
+
+    clock.value += 5
+    tick(client, state, now=clock.now)
+    assert client.joins == ["game-1"] * 2 and state.refused == {}
+
+    clock.value += 10
+    _, _, logs, _ = tick(client, state, now=clock.now)
+    assert client.joins == ["game-1"] * 3
+    assert logs[-1] == "Joined game game-1; waiting for the other agent(s)."
+    assert state.join_retry_at == {}
+
+
+def test_auto_unexplained_join_failure_stops_once_the_game_is_no_longer_join_now():
+    clock = Clock()
+    client = FakeClient([sessions(rows=[row("game-1")]), sessions()], join_answers=[session_join_failed()])
+    state, _, _, _ = tick(client, now=clock.now)
+
+    clock.value += 60
+    tick(client, state, now=clock.now)
+    tick(client, state, now=clock.now)
+
+    assert client.joins == ["game-1"]
+    assert state.join_retry_at == {}
+
+
+def test_auto_unexplained_join_failure_turns_into_a_refusal_once_the_window_closes():
+    clock = Clock()
+    client = FakeClient([sessions(rows=[row("game-1")])], join_answers=[
+        session_join_failed(), MCPToolError("Too late.", status_code=None, error_code="join_deadline_passed")])
+    state, _, _, _ = tick(client, now=clock.now)
+    clock.value += 10
+    tick(client, state, now=clock.now)
+    clock.value += 10
+    tick(client, state, now=clock.now)
+
+    assert client.joins == ["game-1", "game-1"]
+    assert state.refused == {"game-1": "join_deadline_passed"}
+
+
+def test_auto_known_final_join_failure_is_still_a_refusal():
+    client = FakeClient([sessions(rows=[row("game-1")])], join_answers=[session_join_failed("Competition is full")])
+    state, _, logs, _ = tick(client)
+    tick(client, state, now=lambda: 100.0)
+
+    assert client.joins == ["game-1"]
+    assert state.refused == {"game-1": "SESSION_JOIN_FAILED"}
+    assert logs[-1] == "Could not join game game-1: Competition is full"
+
+
+def test_auto_token_rejected_inside_the_join_is_retried_not_refused():
+    clock = Clock()
+    client = FakeClient([sessions(rows=[row("game-1")])], join_answers=[
+        MCPToolError("Invalid or expired token", status_code=None, error_code="Invalid or expired token"),
+        {"status": "waiting"}])
+    state, _, _, _ = tick(client, now=clock.now)
+    clock.value += 10
+    tick(client, state, now=clock.now)
+
+    assert state.refused == {} and client.joins == ["game-1", "game-1"]
+
+
 def test_auto_transient_join_failure_is_retried_next_tick():
     client = FakeClient([sessions(rows=[row("game-1")])], join_answers=[network_down(), {"status": "in_progress"}])
     state, _, logs, _ = tick(client)
@@ -614,6 +767,102 @@ def test_auto_rejected_key_gives_up_after_repeated_failures():
 
     with pytest.raises(AuthenticationError):
         tick(client, state)
+
+
+def login_unavailable():
+    return AuthenticationError("Failed to create session", status_code=401, error_code="Failed to create session",
+                               transient=True)
+
+
+def test_auto_login_the_platform_could_not_complete_backs_off_and_never_gives_up():
+    """'Failed to create session' (the auth service's sign-in limit, or an
+    outage) is not a bad key: the loop waits, doubling the delay up to 2
+    minutes, and makes no request at all in between."""
+    clock = Clock()
+    client = FakeClient([login_unavailable()] * 7 + [sessions(rows=[row("game-1")])])
+    state, logs = AutoJoinState(), []
+    attempts_at = []
+    for _ in range(200):
+        before = client.sessions_calls
+        run_autojoin_once(client, state, agent_id=AGENT_ID, now=clock.now, process_factory=FakeProcessFactory(),
+                          log=logs.append)
+        if client.sessions_calls != before:
+            attempts_at.append(clock.value)
+        if client.joins:
+            break
+        clock.sleep(5.0)
+
+    assert [b - a for a, b in zip(attempts_at, attempts_at[1:])] == [15, 30, 60, 120, 120, 120, 120]
+    assert client.joins == ["game-1"]
+    assert sum("Could not log in (Failed to create session)" in line for line in logs) == 7
+    assert "Connection recovered." in logs
+    assert state.login_backoff == 0.0
+
+
+def test_auto_login_failure_while_joining_backs_off_and_skips_the_other_joins():
+    clock = Clock()
+    client = FakeClient([sessions(rows=[row("game-1"), row("game-2")])],
+                        join_answers=[login_unavailable(), {"status": "waiting"}])
+    state, _, logs, _ = tick(client, now=clock.now)
+
+    assert client.joins == ["game-1"] and state.refused == {}
+    assert "Trying again in 15s." in logs[-1]
+
+    clock.value += 10
+    tick(client, state, now=clock.now)
+    assert client.sessions_calls == 1  # still backing off
+
+    clock.value += 5
+    tick(client, state, now=clock.now)
+    assert client.joins == ["game-1", "game-1", "game-2"]
+
+
+def test_auto_hands_its_token_to_each_game_worker_without_showing_it():
+    client = FakeClient([sessions(active=[comp("game-1")])])
+    client.cached_access_token = lambda: "jwt-parent"
+
+    _, factory, _, _ = tick(client)
+
+    worker_input = factory.processes[0].args[0]
+    assert worker_input.access_token == "jwt-parent"
+    assert "jwt-parent" not in repr(worker_input)
+
+
+def test_auto_with_the_real_client_survives_a_login_outage():
+    """The real AltruAgentClient: the token expires, and every re-login
+    answers 401 'Failed to create session' for a while. The loop keeps
+    going (it used to stop for good after 3 ticks, ~15 s) and logs in at
+    most once per backoff step, then carries on once logins work again."""
+    calls = {"logins": 0, "sessions": 0}
+    clock = Clock()
+    outage = (10.0, 400.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/agent/login":
+            calls["logins"] += 1
+            if outage[0] <= clock.value < outage[1]:
+                return httpx.Response(401, json={"error": "Failed to create session"})
+            return httpx.Response(200, json={"access_token": f"jwt-{calls['logins']}"})
+        if request.url.path == "/agents/me/sessions":
+            calls["sessions"] += 1
+            if request.headers["Authorization"] == "Bearer jwt-1" and clock.value >= outage[0]:
+                return httpx.Response(401, json={"error": "Invalid or expired token"})
+            return httpx.Response(200, json={"joined_sessions": [], "active_sessions": [], "completed_sessions": [],
+                                             "tournament_matches": []})
+        raise AssertionError(f"unexpected request {request.url.path}")
+
+    client = AltruAgentClient(control_url="https://control.example.test", api_key="sk_agent_test",
+                              load_env_file=False, transport=httpx.MockTransport(handler))
+    logs = []
+
+    assert run_autojoin_forever(client, agent_id=AGENT_ID, sleep=clock.sleep, now=clock.now,
+                                process_factory=FakeProcessFactory(), log=logs.append, max_iterations=120) is None
+
+    # 15 + 30 + 60 + 120 + 120 s of backoff cover the 390 s outage: 6 failed
+    # logins at most, instead of one every 5 s.
+    assert 2 <= calls["logins"] <= 8
+    assert "Connection recovered." in logs
+    assert client.cached_access_token() not in (None, "jwt-1")
 
 
 # -- --tournament-auto: run_autojoin_forever --------------------------------------------------------

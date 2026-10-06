@@ -116,11 +116,68 @@ def test_retry_stops_after_second_401():
 
     client = make_client(handler)
 
-    with pytest.raises(AuthenticationError):
+    with pytest.raises(AuthenticationError) as exc_info:
         client.me()
 
     assert login_count == 2  # initial login + exactly one re-login, no loop
     assert me_attempts == 2  # exactly one retry
+    # The key was just accepted, so a token rejected right after a fresh
+    # login is the platform's token check failing: worth retrying later.
+    assert exc_info.value.transient is True
+
+
+@pytest.mark.parametrize(
+    "status, body, transient",
+    [
+        (401, {"error": "Invalid API key"}, False),
+        (401, {"error": "Invalid API key format"}, False),
+        (400, {"error": "API key is required"}, False),
+        # The auth service's anonymous sign-in failing or rate-limited: the
+        # control plane still answers 401, but not about the key.
+        (401, {"error": "Failed to create session"}, True),
+        (401, {"error": "TypeError: fetch failed"}, True),
+        (503, {"error": "login_temporarily_unavailable", "retry_after_seconds": 30}, True),
+        (429, {"error": "rate_limited"}, True),
+        (502, {"message": "Internal Server Error"}, True),
+        (403, {"error": "forbidden"}, False),
+    ],
+)
+def test_login_failure_says_whether_it_is_worth_retrying(status, body, transient):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/auth/agent/login"
+        return httpx.Response(status, json=body)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        make_client(handler).login()
+
+    assert exc_info.value.status_code == status
+    assert exc_info.value.transient is transient
+
+
+def test_a_seeded_token_is_used_without_logging_in_and_renewed_once_rejected():
+    logins, headers = [], []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/agent/login":
+            logins.append(1)
+            return httpx.Response(200, json={"access_token": "jwt-fresh"})
+        headers.append(request.headers["Authorization"])
+        if request.headers["Authorization"] == "Bearer jwt-expired":
+            return httpx.Response(401, json={"error": "Invalid or expired token"})
+        return httpx.Response(200, json={"id": "agent-1", "name": "A", "status": "claimed"})
+
+    client = make_client(handler)
+    assert client.cached_access_token() is None
+
+    client.use_access_token("jwt-parent")
+    client.me()
+    assert logins == [] and headers == ["Bearer jwt-parent"]
+    assert client.cached_access_token() == "jwt-parent"
+
+    client.use_access_token("jwt-expired")
+    client.me()
+    assert logins == [1] and headers[-2:] == ["Bearer jwt-expired", "Bearer jwt-fresh"]
+    assert client.cached_access_token() == "jwt-fresh"
 
 
 def test_missing_configuration_raises_configuration_error(monkeypatch):

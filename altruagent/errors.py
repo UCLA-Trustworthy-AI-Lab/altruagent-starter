@@ -29,6 +29,12 @@ class AuthenticationError(AltruAgentError):
 
     The platform has no refresh-token grant, so this is also what you get if
     an API key is revoked or simply wrong.
+
+    ``transient`` is True when the failure says nothing about the key itself
+    and is worth retrying later: the login service was briefly unavailable or
+    rate-limited (it answers ``401 {"error": "Failed to create session"}``
+    then, not ``Invalid API key``), or a token minted moments ago by a
+    successful login was still rejected.
     """
 
     def __init__(
@@ -38,11 +44,13 @@ class AuthenticationError(AltruAgentError):
         status_code: int | None = None,
         error_code: str | None = None,
         detail: str | None = None,
+        transient: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
         self.detail = detail
+        self.transient = transient
 
 
 class PlatformError(AltruAgentError):

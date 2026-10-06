@@ -18,16 +18,19 @@ picklable (``httpx.Client`` holds a real ``_thread.RLock``), so nothing here
 ever tries to pass one. Each worker builds its own ``AltruAgentClient()``
 from its own inherited environment/`.env` (the same config-loading path
 every other entry point already uses) rather than receiving the API key
-through ``WorkerInput`` at all.
+through ``WorkerInput`` at all. ``--tournament-auto`` does pass its current
+short-lived JWT (``WorkerInput.access_token``), so a game needn't cost a
+fresh login; the worker still logs in with its own key once that's rejected.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from .client import AltruAgentClient
-from .errors import PlatformError
+from .errors import AuthenticationError, PlatformError
 from .mcp_game import MCPGameSession
 from .models import Match
 from .runner import DecisionError, UnsupportedGameFlowError
@@ -51,6 +54,15 @@ EXIT_SEAT_BUSY = 3
 
 _MATCH_SCOPED_ERRORS = (DecisionError, UnsupportedGameFlowError, PlatformError)
 
+# A login the platform couldn't complete (``AuthenticationError.transient``:
+# its auth service down or rate-limited) is retried inside the worker — same
+# contestant, the game picked up where it was — after a delay that doubles
+# from the first value up to the second, for at most the third in total.
+# Exiting instead would mean a respawn every few seconds, each one a new login.
+LOGIN_RETRY_START_SECONDS = 15.0
+LOGIN_RETRY_MAX_SECONDS = 120.0
+LOGIN_RETRY_WINDOW_SECONDS = 600.0
+
 
 class WorkerInput(NamedTuple):
     """Primitive, picklable description of one match for a worker process to
@@ -67,6 +79,18 @@ class WorkerInput(NamedTuple):
     # ``MODULE[:FACTORY]`` to build the contestant from (``--agent``); None
     # keeps the default, ``agent.agent.create_agent``.
     agent_spec: str | None = None
+    # The parent's current JWT for this same agent (``--tournament-auto``),
+    # so the worker starts with it instead of a fresh login and logs in only
+    # once it's rejected. Travels pickled over the spawn pipe — never argv or
+    # the environment — and is kept out of repr so it never lands in a log.
+    access_token: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"WorkerInput(session_id={self.session_id!r}, tournament_id={self.tournament_id!r}, "
+            f"game_type={self.game_type!r}, agent_id={self.agent_id!r}, agent_spec={self.agent_spec!r}"
+            f"{', access_token=<redacted>' if self.access_token else ''})"
+        )
 
 
 def run_worker(
@@ -76,11 +100,19 @@ def run_worker(
     match_factory: Callable[..., Match] = Match.from_dict,
     agent_module: object | None = None,
     run_match_fn: Callable[..., "GameState"] = _default_run_match,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
 ) -> int:
     """Play exactly one match: build a client, reconstruct its ``Match``,
     call ``agent.agent.create_agent()`` (or ``worker_input.agent_spec``'s
     factory) exactly once, and hand the result to the existing, unmodified
     ``run_match``.
+
+    With ``worker_input.access_token``, the client starts from that token
+    rather than a fresh login. A login the platform couldn't complete
+    (``AuthenticationError.transient``) — before the game or mid-game — is
+    waited out and the game resumed with the same contestant, for up to
+    ``LOGIN_RETRY_WINDOW_SECONDS``; a rejected API key is not retried.
 
     Returns an exit code (``EXIT_*`` above) rather than raising — this is
     what ``_process_entry`` turns into a real process exit code, and it's
@@ -114,6 +146,8 @@ def run_worker(
                 return EXIT_UNEXPECTED
 
         client = client_factory()
+        if worker_input.access_token:
+            client.use_access_token(worker_input.access_token)
         match = match_factory(
             {
                 "session_id": worker_input.session_id,
@@ -125,7 +159,24 @@ def run_worker(
         )
 
         contestant = create_agent()
-        final_state = run_match_fn(match, worker_input.agent_id, contestant)
+        give_up_at = now() + LOGIN_RETRY_WINDOW_SECONDS
+        delay = 0.0
+        while True:
+            try:
+                final_state = run_match_fn(match, worker_input.agent_id, contestant)
+                break
+            except AuthenticationError as exc:
+                if not exc.transient:
+                    raise
+                delay = LOGIN_RETRY_START_SECONDS if delay <= 0 else min(delay * 2, LOGIN_RETRY_MAX_SECONDS)
+                if now() + delay > give_up_at:
+                    raise
+                print(
+                    f"[worker pid={pid}] could not log in ({exc}); this looks like a temporary problem "
+                    f"on the platform's side. Trying again in {delay:.0f}s.",
+                    flush=True,
+                )
+                sleep(delay)
         print(
             f"[worker pid={pid}] match finished session_id={worker_input.session_id} "
             f"termination_reason={final_state.termination_reason}"

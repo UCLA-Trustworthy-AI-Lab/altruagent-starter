@@ -207,15 +207,140 @@ def test_join_competition_already_joined_is_success(monkeypatch):
     assert result.already_joined is True and result.status == "in_progress"
 
 
-@pytest.mark.parametrize("code", ["not_in_this_match", "join_deadline_passed", "SESSION_JOIN_FAILED"])
-def test_join_competition_refusals_are_raised_without_a_rest_retry(monkeypatch, code):
+@pytest.mark.parametrize("code, message", [
+    ("not_in_this_match", "refused"),
+    ("join_deadline_passed", "refused"),
+    # GameAPI's catch-all, but with one of the backend's final refusal messages.
+    ("SESSION_JOIN_FAILED", "Competition is full"),
+    ("SESSION_JOIN_FAILED", "Competition not found"),
+    ("SESSION_JOIN_FAILED", "Competition is not accepting participants"),
+])
+def test_join_competition_refusals_are_raised_without_a_rest_retry(monkeypatch, code, message):
     monkeypatch.setattr(client_module, "call_tool", RecordingCallTool(
-        MCPToolError("refused", status_code=None, error_code=code)))
+        MCPToolError(message, status_code=None, error_code=code)))
 
     with pytest.raises(MCPToolError) as exc_info:
         make_client(_no_rest, mcp_url=MCP_URL).join_competition("game-7")
 
     assert exc_info.value.error_code == code
+
+
+def _rest_join_handler(rest, logins=None, *, answer=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/agent/login":
+            if logins is not None:
+                logins.append(1)
+                return httpx.Response(200, json={"access_token": f"jwt-{len(logins)}"})
+            return login_ok(request)
+        rest.append((request.method, request.url.path, request.headers["Authorization"]))
+        if answer is not None:
+            return answer
+        return httpx.Response(200, json={"success": True, "session_id": "game-7", "status": "waiting"})
+
+    return handler
+
+
+@pytest.mark.parametrize("detail", ["Backend request failed.", "TypeError: fetch failed", "Internal Server Error"])
+def test_join_competition_unexplained_session_join_failed_tries_rest_once(monkeypatch, detail):
+    """SESSION_JOIN_FAILED is also what GameAPI answers when the control plane
+    failed temporarily (a Supabase blip, a Lambda 500): the join is made once
+    more through the control plane directly."""
+    monkeypatch.setattr(client_module, "call_tool", RecordingCallTool(
+        MCPToolError(detail, status_code=None, error_code="SESSION_JOIN_FAILED")))
+    rest = []
+
+    result = make_client(_rest_join_handler(rest), mcp_url=MCP_URL).join_competition("game-7")
+
+    assert [(m, p) for m, p, _ in rest] == [("POST", "/competitions/game-7/join")]
+    assert result.transport == "rest" and result.status == "waiting"
+
+
+def test_join_competition_unexplained_failure_on_both_routes_keeps_the_rest_code(monkeypatch):
+    monkeypatch.setattr(client_module, "call_tool", RecordingCallTool(
+        MCPToolError("Backend request failed.", status_code=None, error_code="SESSION_JOIN_FAILED")))
+    rest = []
+    answer = httpx.Response(400, json={"error": "join_failed", "detail": "TypeError: fetch failed"})
+
+    with pytest.raises(PlatformError) as exc_info:
+        make_client(_rest_join_handler(rest, answer=answer), mcp_url=MCP_URL).join_competition("game-7")
+
+    assert len(rest) == 1
+    assert (exc_info.value.status_code, exc_info.value.error_code) == (400, "join_failed")
+
+
+@pytest.mark.parametrize("code", ["Invalid or expired token", "Agent authentication required", "UNAUTHENTICATED"])
+def test_join_competition_backend_token_rejection_over_mcp_relogs_in_and_joins_over_rest(monkeypatch, code):
+    """GameAPI accepted the token but the control plane then didn't (it
+    expired in between, or the auth service blipped): that arrives inside the
+    tool answer, not as an HTTP 401, so the client logs in again itself."""
+    monkeypatch.setattr(client_module, "call_tool", RecordingCallTool(
+        MCPToolError(code, status_code=None, error_code=code)))
+    rest, logins = [], []
+    client = make_client(_rest_join_handler(rest, logins), mcp_url=MCP_URL)
+    client.login()
+
+    result = client.join_competition("game-7")
+
+    assert len(logins) == 2  # the first token, then one fresh login
+    assert rest == [("POST", "/competitions/game-7/join", "Bearer jwt-2")]
+    assert result.transport == "rest" and result.status == "waiting"
+
+
+def test_join_competition_backend_token_rejection_through_the_real_mcp_sdk(monkeypatch):
+    """The real MCP client: the first join_session answers with the
+    backend's 401 string as its error code; the join still succeeds after one
+    re-login."""
+    tool_calls = []
+
+    async def mcp_server(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        method, req_id = body.get("method"), body.get("id")
+        if method == "initialize":
+            return httpx.Response(200, json=_initialize_response(req_id))
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "tools/list":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": req_id, "result": {"tools": [
+                {"name": "join_session", "inputSchema": {"type": "object"}, "outputSchema": None}]}})
+        if method == "tools/call":
+            tool_calls.append(body["params"])
+            return httpx.Response(200, json=_tool_call_response(req_id, {
+                "error": "Invalid or expired token", "detail": "Invalid or expired token"}))
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        client_module, "call_tool",
+        lambda client, url, name, args: real_call_tool(client, url, name, args, httpx_client_factory=make_factory(mcp_server)),
+    )
+    rest, logins = [], []
+
+    result = make_client(_rest_join_handler(rest, logins), mcp_url=MCP_URL).join_competition("game-7")
+
+    assert len(tool_calls) == 1 and len(logins) == 2
+    assert [(m, p) for m, p, _ in rest] == [("POST", "/competitions/game-7/join")]
+    assert result.status == "waiting"
+
+
+def test_join_competition_relogin_failure_after_a_token_rejection_propagates(monkeypatch):
+    monkeypatch.setattr(client_module, "call_tool", RecordingCallTool(
+        MCPToolError("Invalid or expired token", status_code=None, error_code="Invalid or expired token")))
+    logins = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/agent/login":
+            logins.append(1)
+            if len(logins) == 1:
+                return httpx.Response(200, json={"access_token": "jwt-1"})
+            return httpx.Response(401, json={"error": "Invalid API key"})
+        raise AssertionError("no join is made without a token")
+
+    client = make_client(handler, mcp_url=MCP_URL)
+    client.login()
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        client.join_competition("game-7")
+
+    assert exc_info.value.transient is False
 
 
 @pytest.mark.parametrize(

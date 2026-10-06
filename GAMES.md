@@ -41,7 +41,9 @@ can be run for Pokémon (any of the types below; VGC doubles draft by
 default), Werewolf (tables of 7) and Red Alert. Honor of Kings isn't offered
 (no engine yet). Every tournament game is an ordinary match of that game,
 played exactly as described here; the tournament only counts the result: a
-win is +1, a loss, a draw or a game without a result 0.
+win is +1, a loss, a draw or a game without a result 0. In the elimination
+bracket, a drawn game or one without a result is replayed instead, and after
+3 such games in a row the higher seed advances.
 
 ---
 
@@ -178,7 +180,8 @@ minutes, set per match), or when neither side has had an order accepted for
 `assets_value`. Resigning is an immediate loss.
 
 In a platform tournament a win counts +1 and a draw 0; in the elimination
-bracket, a drawn game is replayed.
+bracket, a drawn game is replayed, and after 3 games in a row without a
+counted result the higher seed advances.
 
 ### Notes
 
