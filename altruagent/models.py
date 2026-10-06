@@ -348,7 +348,7 @@ class Match:
 
     ``game_server_url`` is never present on this endpoint's rows (confirmed —
     it is not a stored column anywhere; it's computed only by
-    ``GET /competitions/{id}`` and ``GET /tournaments/{id}``). It starts
+    ``GET /competitions/{id}``, for an ``in_progress`` match). It starts
     ``None`` here and is resolved lazily, only when ``game()`` is actually
     called — see ``game()`` below.
     """
@@ -449,24 +449,105 @@ class Match:
         return self._client.game(session_id=self.session_id, game_server_url=game_server_url)
 
 
+@dataclass(frozen=True)
+class AgentRef:
+    """An agent as tournament payloads name it: ``{agent_id, agent_name}``
+    (Agent_ACP backend/src/models/swissTournament.ts ``AgentRef``).
+    """
+
+    agent_id: str
+    agent_name: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentRef":
+        return cls(agent_id=str(data.get("agent_id") or ""), agent_name=str(data.get("agent_name") or ""))
+
+
+def _agent_refs(items: Any) -> list[AgentRef]:
+    return [AgentRef.from_dict(item) for item in (items or []) if isinstance(item, dict)]
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+@dataclass
+class AgentTournamentMatch:
+    """One tournament game this agent is paired into and hasn't finished yet,
+    as listed under ``tournament_matches`` by ``GET /agents/me/sessions``
+    (Agent_ACP backend/src/models/swissTournament.ts
+    ``AgentTournamentMatch``). Only games of tournaments that are running
+    appear here.
+
+    ``session_id`` is the game's competition id: join it (``join_session``
+    over MCP, see ``AltruAgentClient.join_competition``) before
+    ``join_deadline_at``, or the game counts as a loss. ``status`` is
+    ``"join_now"`` (not joined yet), ``"joined_waiting"`` (joined; waiting for
+    the other agent(s)) or ``"in_progress"`` (the game is running — it also
+    appears in ``AgentSessions.active``). ``seconds_left`` was computed by the
+    server when the list was read; ``join_deadline_at`` is the exact time.
+    """
+
+    tournament_id: str
+    tournament_name: str
+    round_label: str
+    match_id: str
+    session_id: str
+    game_type: str
+    game_no: int
+    join_deadline_at: str
+    seconds_left: int
+    status: str
+    opponents: list[AgentRef] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def needs_join(self) -> bool:
+        """True while this agent still has to join the game (``status == "join_now"``)."""
+        return self.status == "join_now"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentTournamentMatch":
+        return cls(
+            tournament_id=str(data.get("tournament_id") or ""),
+            tournament_name=str(data.get("tournament_name") or ""),
+            round_label=str(data.get("round_label") or ""),
+            match_id=str(data.get("match_id") or ""),
+            session_id=str(data.get("session_id") or ""),
+            game_type=str(data.get("game_type") or ""),
+            game_no=_int_or_none(data.get("game_no")) or 1,
+            join_deadline_at=str(data.get("join_deadline_at") or ""),
+            seconds_left=max(0, _int_or_none(data.get("seconds_left")) or 0),
+            status=str(data.get("status") or "unknown"),
+            opponents=_agent_refs(data.get("opponents")),
+            raw=data,
+        )
+
+
 @dataclass
 class AgentSessions:
     """This agent's competition memberships, as returned by
     ``GET /agents/me/sessions``, grouped exactly as the server groups them:
     ``joined_sessions`` -> ``waiting``, ``active_sessions`` -> ``active``,
     ``completed_sessions`` -> ``completed``. Includes both standalone
-    competitions and tournament-created child matches (the endpoint does not
-    distinguish at the query level — see ``Match.tournament_id``).
+    competitions and tournament games (the endpoint does not distinguish at
+    the query level — see ``Match.tournament_id``).
 
-    The backend caps this at the 50 most recently joined memberships in
-    total, not per group (``getCompetitionsForAgent``'s ``.limit(50)``) — a
-    long-lived agent's oldest completed matches can silently drop off before
-    its current ones would.
+    ``tournament_matches`` lists the tournament games this agent is paired
+    into and hasn't finished — including ones it hasn't joined yet (which
+    are in none of the three groups above, since it isn't a member of them
+    until it joins). Empty against a server without tournaments.
+
+    The backend caps the three groups at the 50 most recently joined
+    memberships in total, not per group (``getCompetitionsForAgent``'s
+    ``.limit(50)``) — a long-lived agent's oldest completed matches can
+    silently drop off before its current ones would.
     """
 
     waiting: list[Match] = field(default_factory=list)
     active: list[Match] = field(default_factory=list)
     completed: list[Match] = field(default_factory=list)
+    tournament_matches: list[AgentTournamentMatch] = field(default_factory=list)
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -478,80 +559,172 @@ class AgentSessions:
             waiting=_matches("joined_sessions"),
             active=_matches("active_sessions"),
             completed=_matches("completed_sessions"),
+            tournament_matches=[
+                AgentTournamentMatch.from_dict(row)
+                for row in (data.get("tournament_matches") or [])
+                if isinstance(row, dict)
+            ],
             raw=data,
         )
 
 
 @dataclass
-class TournamentViewer:
-    """The calling agent's membership view of a tournament — present only on
-    an authenticated ``GET /tournaments/{id}`` (see Agent_ACP
-    backend/src/services/tournamentService.ts's ``getTournament``, which only
-    builds a ``viewer`` object when the request carried a JWT that resolved
-    to an agent).
+class TournamentStanding:
+    """One row of a tournament's Swiss standings (``standings`` in
+    ``GET /tournaments/{id}``; Agent_ACP ``StandingRow``). A win and a bye are
+    worth 1 point; a loss, a draw and a game without a result 0. ``buchholz``
+    is the sum of the current points of every opponent faced (the first
+    tie-break). ``in_top_cut`` marks the agents that would reach the
+    elimination bracket (Werewolf: the finals) at the current standings.
     """
 
-    agent_id: str | None = None
-    is_tournament_participant: bool = False
-    active_child_session_ids: list[str] = field(default_factory=list)
-    should_join_tournament: bool | None = None
-    should_wait_for_child_match: bool | None = None
-    next_actions: list[NextAction] = field(default_factory=list)
+    rank: int
+    agent_id: str
+    agent_name: str
+    points: float
+    wins: int = 0
+    losses: int = 0
+    draws: int = 0
+    byes: int = 0
+    no_shows: int = 0
+    games_played: int = 0
+    buchholz: float = 0
+    in_top_cut: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TournamentViewer":
+    def from_dict(cls, data: dict) -> "TournamentStanding":
+        def number(key: str) -> float:
+            value = data.get(key)
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
         return cls(
-            agent_id=data.get("agent_id"),
-            is_tournament_participant=bool(data.get("is_tournament_participant", False)),
-            active_child_session_ids=list(data.get("active_child_session_ids") or []),
-            should_join_tournament=data.get("should_join_tournament"),
-            should_wait_for_child_match=data.get("should_wait_for_child_match"),
-            next_actions=[NextAction.from_dict(a) for a in (data.get("next_actions") or [])],
+            rank=_int_or_none(data.get("rank")) or 0,
+            agent_id=str(data.get("agent_id") or ""),
+            agent_name=str(data.get("agent_name") or ""),
+            points=number("points"),
+            wins=int(number("wins")),
+            losses=int(number("losses")),
+            draws=int(number("draws")),
+            byes=int(number("byes")),
+            no_shows=int(number("no_shows")),
+            games_played=int(number("games_played")),
+            buchholz=number("buchholz"),
+            in_top_cut=bool(data.get("in_top_cut", False)),
         )
 
 
 @dataclass
-class Tournament:
-    """A tournament, as returned by either ``GET /tournaments`` (list — a raw
-    ``tournaments`` DB row) or ``GET /tournaments/{id}`` (detail — a curated
-    ``compactTournament()`` subset with a *different* field set — see
-    Agent_ACP backend/src/services/tournamentService.ts). Both shapes are
-    tolerated: only fields useful and common enough to model are typed;
-    everything else (list-only fields like ``created_at``/``metadata``, or
-    detail-only ``leaderboard``/``participants``) stays reachable via ``raw``.
+class TournamentDetail:
+    """One tournament, as returned by ``GET /tournaments/{id}`` (Agent_ACP
+    backend/src/models/swissTournament.ts ``TournamentDetail``): a Swiss
+    phase, then an elimination bracket of best-of series (Werewolf: finals
+    at tables of 7).
 
-    There is no ``name`` field anywhere on the backend (confirmed against
-    the DB schema) — a tournament is identified only by ``tournament_id`` +
-    ``game_type``.
-
-    ``viewer`` is ``None`` unless this came from an authenticated
-    ``GET /tournaments/{id}`` call that returned one (never present on a
-    ``GET /tournaments`` list entry).
+    ``status`` is ``"registration"``, ``"in_progress"``, ``"completed"`` or
+    ``"cancelled"``; ``phase`` says where a running tournament is
+    (``"swiss"``, ``"bracket"``, ``"finals"``). ``current_round`` is the
+    active (or last) round's label, e.g. ``"Swiss round 2 of 4"`` or
+    ``"Semifinals"``. ``final_ranking`` (``[{rank, agent_id, agent_name,
+    points}]``) is set once the tournament is complete. Everything else the
+    server returns — the rounds with every match and game, the bracket, the
+    Werewolf finals, the event log, ``viewer`` — stays reachable via ``raw``.
     """
 
     tournament_id: str
+    name: str
     status: str
-    game_type: str | None = None
+    phase: str
+    game_type: str
+    game_label: str
+    description: str | None = None
+    scheduled_start_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    participant_count: int = 0
     max_participants: int | None = None
+    current_round: str | None = None
+    planned_rounds: int | None = None
+    config: dict = field(default_factory=dict)
+    champion: AgentRef | None = None
+    standings: list[TournamentStanding] = field(default_factory=list)
+    final_ranking: list[dict] | None = None
+    raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def is_finished(self) -> bool:
+        """True once the tournament is over: completed or cancelled."""
+        return self.status in ("completed", "cancelled")
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TournamentDetail":
+        current_round = data.get("current_round")
+        champion = data.get("champion")
+        final_ranking = data.get("final_ranking")
+        return cls(
+            tournament_id=str(data.get("tournament_id") or ""),
+            name=str(data.get("name") or ""),
+            status=str(data.get("status") or "unknown"),
+            phase=str(data.get("phase") or "unknown"),
+            game_type=str(data.get("game_type") or ""),
+            game_label=str(data.get("game_label") or data.get("game_type") or ""),
+            description=data.get("description"),
+            scheduled_start_at=data.get("scheduled_start_at"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            participant_count=_int_or_none(data.get("participant_count")) or 0,
+            max_participants=_int_or_none(data.get("max_participants")),
+            current_round=current_round.get("label") if isinstance(current_round, dict) else None,
+            planned_rounds=_int_or_none(data.get("planned_rounds")),
+            config=dict(data.get("config") or {}),
+            champion=AgentRef.from_dict(champion) if isinstance(champion, dict) else None,
+            standings=[
+                TournamentStanding.from_dict(row)
+                for row in (data.get("standings") or [])
+                if isinstance(row, dict)
+            ],
+            final_ranking=(
+                [row for row in final_ranking if isinstance(row, dict)]
+                if isinstance(final_ranking, list)
+                else None
+            ),
+            raw=data,
+        )
+
+
+@dataclass
+class JoinResult:
+    """The answer to joining one competition (``AltruAgentClient.join_competition``):
+    MCP ``join_session``'s payload, or ``POST /competitions/{id}/join``'s when
+    the MCP endpoint couldn't be used (``transport`` says which).
+
+    ``status`` is the competition's status right after the join:
+    ``"waiting"`` (other seats still open) or ``"in_progress"`` (this join
+    filled it and the game started). ``already_joined`` is True when this
+    agent was already in it — joining is idempotent, so that's success too.
+    """
+
+    session_id: str
+    status: str
+    already_joined: bool = False
+    game_type: str | None = None
+    position: int | None = None
     current_participants: int | None = None
-    max_active_matches: int | None = None
-    queue_id: str | None = None
-    game_server_url: str | None = None
-    viewer: TournamentViewer | None = None
+    max_participants: int | None = None
+    transport: str = "mcp"
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_dict(cls, data: dict, *, viewer: dict | None = None) -> "Tournament":
+    def from_dict(cls, data: dict, *, session_id: str, transport: str) -> "JoinResult":
         return cls(
-            tournament_id=data.get("tournament_id", ""),
-            status=data.get("status", "unknown"),
+            session_id=str(data.get("session_id") or session_id),
+            status=str(data.get("status") or "unknown"),
+            already_joined=bool(data.get("already_joined", False)),
             game_type=data.get("game_type"),
-            max_participants=data.get("max_participants"),
-            current_participants=data.get("current_participants"),
-            max_active_matches=data.get("max_active_matches"),
-            queue_id=data.get("queue_id"),
-            game_server_url=data.get("game_server_url"),
-            viewer=TournamentViewer.from_dict(viewer) if isinstance(viewer, dict) else None,
+            position=_int_or_none(data.get("position")),
+            # MCP names it current_participants; the REST route, participants.
+            current_participants=_int_or_none(data.get("current_participants", data.get("participants"))),
+            max_participants=_int_or_none(data.get("max_participants")),
+            transport=transport,
             raw=data,
         )
 

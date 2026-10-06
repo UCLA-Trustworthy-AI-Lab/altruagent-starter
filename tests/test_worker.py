@@ -108,6 +108,39 @@ def test_run_worker_happy_path_wires_client_match_and_create_agent_together():
     assert fake_client.closed is True
 
 
+def test_run_worker_builds_the_contestant_from_agent_spec_when_given():
+    run_match_calls = []
+
+    def run_match_fn(match, agent_id, decision_fn):
+        run_match_calls.append(decision_fn)
+        return terminal_state()
+
+    exit_code = run_worker(
+        WORKER_INPUT._replace(agent_spec="examples.smoke_agent"),
+        client_factory=FakeClient,
+        match_factory=lambda data, *, client: "fake-match",
+        agent_module=make_agent_module(create_agent=lambda: pytest.fail("used agent.agent instead of agent_spec")),
+        run_match_fn=run_match_fn,
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert run_match_calls[0].__module__ == "examples.smoke_agent"  # its create_agent returns a function
+
+
+def test_run_worker_bad_agent_spec_is_unexpected():
+    exit_code = run_worker(
+        WORKER_INPUT._replace(agent_spec="no_such_module_xyz"),
+        client_factory=lambda: pytest.fail("built a client"),
+        run_match_fn=lambda *a: pytest.fail("played"),
+    )
+
+    assert exit_code == EXIT_UNEXPECTED
+
+
+def test_worker_input_agent_spec_defaults_to_none():
+    assert WORKER_INPUT.agent_spec is None
+
+
 def test_run_worker_missing_create_agent_fails_clearly_without_touching_client():
     client_built = []
 

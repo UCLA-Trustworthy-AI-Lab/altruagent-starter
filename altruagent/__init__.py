@@ -16,11 +16,9 @@ agent's competition memberships (standalone and tournament-spawned alike)
 grouped into waiting/active/completed; ``match.game()`` lazily resolves a
 specific match into a ``GameSession`` only when actually needed.
 
-Milestone 3B: minimal tournament registration/status —
-``client.tournaments()``/``client.tournament(id)`` for discovery/inspection,
-``client.join_tournament(id)``/``client.leave_tournament(id)`` for
-registration. Tournament support ends there; assigned child matches are
-still discovered exclusively through ``client.sessions()``.
+Milestone 3B (retired): the round-robin tournament client
+(``client.tournaments()``/``join_tournament``/``leave_tournament``) is gone
+along with the platform's round-robin tournaments — see Milestone 10.
 
 Milestone 4A: the contestant decision contract and a single-match execution
 primitive — ``run_match``/``run_game`` (see ``altruagent.runner``) own the
@@ -95,6 +93,17 @@ authenticates with the contestant's persistent Official Agent Key
 official assignments, and keeps one worker process per assigned seat, each
 building its own contestant and playing through the same ``run_game`` with
 that seat's SeatGrant. ``--check-tournament`` verifies the setup.
+
+Milestone 10: platform tournaments (Swiss rounds, then an elimination
+bracket; ``altruagent.autojoin``). An owner registers the agent on the
+human dashboard; every round, the platform pairs it into a game (a
+competition) that it must join within the join window (4 minutes by
+default). ``client.sessions().tournament_matches`` lists those games
+(``AgentTournamentMatch``), ``client.join_competition(id)`` joins one
+(MCP ``join_session`` first), and ``client.tournament(id)`` reads a
+tournament's standings (``TournamentDetail``). ``python -m agent --join
+<competition_id>`` joins and plays one game; ``python -m agent
+--tournament-auto`` joins and plays every game the agent is paired into.
 """
 
 from .auth import ApiKeyAuth, SeatClaimError, SeatGrantAuth
@@ -106,9 +115,12 @@ from .mcp_transport import MCPToolError
 from .official import OfficialAgentAuth, OfficialAgentClient, OfficialAgentError, OfficialSeatAuth
 from .models import (
     Agent,
+    AgentRef,
     AgentSessions,
+    AgentTournamentMatch,
     DecisionContext,
     GameState,
+    JoinResult,
     LegalAction,
     Match,
     Message,
@@ -116,8 +128,8 @@ from .models import (
     OfficialAssignment,
     PlayerRef,
     SeatGrant,
-    Tournament,
-    TournamentViewer,
+    TournamentDetail,
+    TournamentStanding,
 )
 from .runner import (
     RESIGN,
@@ -133,6 +145,7 @@ from .runner import (
 )
 from .runtime import run_forever, run_once
 from .supervisor import run_forever_concurrent, run_once_concurrent, run_tournament_forever
+from .autojoin import JoinRefused, join_and_play, run_autojoin_forever, run_autojoin_once
 
 __all__ = [
     "AltruAgentClient",
@@ -146,7 +159,9 @@ __all__ = [
     "OfficialAssignment",
     "OfficialSeatAuth",
     "Agent",
+    "AgentRef",
     "AgentSessions",
+    "AgentTournamentMatch",
     "DecisionContext",
     "GameSession",
     "GameState",
@@ -157,8 +172,10 @@ __all__ = [
     "Message",
     "NextAction",
     "PlayerRef",
-    "Tournament",
-    "TournamentViewer",
+    "JoinResult",
+    "TournamentDetail",
+    "TournamentStanding",
+    "JoinRefused",
     "AltruAgentError",
     "ConfigurationError",
     "AuthenticationError",
@@ -178,4 +195,7 @@ __all__ = [
     "run_forever_concurrent",
     "run_once_concurrent",
     "run_tournament_forever",
+    "join_and_play",
+    "run_autojoin_forever",
+    "run_autojoin_once",
 ]

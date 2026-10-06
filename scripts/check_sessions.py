@@ -1,7 +1,9 @@
 """Read-only discovery smoke test: lists this agent's assigned matches.
 
-Calls GET /agents/me/sessions (via client.sessions()) and prints a summary.
-This never joins, steps, resigns, or otherwise mutates anything.
+Calls GET /agents/me/sessions (via client.sessions()) and prints a summary,
+including the platform tournament games your agent is paired into
+(``tournament_matches``: each game's competition id, status and join
+deadline). This never joins, steps, resigns, or otherwise mutates anything.
 
 Run:
     python scripts/check_sessions.py
@@ -58,6 +60,7 @@ def main() -> int:
         print(f"Waiting matches: {len(sessions.waiting)}")
         print(f"Active matches: {len(sessions.active)}")
         print(f"Completed matches: {len(sessions.completed)}")
+        print(f"Open tournament games: {len(sessions.tournament_matches)}")
 
         if sessions.waiting:
             print("\nWaiting:")
@@ -71,6 +74,14 @@ def main() -> int:
             print("\nCompleted:")
             for m in sessions.completed:
                 _print_match(m)
+        if sessions.tournament_matches:
+            print("\nTournament games (join with python -m agent --join <session_id>):")
+            for row in sessions.tournament_matches:
+                print(
+                    f"  session_id={row.session_id} status={row.status} game_type={row.game_type} "
+                    f"round={row.round_label!r} tournament_id={row.tournament_id} "
+                    f"join_deadline_at={row.join_deadline_at} seconds_left={row.seconds_left}"
+                )
 
         if args.inspect_active and sessions.active:
             print("\nInspecting active matches via MCP (read-only — fetches state, submits no moves):")

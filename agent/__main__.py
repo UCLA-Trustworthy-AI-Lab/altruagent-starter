@@ -22,6 +22,15 @@ registered tournament agent and keeps one worker process per active official
 assignment until Ctrl+C (`altruagent.supervisor.run_tournament_forever`).
 `--check-tournament` verifies the connection and the agent without playing.
 
+Platform tournaments (Swiss rounds, then a bracket; the owner registers the
+agent on the human dashboard) use the API key, and every game must be
+joined within its join window (`altruagent.autojoin`):
+`python -m agent --join <competition_id>` joins one game, waits for it to
+start, plays it here in this process and prints the result;
+`python -m agent --tournament-auto [--tournament-id T]` keeps joining every
+game the agent is paired into and plays each in its own worker process,
+until T is over (or Ctrl+C without T). Both take `--agent`.
+
 This file is deliberately thin — discovery/worker lifecycle lives in
 `altruagent.supervisor`, one match's play loop in `altruagent.runner`, and
 each worker's own setup in `altruagent.worker`.
@@ -47,6 +56,14 @@ from typing import Callable
 from altruagent.agent_loader import DEFAULT_AGENT_SPEC
 from altruagent.agent_loader import load_agent_factory as _load_agent_factory
 from altruagent.auth import SeatClaimError, SeatGrantAuth
+from altruagent.autojoin import (
+    GameNeverStarted,
+    JoinRefused,
+    describe_final_standing,
+    is_transient,
+    join_and_play,
+    run_autojoin_forever,
+)
 from altruagent.client import AltruAgentClient
 from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from altruagent.mcp_game import MCPGameSession
@@ -421,15 +438,162 @@ def _check_tournament(agent_spec: str) -> int:
         official.close()
 
 
+def _api_key_client() -> tuple[AltruAgentClient | None, object | None]:
+    """An API-key client and its claimed agent (``me()``), or ``(None, None)``
+    after printing why not.
+    """
+    try:
+        client = AltruAgentClient()
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}")
+        print("Copy .env.example to .env and fill in ALTRUAGENT_API_KEY.")
+        return None, None
+    try:
+        me = client.me()
+    except AltruAgentError as exc:
+        print(f"Could not authenticate: {exc}")
+        client.close()
+        return None, None
+    if not me.is_claimed:
+        print(
+            f"Agent '{me.name}' is not claimed yet (status={me.status}). "
+            "Have a human claim it with your claim_token before running this."
+        )
+        client.close()
+        return None, None
+    print(f"Authenticated as agent '{me.name}' ({me.id}).")
+    return client, me
+
+
+def _build_contestant(agent_spec: str) -> object | None:
+    """Build the contestant once, before anything is joined, so a broken
+    factory (or a missing OPENAI_API_KEY) is reported while there is still
+    time to fix it. ``None`` after printing why not.
+    """
+    try:
+        contestant = _load_agent_factory(agent_spec)()
+        _resolve_decision_fn(contestant)
+        return contestant
+    except Exception as exc:  # noqa: BLE001 - contestant code; report it, don't join
+        print(f"Startup error: agent {agent_spec} could not be created, so nothing was joined: {exc}")
+        return None
+
+
+def _run_join(session_id: str, agent_spec: str) -> int:
+    """Join one competition (a platform tournament game, or any open
+    competition), wait for it to start, play it to the end here, print the result.
+    """
+    session_id = session_id.strip()
+    if not session_id:
+        print("Join error: no competition id was given.")
+        return 1
+    contestant = _build_contestant(agent_spec)
+    if contestant is None:
+        return 1
+    client, me = _api_key_client()
+    if client is None:
+        return 1
+    print(f"Joining competition {session_id} with agent {agent_spec}...", flush=True)
+    try:
+        join_and_play(client, session_id, contestant, agent_id=me.id, game_factory=_ProgressGameSession,
+                      run_game_fn=run_game)
+        return 0
+    except JoinRefused as exc:
+        print(f"Could not join competition {session_id}: {exc}")
+        return 1
+    except GameNeverStarted as exc:
+        print(f"Stopped: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print(
+            "\nStopped. If your agent had already joined, it is still in the game: run the same "
+            "command again to carry on playing it."
+        )
+        return 0
+    except RunnerError as exc:
+        print(f"\nMatch failed: {exc}")
+        return 1
+    except AltruAgentError as exc:
+        print(f"\nStopped due to an unrecoverable error: {exc}")
+        return 1
+    finally:
+        client.close()
+
+
+def _run_tournament_auto(agent_spec: str, tournament_id: str | None) -> int:
+    """Join and play every platform tournament game this agent is paired into
+    (only tournament_id's, if given — then exit once it is over).
+    """
+    if _build_contestant(agent_spec) is None:  # validated here; each game builds its own
+        return 1
+    client, me = _api_key_client()
+    if client is None:
+        return 1
+    try:
+        scope = "every tournament"
+        if tournament_id:
+            scope = f"tournament {tournament_id}"
+            try:
+                detail = client.tournament(tournament_id)
+            except PlatformError as exc:
+                if exc.status_code == 404:
+                    print(f"No tournament with id {tournament_id}. Copy the id from the tournament's page or your dashboard.")
+                    return 1
+                if not is_transient(exc):
+                    raise
+                print(f"Could not read tournament {tournament_id} yet ({exc}); carrying on.")
+            else:
+                if detail.is_finished:
+                    for line in describe_final_standing(detail, me.id):
+                        print(line)
+                    return 0
+                scope = f'tournament "{detail.name}"'
+                where = f" ({detail.current_round})" if detail.current_round else ""
+                print(f'Tournament "{detail.name}" — {detail.game_label}: {detail.status}{where}.')
+                if detail.status == "registration":
+                    print("It hasn't started yet; your agent will join its first game as soon as it does.")
+        print(
+            f"Auto mode: joining and playing every game your agent is paired into in {scope}, "
+            f"with agent {agent_spec}. Press Ctrl+C to stop.",
+            flush=True,
+        )
+        finished = run_autojoin_forever(client, agent_id=me.id, agent_spec=agent_spec, tournament_id=tournament_id)
+        if finished is not None:
+            for line in describe_final_standing(finished, me.id):
+                print(line)
+        return 0
+    except KeyboardInterrupt:
+        print("\nStopped. Games your agent already joined keep running without it.")
+        return 0
+    except AltruAgentError as exc:
+        print(f"\nStopped due to an unrecoverable error: {exc}")
+        return 1
+    finally:
+        client.close()
+
+
+_DESCRIPTION = """\
+With no arguments: play every running match your agent (ALTRUAGENT_API_KEY) is
+already in.
+
+Platform tournaments (Swiss rounds, then a bracket; your agent's owner
+registers it on the human dashboard) use the same API key. Every round, your
+agent is paired into a game with its own competition id, and must join it
+within the join window (4 minutes by default) or lose that game:
+  --join ID           join one game (the id your dashboard shows), play it, exit
+  --tournament-auto   join and play every game your agent is paired into
+
+The UCLA event uses a different system, with no joining at all:
+  --tournament        play your official assignments (ALTRUAGENT_OFFICIAL_AGENT_KEY)
+  --claim TOKEN       play one seat of a Testing match (no API key needed)
+"""
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent",
-        description=(
-            "With no arguments: play every match assigned to your registered agent "
-            "(ALTRUAGENT_API_KEY). With --claim: claim and play one tournament "
-            "test-match seat (no API key needed). With --tournament: play your "
-            f"official tournament assignments ({OFFICIAL_AGENT_KEY_ENV})."
-        ),
+        description=_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -441,19 +605,46 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     mode.add_argument(
+        "--join",
+        metavar="COMPETITION_ID",
+        help=(
+            "platform tournament: join this game (its competition id, from your dashboard), wait for it "
+            "to start, play it to the end and print the result; also works for any open competition"
+        ),
+    )
+    mode.add_argument(
+        "--tournament-auto",
+        action="store_true",
+        help=(
+            "platform tournament: every 5 s, join every game your agent is paired into and play it; "
+            "runs until Ctrl+C, or until --tournament-id's tournament is over"
+        ),
+    )
+    mode.add_argument(
         "--tournament",
         action="store_true",
-        help=f"official tournament mode: wait for and play your official assignments ({OFFICIAL_AGENT_KEY_ENV})",
+        help=(
+            "UCLA event (official tournament): wait for and play your official assignments "
+            f"({OFFICIAL_AGENT_KEY_ENV}); not for platform tournaments"
+        ),
     )
     mode.add_argument(
         "--check-tournament",
         action="store_true",
-        help="check your official tournament connection and agent without playing anything",
+        help="UCLA event: check your official tournament connection and agent without playing anything",
+    )
+    parser.add_argument(
+        "--tournament-id",
+        metavar="TOURNAMENT_ID",
+        help="with --tournament-auto: only this tournament's games, and exit once it is completed or cancelled",
     )
     parser.add_argument(
         "--agent",
         metavar="MODULE[:FACTORY]",
-        help=f"with --claim/--tournament/--check-tournament: agent factory to use (default: {DEFAULT_AGENT_SPEC})",
+        help=(
+            f"agent factory to use (default: {DEFAULT_AGENT_SPEC}); works with every mode "
+            "except the no-argument one"
+        ),
     )
     return parser
 
@@ -462,6 +653,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args([] if argv is None else argv)
 
+    if args.tournament_id is not None and not args.tournament_auto:
+        parser.error("--tournament-id is only supported together with --tournament-auto")
+    if args.join is not None:
+        return _run_join(args.join, args.agent or DEFAULT_AGENT_SPEC)
+    if args.tournament_auto:
+        return _run_tournament_auto(args.agent or DEFAULT_AGENT_SPEC, (args.tournament_id or "").strip() or None)
+
     if args.tournament or args.check_tournament:
         agent_spec = args.agent or DEFAULT_AGENT_SPEC
         return _check_tournament(agent_spec) if args.check_tournament else _run_tournament(agent_spec)
@@ -469,7 +667,10 @@ def main(argv: list[str] | None = None) -> int:
     claim_token = _resolve_claim_token(args.claim, prompt=getpass.getpass)
     if claim_token is None:
         if args.agent is not None:
-            parser.error("--agent is only supported together with --claim, --tournament, or --check-tournament")
+            parser.error(
+                "--agent is only supported together with --join, --tournament-auto, --claim, "
+                "--tournament, or --check-tournament"
+            )
         return _run_discovery()
 
     if not claim_token.strip():

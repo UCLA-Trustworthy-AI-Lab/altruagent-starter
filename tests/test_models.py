@@ -6,14 +6,16 @@ import pytest
 
 from altruagent.models import (
     Agent,
+    AgentRef,
     AgentSessions,
+    AgentTournamentMatch,
     GameState,
+    JoinResult,
     LegalAction,
     Match,
     Message,
     NextAction,
-    Tournament,
-    TournamentViewer,
+    TournamentDetail,
 )
 
 
@@ -277,7 +279,7 @@ def test_match_tolerates_missing_optional_fields():
     assert match.completed_at is None
 
 
-def test_match_tournament_id_preserved_for_child_matches():
+def test_match_tournament_id_preserved_for_tournament_games():
     match = Match.from_dict(
         {"session_id": "session-1", "status": "waiting", "tournament_id": "tournament-9"}
     )
@@ -474,113 +476,216 @@ def test_game_state_from_mcp_state_new_messages_parsed_as_message_objects():
     assert state.new_messages[0].sender == 1
 
 
-# -- Tournament / TournamentViewer -----------------------------------------
+# -- Platform tournaments: AgentTournamentMatch / TournamentDetail / JoinResult ------
+# Shapes follow Agent_ACP backend/src/models/swissTournament.ts.
 
 
-def test_tournament_from_dict_list_shape():
-    # GET /tournaments list entries are raw DB rows: no viewer, no
-    # game_server_url (never a stored column).
-    tournament = Tournament.from_dict(
+def tournament_match_row(**overrides) -> dict:
+    row = {
+        "tournament_id": "t-1",
+        "tournament_name": "Autumn Cup",
+        "round_label": "Swiss round 2 of 4",
+        "match_id": "r2-m3",
+        "session_id": "game-7",
+        "game_type": "pokemon_vgc_doubles_draft",
+        "game_no": 1,
+        "join_deadline_at": "2026-10-06T12:04:00.000Z",
+        "seconds_left": 187,
+        "status": "join_now",
+        "opponents": [{"agent_id": "agent-b", "agent_name": "Bulbasaur Bot"}],
+    }
+    row.update(overrides)
+    return row
+
+
+def tournament_detail_payload(**overrides) -> dict:
+    payload = {
+        "tournament_id": "t-1",
+        "name": "Autumn Cup",
+        "description": None,
+        "game_type": "pokemon_vgc_doubles_draft",
+        "game_family": "pokemon",
+        "game_label": "Pokémon (VGC doubles draft)",
+        "status": "in_progress",
+        "phase": "swiss",
+        "scheduled_start_at": None,
+        "started_at": "2026-10-06T12:00:00.000Z",
+        "completed_at": None,
+        "created_at": "2026-10-05T09:00:00.000Z",
+        "config": {"swiss_rounds": 4, "top_cut": 4, "best_of": 3, "finals_games": 4, "join_window_seconds": 240},
+        "max_participants": 128,
+        "participant_count": 9,
+        "current_round": {"index": 2, "phase": "swiss", "number": 2, "label": "Swiss round 2 of 4"},
+        "planned_rounds": 6,
+        "champion": None,
+        "participants": [],
+        "standings": [
+            {"rank": 1, "agent_id": "agent-a", "agent_name": "Alpha", "points": 2, "wins": 2, "losses": 0,
+             "draws": 0, "byes": 0, "no_shows": 0, "games_played": 2, "buchholz": 1, "in_top_cut": True},
+            {"rank": 2, "agent_id": "agent-b", "agent_name": "Bulbasaur Bot", "points": 1, "wins": 0, "losses": 1,
+             "draws": 0, "byes": 1, "no_shows": 1, "games_played": 1, "buchholz": 2, "in_top_cut": True},
+        ],
+        "rounds": [{"index": 1, "phase": "swiss", "number": 1, "label": "Swiss round 1 of 4", "matches": []}],
+        "bracket": None,
+        "finals": None,
+        "final_ranking": None,
+        "events": [{"id": "e3", "at": "2026-10-06T12:00:00.000Z", "kind": "round_started", "message": "…"}],
+        "viewer": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_agent_tournament_match_from_dict_parses_every_field():
+    row = AgentTournamentMatch.from_dict(tournament_match_row())
+
+    assert row.tournament_id == "t-1"
+    assert row.tournament_name == "Autumn Cup"
+    assert row.round_label == "Swiss round 2 of 4"
+    assert row.match_id == "r2-m3"
+    assert row.session_id == "game-7"
+    assert row.game_type == "pokemon_vgc_doubles_draft"
+    assert row.game_no == 1
+    assert row.join_deadline_at == "2026-10-06T12:04:00.000Z"
+    assert row.seconds_left == 187
+    assert row.status == "join_now"
+    assert row.needs_join is True
+    assert row.opponents == [AgentRef(agent_id="agent-b", agent_name="Bulbasaur Bot")]
+    assert row.raw["match_id"] == "r2-m3"
+
+
+@pytest.mark.parametrize("status", ["joined_waiting", "in_progress"])
+def test_agent_tournament_match_needs_join_only_for_join_now(status):
+    assert AgentTournamentMatch.from_dict(tournament_match_row(status=status)).needs_join is False
+
+
+def test_agent_tournament_match_tolerates_missing_and_odd_fields():
+    row = AgentTournamentMatch.from_dict({"session_id": "game-1", "seconds_left": -3, "opponents": None})
+
+    assert row.session_id == "game-1"
+    assert row.seconds_left == 0
+    assert row.game_no == 1
+    assert row.status == "unknown"
+    assert row.needs_join is False
+    assert row.opponents == []
+
+
+def test_werewolf_table_lists_every_tablemate_as_an_opponent():
+    opponents = [{"agent_id": f"agent-{i}", "agent_name": f"Wolf {i}"} for i in range(6)]
+    row = AgentTournamentMatch.from_dict(tournament_match_row(game_type="werewolf", match_id="r1-t2", opponents=opponents))
+
+    assert [o.agent_name for o in row.opponents] == [f"Wolf {i}" for i in range(6)]
+
+
+def test_agent_sessions_parses_tournament_matches():
+    sessions = AgentSessions.from_dict(
         {
-            "tournament_id": "t-1",
-            "game_type": "tic_tac_toe",
-            "status": "waiting",
-            "max_participants": 2,
-            "current_participants": 1,
-            "max_active_matches": 1,
-            "queue_id": None,
-            "created_by_user_id": "user-1",
-            "metadata": None,
-            "created_at": "2026-01-01T00:00:00Z",
+            "joined_sessions": [],
+            "active_sessions": [{"session_id": "game-6", "status": "in_progress", "tournament_id": "t-1"}],
+            "completed_sessions": [],
+            "tournament_matches": [
+                tournament_match_row(),
+                tournament_match_row(session_id="game-6", status="in_progress", tournament_id="t-2"),
+                "not-a-row",
+            ],
         }
     )
 
-    assert tournament.tournament_id == "t-1"
-    assert tournament.status == "waiting"
-    assert tournament.current_participants == 1
-    assert tournament.game_server_url is None
-    assert tournament.viewer is None
-    assert tournament.raw["created_by_user_id"] == "user-1"
+    assert [r.session_id for r in sessions.tournament_matches] == ["game-7", "game-6"]
+    assert sessions.tournament_matches[1].tournament_id == "t-2"
+    assert sessions.active[0].tournament_id == "t-1"
 
 
-def test_tournament_from_dict_detail_shape_with_viewer():
-    # GET /tournaments/{id}'s `tournament` sub-object (compactTournament) can
-    # include game_server_url; `viewer` is passed separately (it's a sibling
-    # key in the response body, not nested inside `tournament`).
-    tournament = Tournament.from_dict(
-        {
-            "tournament_id": "t-1",
-            "game_type": "tic_tac_toe",
-            "status": "in_progress",
-            "max_participants": 2,
-            "current_participants": 2,
-            "max_active_matches": 1,
-            "queue_id": None,
-            "game_server_url": "host:8000",
-        },
-        viewer={
-            "agent_id": "agent-1",
-            "is_tournament_participant": True,
-            "active_child_session_ids": ["session-1"],
-            "should_join_tournament": False,
-            "should_wait_for_child_match": False,
-            "next_actions": [
-                {"action": "play_child_session", "endpoint": "GET .../games/session-1", "hint": "Play it."}
+def test_agent_sessions_without_tournament_matches_gives_empty_list():
+    assert AgentSessions.from_dict({"joined_sessions": []}).tournament_matches == []
+
+
+def test_tournament_detail_from_dict_parses_summary_and_standings():
+    detail = TournamentDetail.from_dict(tournament_detail_payload())
+
+    assert detail.tournament_id == "t-1"
+    assert detail.name == "Autumn Cup"
+    assert detail.status == "in_progress"
+    assert detail.phase == "swiss"
+    assert detail.game_type == "pokemon_vgc_doubles_draft"
+    assert detail.game_label == "Pokémon (VGC doubles draft)"
+    assert detail.participant_count == 9
+    assert detail.max_participants == 128
+    assert detail.current_round == "Swiss round 2 of 4"
+    assert detail.planned_rounds == 6
+    assert detail.config["best_of"] == 3
+    assert detail.champion is None
+    assert detail.final_ranking is None
+    assert detail.is_finished is False
+    assert [s.agent_name for s in detail.standings] == ["Alpha", "Bulbasaur Bot"]
+    second = detail.standings[1]
+    assert (second.rank, second.points, second.wins, second.losses, second.byes, second.no_shows) == (2, 1, 0, 1, 1, 1)
+    assert second.buchholz == 2 and second.in_top_cut is True
+    # Not individually modeled, still reachable.
+    assert detail.raw["rounds"][0]["label"] == "Swiss round 1 of 4"
+    assert detail.raw["events"][0]["kind"] == "round_started"
+
+
+def test_tournament_detail_completed_has_champion_and_final_ranking():
+    detail = TournamentDetail.from_dict(
+        tournament_detail_payload(
+            status="completed",
+            phase="completed",
+            champion={"agent_id": "agent-a", "agent_name": "Alpha"},
+            final_ranking=[
+                {"rank": 1, "agent_id": "agent-a", "agent_name": "Alpha", "points": 3},
+                {"rank": 2, "agent_id": "agent-b", "agent_name": "Bulbasaur Bot", "points": 2},
             ],
-        },
+        )
     )
 
-    assert tournament.game_server_url == "host:8000"
-    assert tournament.viewer is not None
-    assert tournament.viewer.agent_id == "agent-1"
-    assert tournament.viewer.is_tournament_participant is True
-    assert tournament.viewer.active_child_session_ids == ["session-1"]
-    assert [a.action for a in tournament.viewer.next_actions] == ["play_child_session"]
+    assert detail.is_finished is True
+    assert detail.champion == AgentRef(agent_id="agent-a", agent_name="Alpha")
+    assert [row["agent_id"] for row in detail.final_ranking] == ["agent-a", "agent-b"]
 
 
-def test_tournament_viewer_absent_gives_none():
-    tournament = Tournament.from_dict({"tournament_id": "t-1", "status": "waiting"})
-
-    assert tournament.viewer is None
-
-
-def test_tournament_tolerates_missing_optional_fields():
-    tournament = Tournament.from_dict({"tournament_id": "t-1", "status": "waiting"})
-
-    assert tournament.game_type is None
-    assert tournament.max_participants is None
-    assert tournament.current_participants is None
-    assert tournament.queue_id is None
-    assert tournament.game_server_url is None
+@pytest.mark.parametrize("status, finished", [("registration", False), ("in_progress", False),
+                                              ("completed", True), ("cancelled", True)])
+def test_tournament_detail_is_finished(status, finished):
+    assert TournamentDetail.from_dict({"status": status}).is_finished is finished
 
 
-def test_tournament_preserves_unknown_fields_in_raw():
-    tournament = Tournament.from_dict(
-        {"tournament_id": "t-1", "status": "waiting", "leaderboard": [], "messaging_config": {"messaging_enabled": True}}
+def test_tournament_detail_tolerates_a_minimal_payload():
+    detail = TournamentDetail.from_dict({"tournament_id": "t-1"})
+
+    assert detail.status == "unknown"
+    assert detail.current_round is None
+    assert detail.standings == []
+    assert detail.final_ranking is None
+    assert detail.champion is None
+
+
+def test_join_result_from_mcp_payload():
+    result = JoinResult.from_dict(
+        {"status": "waiting", "session_id": "game-7", "game_type": "werewolf", "runtime_adapter": "openspiel",
+         "position": 3, "current_participants": 4, "max_participants": 7,
+         "next_actions": [{"tool": "get_agent_status", "hint": "Poll until the session starts."}]},
+        session_id="game-7",
+        transport="mcp",
     )
 
-    assert tournament.raw["leaderboard"] == []
-    assert tournament.raw["messaging_config"] == {"messaging_enabled": True}
+    assert (result.session_id, result.status, result.already_joined) == ("game-7", "waiting", False)
+    assert (result.position, result.current_participants, result.max_participants) == (3, 4, 7)
+    assert result.transport == "mcp"
 
 
-def test_tournament_has_no_name_attribute():
-    # There is no `name` field anywhere on the backend's tournaments table —
-    # guard against ever accidentally assuming one exists.
-    tournament = Tournament.from_dict({"tournament_id": "t-1", "status": "waiting", "name": "Ignored"})
+def test_join_result_from_rest_payload_already_joined():
+    result = JoinResult.from_dict(
+        {"success": True, "already_joined": True, "session_id": "game-7", "status": "in_progress",
+         "position": 1, "participants": 2, "max_participants": 2},
+        session_id="game-7",
+        transport="rest",
+    )
 
-    assert not hasattr(tournament, "name")
-    # If a "name" key is ever present in a payload (it shouldn't be), it's
-    # only reachable via raw, never promoted to a typed attribute.
-    assert tournament.raw.get("name") == "Ignored"
-
-
-def test_tournament_viewer_from_dict_defaults():
-    viewer = TournamentViewer.from_dict({})
-
-    assert viewer.agent_id is None
-    assert viewer.is_tournament_participant is False
-    assert viewer.active_child_session_ids == []
-    assert viewer.next_actions == []
+    assert result.already_joined is True
+    assert result.status == "in_progress"
+    assert result.current_participants == 2
+    assert result.transport == "rest"
 
 
 def test_message_from_dict_prefers_platform_seq_over_legacy_index():

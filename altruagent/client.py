@@ -35,13 +35,38 @@ from dotenv import load_dotenv
 from ._responses import _parse_error_body, _parse_json_body
 from .auth import ApiKeyAuth, AuthStrategy
 from .errors import AuthenticationError, ConfigurationError, PlatformError
-from .models import Agent, AgentSessions, Tournament
+from .game import _normalize_game_server_url
+from .mcp_transport import call_tool
+from .models import Agent, AgentSessions, JoinResult, TournamentDetail
 
 if TYPE_CHECKING:
     from .game import GameSession
     from .mcp_game import MCPGameSession
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
+
+# Where join_session lives when nothing else says so: the deployed control
+# plane's GameAPI (the host GET /competitions/{id} reports as game_server_url
+# for the deployed platform's running matches), with its MCP mount.
+MCP_URL_ENV = "ALTRUAGENT_MCP_URL"
+KNOWN_MCP_URLS = {
+    "https://api.altruagent-game.com": "https://gameapi.altruagent-game.com/mcp",
+}
+
+
+# join_session failures that say nothing about the join itself (no tool
+# answer at all, or GameAPI couldn't reach the control plane): the REST
+# route is tried instead.
+_MCP_JOIN_FALLBACK_CODES = frozenset({None, "BACKEND_UNAVAILABLE"})
+
+
+def _normalize_mcp_url(value: str) -> str:
+    """``ALTRUAGENT_MCP_URL`` may be a bare GameAPI host or its full ``/mcp``
+    URL; either way the result is a full URL ending in ``/mcp`` (scheme rule
+    as for ``game_server_url``).
+    """
+    url = _normalize_game_server_url(value)
+    return url if url.endswith("/mcp") else f"{url}/mcp"
 
 
 class AltruAgentClient:
@@ -68,6 +93,7 @@ class AltruAgentClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         load_env_file: bool = True,
         transport: httpx.BaseTransport | None = None,
+        mcp_url: str | None = None,
     ) -> None:
         if load_env_file:
             # No-op if there's no .env file; explicit args / real env vars
@@ -95,6 +121,7 @@ class AltruAgentClient:
 
         self.control_url = control_url.rstrip("/")
         self.auth = auth
+        self._mcp_url = mcp_url
         self._access_token: str | None = None
         self._http = httpx.Client(base_url=self.control_url, timeout=timeout, transport=transport)
 
@@ -155,79 +182,84 @@ class AltruAgentClient:
         data = self.request("GET", "/agents/me/sessions")
         return AgentSessions.from_dict(data if isinstance(data, dict) else {}, client=self)
 
-    def tournaments(self) -> list[Tournament]:
-        """``GET /tournaments`` — public listing of active tournaments (see
-        Agent_ACP backend/src/index.ts:442, ``listActiveTournaments`` /
-        ``db/tournaments.ts``'s ``getActiveTournaments``).
+    def tournament(self, tournament_id: str) -> TournamentDetail:
+        """``GET /tournaments/{id}`` — one tournament: its status and phase,
+        Swiss standings, and (once complete) the final ranking. The rounds,
+        bracket, finals and event log are in ``.raw``.
 
-        Exactly one request; no per-tournament detail calls. Entries are raw
-        DB rows, returned in whatever order the server gives them (newest
-        `created_at` first, currently). The backend already filters this to
-        `waiting`/`in_progress` only (capped at 10) — completed tournaments
-        never appear here, so no client-side filtering is applied on top.
-        """
-        data = self.request("GET", "/tournaments")
-        rows = data.get("tournaments") if isinstance(data, dict) else None
-        return [Tournament.from_dict(row) for row in (rows or [])]
-
-    def tournament(self, tournament_id: str) -> Tournament:
-        """``GET /tournaments/{id}`` — one tournament's detail, including this
-        agent's ``viewer`` membership info (present because this uses the
-        authenticated request path, so an agent JWT is sent even though the
-        route itself only optionally requires one).
-
-        Note: this GET is **not side-effect-free** on the current backend.
-        ``getTournament`` (tournamentService.ts) can, as a side effect of
-        this same call: advance a tournament past an expired start timer
-        (starting it), and reconcile any child match GameAPI already
-        finished (recomputing the leaderboard, scheduling the next batch of
-        matches, or completing the tournament). This is real platform
-        behavior, not something the SDK compensates for or hides.
+        Public on the platform; sent with this agent's JWT anyway (the route
+        accepts an optional token). A tournament id that doesn't exist (or a
+        retired round-robin tournament) is a ``PlatformError`` with
+        ``status_code == 404``. The server may use this read to advance the
+        tournament (close games past their join deadline, start the next
+        round) — that's platform behavior, not something to compensate for.
         """
         data = self.request("GET", f"/tournaments/{tournament_id}")
-        tournament_data = data.get("tournament") if isinstance(data, dict) else None
-        viewer_data = data.get("viewer") if isinstance(data, dict) else None
-        return Tournament.from_dict(tournament_data or {}, viewer=viewer_data)
+        return TournamentDetail.from_dict(data if isinstance(data, dict) else {})
 
-    def join_tournament(self, tournament_id: str) -> dict:
-        """``POST /tournaments/{id}/join``. Identity comes entirely from the
-        authenticated, claimed agent's JWT — no request body is sent or
-        needed (verified against Agent_ACP index.ts:462, which never reads
-        ``req.body``).
-
-        Returns the parsed JSON response as a plain dict (a dedicated model
-        would add little value here — the only fields worth reading are
-        ``status``/``position``/``next_actions``, all already anonymous
-        dict keys). Idempotent: rejoining a tournament you're already in
-        returns success with ``already_joined: true`` rather than an error.
-        If this join fills the tournament's capacity, the tournament starts
-        synchronously as part of this same call — every round-robin child
-        competition is created before this returns. A full/already-started/
-        nonexistent tournament all collapse to the same
-        ``PlatformError(error_code="join_failed")`` — the backend does not
-        distinguish them with separate machine codes (and, notably, a
-        nonexistent tournament returns 400 here, not the 404 that
-        ``tournament()`` would give for the same id).
+    def competition(self, session_id: str) -> dict:
+        """``GET /competitions/{id}`` — one competition's row, as a plain dict:
+        ``status``, ``tournament_id``, and once it's over ``winner_agent_ids``,
+        ``results`` and ``failure_reason``. ``game_server_url`` is included
+        only while it's ``in_progress``.
         """
-        return self.request("POST", f"/tournaments/{tournament_id}/join")
+        data = self.request("GET", f"/competitions/{session_id}")
+        return data if isinstance(data, dict) else {}
 
-    def leave_tournament(self, tournament_id: str) -> dict:
-        """``POST /tournaments/{id}/leave``. No request body.
-
-        Idempotent when not a member. Only succeeds while the tournament is
-        still ``waiting`` — once it has started there is no code path to
-        leave it, and this always fails with
-        ``PlatformError(error_code="leave_failed")``.
+    @property
+    def mcp_url(self) -> str | None:
+        """The platform's MCP endpoint for session tools like ``join_session``
+        (gameplay tools use each match's own ``game_server_url`` instead):
+        ``mcp_url=`` if given, else ``ALTRUAGENT_MCP_URL``, else the deployed
+        platform's endpoint when ``control_url`` is the deployed control plane.
+        ``None`` when none of those applies (e.g. a local backend without
+        ``ALTRUAGENT_MCP_URL``) — ``join_competition`` then joins through the
+        control plane's REST route instead.
         """
-        return self.request("POST", f"/tournaments/{tournament_id}/leave")
+        configured = self._mcp_url or os.environ.get(MCP_URL_ENV)
+        if configured:
+            return _normalize_mcp_url(configured)
+        return KNOWN_MCP_URLS.get(self.control_url)
+
+    def join_competition(self, session_id: str) -> JoinResult:
+        """Join one competition by id — a tournament game the platform paired
+        this agent into (``AgentSessions.tournament_matches``, or the id the
+        owner's dashboard shows), or any open competition.
+
+        MCP first: calls the ``join_session`` tool at ``mcp_url``. Only if
+        that endpoint is unknown or can't be used at all (a network or HTTP
+        failure, no tool answer) does it make the same join through the
+        control plane's ``POST /competitions/{id}/join``, which needs no
+        GameAPI. Joining is idempotent: an agent that is already in the
+        competition gets success with ``already_joined=True``.
+
+        A refusal raises ``PlatformError`` (``MCPToolError`` over MCP) with
+        the platform's ``error_code`` — for tournament games:
+        ``not_in_this_match`` (this game is reserved for other agents) and
+        ``join_deadline_passed`` (its join window closed; the game counts as
+        a loss). Over MCP a backend refusal without its own code arrives as
+        ``SESSION_JOIN_FAILED``; over REST as ``join_failed``.
+        """
+        mcp_url = self.mcp_url
+        if mcp_url:
+            try:
+                payload = call_tool(self, mcp_url, "join_session", {"session_id": session_id})
+                return JoinResult.from_dict(payload, session_id=session_id, transport="mcp")
+            except PlatformError as exc:
+                if exc.error_code not in _MCP_JOIN_FALLBACK_CODES:
+                    raise  # the platform answered: a real refusal, the REST route would say the same
+                # No tool answer (endpoint unreachable, HTTP error), or GameAPI
+                # couldn't reach the control plane: the join itself is a
+                # control-plane operation, so make it there directly.
+        data = self.request("POST", f"/competitions/{session_id}/join")
+        return JoinResult.from_dict(data if isinstance(data, dict) else {}, session_id=session_id, transport="rest")
 
     def game(self, session_id: str, game_server_url: str) -> "GameSession":
         """Open a handle to one already-known GameAPI match.
 
         Both ``session_id`` and ``game_server_url`` must be supplied
-        explicitly — this milestone does not discover them (that's the
-        control plane's ``/competitions``/``/tournaments`` job, not yet
-        implemented here). ``game_server_url`` is accepted with or without a
+        explicitly — this does not discover them (``client.sessions()`` and
+        ``Match.game()`` do that). ``game_server_url`` is accepted with or without a
         scheme: the real control plane hands it back as a bare host (see
         Agent_ACP/backend/src/services/gameAPIService.ts's
         ``getGameAPIServerUrl``), so ``http://`` is prepended automatically

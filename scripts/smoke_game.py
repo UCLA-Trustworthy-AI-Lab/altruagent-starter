@@ -1,10 +1,10 @@
-"""Milestone 2 + 3A/3B/4A/4B/4C LIVE end-to-end smoke test — developer/manual tool only.
+"""Milestone 2 + 3A/4A/4B/4C LIVE end-to-end smoke test — developer/manual tool only.
 
 Proves the starter SDK can play a real match against the REAL deployed
 AltruAgent platform (Agent_ACP), not a mock. This is not contestant-facing
 functionality — it's an integration check for people working on the SDK
-itself. It creates real, if disposable, platform state: one or two
-temporary second agents and one or two temporary competitions/tournaments.
+itself. It creates real, if disposable, platform state: one temporary
+second agent and one or two temporary competitions.
 
 Milestone 6 note: since `Match.game()` now builds an `MCPGameSession` (MCP
 is the production path — see `altruagent.runner`), this script's own direct
@@ -17,12 +17,13 @@ incidentally proves REST and MCP reads agree on the same underlying session,
 in addition to its original purpose. `scripts/acceptance_test.py --mcp` is
 the dedicated, purpose-built MCP proof (see its own docstring).
 
-Three modes. The default and `--tournament` share all of their setup/
-cleanup machinery; `--concurrent` (Milestone 4C) is a self-contained,
-separate check with its own two-competition setup (see
-`run_concurrent_check`) — it doesn't fit the single-match mover/RESIGN
-shape the other two modes share, since its whole point is proving *two*
-matches run at once.
+Two modes. `--concurrent` (Milestone 4C) is a self-contained, separate
+check with its own two-competition setup (see `run_concurrent_check`) — it
+doesn't fit the default mode's single-match mover/RESIGN shape, since its
+whole point is proving *two* matches run at once. (The old `--tournament`
+mode exercised the platform's retired round-robin tournaments and is gone;
+platform tournament games are ordinary competitions joined by id — see
+`altruagent.autojoin` and its unit tests.)
 
 **Default (standalone competition, Milestones 2 + 3A):**
 
@@ -61,21 +62,6 @@ matches run at once.
    free again. Ordinary move submission was already proven live in
    Milestones 2/3A and isn't re-proven here.
 
-**`--tournament` (Milestone 3B):** identical agent setup (steps 1-3 above,
-substituting `POST /admin/tournaments/create` for the competition create
-call), then:
-
-4. Joins both agents via the new `client.join_tournament(tournament_id)`
-   (not the low-level competition-join path) and confirms the second join
-   causes (or already sees) the tournament reach `in_progress`.
-5. Uses `primary.sessions()` to find the *tournament-spawned* child match by
-   `tournament_id` (not by an already-known `session_id` — that's the thing
-   this mode proves that the default mode doesn't), then resolves it via
-   `match.game()` exactly as before.
-6-7. Same state-fetch / run_once()-driven-RESIGN as the default mode.
-8. Best-effort (single, non-looping) check of the tournament's final status
-   after cleanup — not a fragile polling loop.
-
 **`--concurrent` (Milestone 4C):** see `run_concurrent_check`'s own
 docstring for the full flow — in short: two independent standalone
 competitions, one shared temporary opponent, confirms both matches are
@@ -93,7 +79,6 @@ agent-deletion endpoint, so this script does not invent one.
 
 Run:
     python scripts/smoke_game.py
-    python scripts/smoke_game.py --tournament
     python scripts/smoke_game.py --concurrent
 """
 
@@ -213,27 +198,6 @@ def join_competition(client: AltruAgentClient, session_id: str) -> None:
     client.request("POST", f"/competitions/{session_id}/join")
 
 
-def create_tournament(http: httpx.Client, control_url: str, human_token: str) -> str:
-    """POST /admin/tournaments/create. Returns tournament_id.
-
-    Verified against Agent_ACP/backend/src/index.ts:758 — only `game_type`
-    and `max_participants` are currently required (unlike competitions,
-    tournaments have no preset system at all). Same hosting-cap rules as
-    `create_competition` apply (competitions + tournaments share one active
-    per-user hosting count, backend/src/services/hostingService.ts).
-    """
-    response = http.post(
-        f"{control_url}/admin/tournaments/create",
-        json={"game_type": COMPETITION_GAME_TYPE, "max_participants": 2},
-        headers={"Authorization": f"Bearer {human_token}"},
-    )
-    body = _json_or_fail(response, "tournament creation")
-    tournament_id = body.get("tournament_id")
-    if not tournament_id:
-        _fail("Tournament creation response did not include tournament_id.")
-    return tournament_id
-
-
 def _poll_until(
     poll: Callable[[], dict],
     is_ready: Callable[[dict], bool],
@@ -285,37 +249,6 @@ def wait_for_in_progress(
         timeout_message=lambda last: (
             "Competition did not reach in_progress with a game_server_url "
             f"within {timeout_seconds:.0f}s (last status: {last.get('status')!r})."
-        ),
-    )
-
-
-def wait_for_tournament_in_progress(
-    poll: Callable[[], dict],
-    *,
-    timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS,
-    interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
-    sleep: Callable[[float], None] = time.sleep,
-    now: Callable[[], float] = time.monotonic,
-) -> dict:
-    """Poll `poll()` (returns a tournament dict, e.g. the `"tournament"` key
-    of `GET /tournaments/{id}`'s response body) until status=in_progress, or
-    raise SmokeTestError once `timeout_seconds` has elapsed.
-
-    Unlike `wait_for_in_progress`, this does not wait for a `game_server_url`
-    on the tournament itself — the actual child match's URL is resolved
-    separately, via `client.sessions()` + `Match.game()`, not read off the
-    tournament object.
-    """
-    return _poll_until(
-        poll,
-        lambda last: last.get("status") == "in_progress",
-        timeout_seconds=timeout_seconds,
-        interval_seconds=interval_seconds,
-        sleep=sleep,
-        now=now,
-        timeout_message=lambda last: (
-            f"Tournament did not reach in_progress within {timeout_seconds:.0f}s "
-            f"(last status: {last.get('status')!r})."
         ),
     )
 
@@ -530,28 +463,15 @@ def run_concurrent_check(primary: AltruAgentClient, http: httpx.Client, control_
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--tournament",
-        action="store_true",
-        help=(
-            "Run the tournament-registration smoke test (Milestone 3B) instead "
-            "of the default standalone-competition one (Milestones 2 + 3A)."
-        ),
-    )
-    parser.add_argument(
         "--concurrent",
         action="store_true",
         help=(
             "Run the Milestone 4C concurrency check instead: two independent "
             "standalone competitions, proving the supervisor runs two real "
-            "worker processes for them at once. Mutually exclusive with "
-            "--tournament."
+            "worker processes for them at once."
         ),
     )
     args = parser.parse_args()
-
-    if args.concurrent and args.tournament:
-        print("--concurrent and --tournament cannot be combined.")
-        return 1
 
     if args.concurrent:
         print("=== Milestone 4C LIVE concurrency smoke test ===")
@@ -569,8 +489,7 @@ def main() -> int:
             primary.close()
             http.close()
 
-    mode_label = "tournament" if args.tournament else "standalone competition"
-    print(f"=== Milestone 2 + 3A/3B LIVE smoke test ({mode_label} mode) ===")
+    print("=== Milestone 2 + 3A LIVE smoke test (standalone competition mode) ===")
     print("This calls the REAL deployed AltruAgent platform. It is a developer")
     print("diagnostic tool, not contestant-facing functionality.\n")
 
@@ -583,7 +502,6 @@ def main() -> int:
     http = httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)
     opponent: AltruAgentClient | None = None
     primary_session = None
-    tournament_id: str | None = None
     cleaned_up = False
 
     try:
@@ -612,103 +530,59 @@ def main() -> int:
             _fail(f"Temporary agent '{name}' was not claimed successfully.")
         _checkpoint(f"temporary opponent created and claimed ({name})")
 
-        if args.tournament:
-            tournament_id = create_tournament(http, control_url, human_token)
-            _checkpoint(f"tournament created (tournament_id={tournament_id})")
+        session_id = create_competition(http, control_url, human_token)
+        _checkpoint(f"competition created (session_id={session_id})")
 
-            primary.join_tournament(tournament_id)
-            opponent.join_tournament(tournament_id)
-            _checkpoint("both agents joined tournament (via client.join_tournament)")
+        join_competition(primary, session_id)
+        join_competition(opponent, session_id)
+        _checkpoint("both agents joined")
 
-            wait_for_tournament_in_progress(
-                lambda: primary.request("GET", f"/tournaments/{tournament_id}")["tournament"]
+        competition = wait_for_in_progress(
+            lambda: primary.request("GET", f"/competitions/{session_id}")
+        )
+        game_server_url = competition["game_server_url"]
+        _checkpoint(f"GameAPI session started (game_server_url={game_server_url})")
+
+        # Milestone 3A: verify discovery finds this same match before doing
+        # anything else with GameAPI for the primary agent.
+        discovered_match = next(
+            (m for m in primary.sessions().active if m.session_id == session_id), None
+        )
+        if discovered_match is None:
+            _fail(
+                f"client.sessions() did not list session_id={session_id!r} in "
+                "active_sessions after the competition started."
             )
-            _checkpoint("tournament reached in_progress")
-
-            # Milestone 3B: find the tournament-spawned child match by
-            # tournament_id — NOT by an already-known session_id. That's the
-            # thing this mode proves that the default mode doesn't.
-            discovered_match = next(
-                (m for m in primary.sessions().active if m.tournament_id == tournament_id),
-                None,
+        if discovered_match.status != "in_progress" or discovered_match.game_type != COMPETITION_GAME_TYPE:
+            _fail(
+                "Discovered match has unexpected fields (status="
+                f"{discovered_match.status!r}, game_type={discovered_match.game_type!r})."
             )
-            if discovered_match is None:
-                _fail(
-                    f"client.sessions() did not list an active match with "
-                    f"tournament_id={tournament_id!r}."
-                )
-            session_id = discovered_match.session_id
-            _checkpoint(
-                f"active match discovered via client.sessions() (session_id={session_id})"
+        if discovered_match.game_server_url is not None:
+            _fail(
+                "Expected the freshly discovered Match to have no resolved "
+                f"game_server_url yet, but got {discovered_match.game_server_url!r} — "
+                "GET /agents/me/sessions is not expected to include one."
             )
+        _checkpoint("active match discovered via client.sessions()")
 
-            # rest_game(), deliberately — see the concurrent-mode comment
-            # above: this check's own state reads go over REST directly;
-            # match.game() (MCP) is what the production runner uses below.
-            primary_session = discovered_match.rest_game()
-            _checkpoint("GameAPI URL resolved lazily via match.rest_game()")
-
-            # The opponent reuses the already-resolved, normalized URL rather
-            # than repeating its own sessions()+game() lookup purely for its
-            # own convenience — see check_game.py's script docstring for the
-            # same "opponent may use its existing construction" pattern.
-            opponent_session = opponent.game(
-                session_id=session_id, game_server_url=primary_session.game_server_url
+        # Lazy-resolution path: Match.rest_game() -> GET /competitions/{id}
+        # -> game_server_url -> GameSession. Deliberately NOT
+        # client.game(...) directly for the primary agent — that's the
+        # thing this step proves. rest_game() (not game()/MCP) so this
+        # check's own state read stays over REST — see the concurrent-
+        # mode comment above for why that's deliberate, not a fallback.
+        primary_session = discovered_match.rest_game()
+        if not discovered_match.game_server_url:
+            _fail("discovered_match.game_server_url was not populated after match.rest_game().")
+        if not primary_session.game_server_url.startswith(("http://", "https://")):
+            _fail(
+                "GameSession.game_server_url is not a normalized URL: "
+                f"{primary_session.game_server_url!r}"
             )
-        else:
-            session_id = create_competition(http, control_url, human_token)
-            _checkpoint(f"competition created (session_id={session_id})")
+        _checkpoint("GameAPI URL resolved lazily via match.rest_game()")
 
-            join_competition(primary, session_id)
-            join_competition(opponent, session_id)
-            _checkpoint("both agents joined")
-
-            competition = wait_for_in_progress(
-                lambda: primary.request("GET", f"/competitions/{session_id}")
-            )
-            game_server_url = competition["game_server_url"]
-            _checkpoint(f"GameAPI session started (game_server_url={game_server_url})")
-
-            # Milestone 3A: verify discovery finds this same match before doing
-            # anything else with GameAPI for the primary agent.
-            discovered_match = next(
-                (m for m in primary.sessions().active if m.session_id == session_id), None
-            )
-            if discovered_match is None:
-                _fail(
-                    f"client.sessions() did not list session_id={session_id!r} in "
-                    "active_sessions after the competition started."
-                )
-            if discovered_match.status != "in_progress" or discovered_match.game_type != COMPETITION_GAME_TYPE:
-                _fail(
-                    "Discovered match has unexpected fields (status="
-                    f"{discovered_match.status!r}, game_type={discovered_match.game_type!r})."
-                )
-            if discovered_match.game_server_url is not None:
-                _fail(
-                    "Expected the freshly discovered Match to have no resolved "
-                    f"game_server_url yet, but got {discovered_match.game_server_url!r} — "
-                    "GET /agents/me/sessions is not expected to include one."
-                )
-            _checkpoint("active match discovered via client.sessions()")
-
-            # Lazy-resolution path: Match.rest_game() -> GET /competitions/{id}
-            # -> game_server_url -> GameSession. Deliberately NOT
-            # client.game(...) directly for the primary agent — that's the
-            # thing this step proves. rest_game() (not game()/MCP) so this
-            # check's own state read stays over REST — see the concurrent-
-            # mode comment above for why that's deliberate, not a fallback.
-            primary_session = discovered_match.rest_game()
-            if not discovered_match.game_server_url:
-                _fail("discovered_match.game_server_url was not populated after match.rest_game().")
-            if not primary_session.game_server_url.startswith(("http://", "https://")):
-                _fail(
-                    "GameSession.game_server_url is not a normalized URL: "
-                    f"{primary_session.game_server_url!r}"
-                )
-            _checkpoint("GameAPI URL resolved lazily via match.rest_game()")
-
-            opponent_session = opponent.game(session_id=session_id, game_server_url=game_server_url)
+        opponent_session = opponent.game(session_id=session_id, game_server_url=game_server_url)
 
         primary_state = primary_session.state()
         _checkpoint("initial state fetched")
@@ -776,26 +650,12 @@ def main() -> int:
         print("[OK] cleanup: match ended via runtime-driven discovery + resign")
         cleaned_up = True
 
-        if args.tournament:
-            # Best-effort, single check — not a poll loop. GameAPI reports
-            # the match result to the backend as a fire-and-forget background
-            # task, so it may not have landed yet; that's expected, not a
-            # failure of this test.
-            try:
-                final_tournament = primary.tournament(tournament_id)
-                print(f"[INFO] tournament status after cleanup: {final_tournament.status}")
-            except AltruAgentError as exc:
-                print(f"[INFO] could not fetch final tournament status (non-fatal): {exc}")
-
         print(
             f"\n[NOTE] Temporary agent '{name}' remains claimed — the current backend "
             "has no safe agent-deletion endpoint, so it was not deleted."
         )
 
-        if args.tournament:
-            print("\nMILESTONE 3B + 4A/4B LIVE TOURNAMENT SMOKE TEST PASSED")
-        else:
-            print("\nMILESTONE 3A + 4A/4B LIVE SMOKE TEST PASSED")
+        print("\nMILESTONE 3A + 4A/4B LIVE SMOKE TEST PASSED")
         return 0
 
     except (SmokeTestError, AltruAgentError) as exc:

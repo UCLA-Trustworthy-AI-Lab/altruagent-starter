@@ -64,6 +64,9 @@ class WorkerInput(NamedTuple):
     tournament_id: str | None
     game_type: str | None
     agent_id: str
+    # ``MODULE[:FACTORY]`` to build the contestant from (``--agent``); None
+    # keeps the default, ``agent.agent.create_agent``.
+    agent_spec: str | None = None
 
 
 def run_worker(
@@ -75,8 +78,9 @@ def run_worker(
     run_match_fn: Callable[..., "GameState"] = _default_run_match,
 ) -> int:
     """Play exactly one match: build a client, reconstruct its ``Match``,
-    call ``agent.agent.create_agent()`` exactly once, and hand the result to
-    the existing, unmodified ``run_match``.
+    call ``agent.agent.create_agent()`` (or ``worker_input.agent_spec``'s
+    factory) exactly once, and hand the result to the existing, unmodified
+    ``run_match``.
 
     Returns an exit code (``EXIT_*`` above) rather than raising — this is
     what ``_process_entry`` turns into a real process exit code, and it's
@@ -93,16 +97,21 @@ def run_worker(
 
     client: AltruAgentClient | None = None
     try:
-        if agent_module is None:
-            import agent.agent as agent_module  # the contestant's own code
+        if worker_input.agent_spec:
+            from .agent_loader import load_agent_factory
 
-        create_agent = getattr(agent_module, "create_agent", None)
-        if not callable(create_agent):
-            print(
-                f"[worker pid={pid}] agent.agent.create_agent is missing or "
-                "not callable — nothing to play this match with."
-            )
-            return EXIT_UNEXPECTED
+            create_agent = load_agent_factory(worker_input.agent_spec)
+        else:
+            if agent_module is None:
+                import agent.agent as agent_module  # the contestant's own code
+
+            create_agent = getattr(agent_module, "create_agent", None)
+            if not callable(create_agent):
+                print(
+                    f"[worker pid={pid}] agent.agent.create_agent is missing or "
+                    "not callable — nothing to play this match with."
+                )
+                return EXIT_UNEXPECTED
 
         client = client_factory()
         match = match_factory(
