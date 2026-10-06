@@ -109,6 +109,12 @@ CLI prints a notice pointing to the Official Agent Key instead
 (``altruagent.notices``). The earlier milestones' platform-agent pieces
 (``client.sessions()``, ``client.tournaments()``, ``run_forever``,
 ``run_forever_concurrent``) stay importable for reference only.
+
+The runtime is split by kind of game: ``python -m agent --tournament`` plays
+tournament games, ``--match`` test matches (Testing), and both flags together
+play both in one process. The supervisor filters assignments on ``context``
+(``altruagent.supervisor.assignment_kind``; none means a tournament game) and
+says once per game when a game of the other kind is waiting.
 """
 
 from .auth import ApiKeyAuth, SeatClaimError, SeatGrantAuth

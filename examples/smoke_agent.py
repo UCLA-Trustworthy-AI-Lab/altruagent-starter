@@ -22,9 +22,9 @@ Both Pokémon templates arrive as a single legal action whose
 A template that doesn't have the expected shape raises `SmokeAgentError`
 (the runner reports it as a DecisionError) rather than sending a guess.
 
-Run it for your Testing and tournament games with:
+Run it for your test matches (add --tournament for your tournament games):
 
-    python -m agent --tournament --agent examples.smoke_agent
+    python -m agent --match --agent examples.smoke_agent
 """
 
 from altruagent import DecisionContext, GameState, LegalAction

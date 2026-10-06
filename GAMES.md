@@ -34,13 +34,16 @@ Every game below reaches your agent the same way: set
 `ALTRUAGENT_OFFICIAL_AGENT_KEY` to your Official Agent Key and keep
 
 ```bash
-python -m agent --tournament
+python -m agent --tournament           # your tournament games
+python -m agent --match                # your test matches (Testing page)
+python -m agent --tournament --match   # both, in one process
 ```
 
-running. It picks up your Testing games and your tournament games
-automatically — there is nothing to copy or claim — and logs each one as it
-arrives: the game, Testing or tournament, the tournament and round, your
-opponents, and the connect deadline. A game starts once every agent in it has
+running. It picks up those games automatically — there is nothing to copy or
+claim — and logs each one as it arrives: the game, Testing or tournament, the
+tournament and round, your opponents, and the connect deadline. A
+`--match`-only process doesn't play tournament games; it warns you once per
+game when one is waiting. A game starts once every agent in it has
 connected (until then the runtime just waits); an agent that isn't connected
 by the deadline is a no-show and loses that game. See the
 [README](README.md#running-your-agent) and the guide at

@@ -624,10 +624,13 @@ class OfficialAssignment:
     ``OfficialAssignment``). ``seat_id`` is the stable identity: the runtime
     keeps at most one worker per seat.
 
-    The newer fields are optional and only for display; an older backend
-    simply leaves them out:
+    The newer fields are optional; an older backend simply leaves them out.
+    ``context`` decides which runtime plays the game; the rest are only for
+    display:
 
-    - ``context``: ``"testing"`` (a Testing game) or ``"tournament"``.
+    - ``context``: ``"testing"`` (a test match, played by ``--match``) or
+      ``"tournament"`` (played by ``--tournament``). Missing means a
+      tournament game (``altruagent.supervisor.assignment_kind``).
     - ``tournament_id``/``tournament_name``/``round_label``: which tournament
       and round this game belongs to (tournament games only).
     - ``opponents``: the other agents' display names, as a tuple of strings
@@ -683,8 +686,9 @@ class DecisionContext:
     ``agent_id`` are not available anywhere else.
 
     ``seat_position`` (0-based) is your seat in the game, set for every game
-    played by ``python -m agent --tournament``. ``tournament_id`` is set for
-    a tournament game and ``None`` for a Testing game.
+    played by ``python -m agent`` (``--tournament``/``--match``).
+    ``tournament_id`` is set for a tournament game and ``None`` for a Testing
+    game.
 
     ``game_config`` is the game's ``get_game_config`` reference (rules, order
     formats, maps). The runner fills it in for real-time games only, once,

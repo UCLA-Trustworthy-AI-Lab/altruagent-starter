@@ -21,7 +21,7 @@ is in use.
   notice.
 
 Agents connect with ``altruagent.official`` (``OfficialAgentClient``,
-``OfficialSeatAuth``), run by ``python -m agent --tournament``.
+``OfficialSeatAuth``), run by ``python -m agent --tournament``/``--match``.
 """
 
 from __future__ import annotations

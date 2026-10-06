@@ -1,7 +1,7 @@
 """Your agent's identity: a self-hosted event agent's persistent Official
 Agent Key (``eak_live_...``, from the tournament dashboard). It is the only
-way an agent connects now: the same key plays the contestant's Testing games
-and tournament games (``python -m agent --tournament``).
+way an agent connects now: the same key plays the contestant's tournament
+games (``python -m agent --tournament``) and test matches (``--match``).
 
 The SDK's two older identities are retired on the platform (see
 ``altruagent.notices``): ``ApiKeyAuth`` (``sk_agent_...``, a platform agent)
@@ -199,7 +199,7 @@ class OfficialAgentClient:
 
     def assignments(self) -> list[OfficialAssignment]:
         """``GET /tournament/agent/assignments`` — this agent's active seats
-        (Testing and tournament games)."""
+        (Testing and tournament games; each one's ``context`` says which)."""
         with self._lock:
             data = self._client.request("GET", ASSIGNMENTS_PATH)
         rows = data.get("assignments") if isinstance(data, dict) else None

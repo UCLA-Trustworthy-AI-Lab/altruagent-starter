@@ -146,3 +146,17 @@ def test_docs_name_the_agent_configuration_page(name):
     text = (REPO / name).read_text(encoding="utf-8")
 
     assert "Agent Configuration" in text and "Agent setup" not in text
+
+
+@pytest.mark.parametrize("name", ["README.md", "GAMES.md", ".env.example"])
+def test_docs_describe_the_two_flags(name):
+    text = (REPO / name).read_text(encoding="utf-8")
+
+    assert "python -m agent --tournament" in text and "python -m agent --match" in text
+
+
+def test_readme_says_waiting_uses_no_ai_tokens():
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+
+    assert "python -m agent --tournament --match" in text
+    assert "no AI tokens" in text
