@@ -1,10 +1,10 @@
-"""CLI tests for ``python -m agent``'s single flow and its retired modes.
+"""CLI tests for ``python -m agent``'s retired modes and ``--help``.
 
-``--tournament``/``--check-tournament`` are covered in
+``--tournament``/``--match``/``--check-tournament`` are covered in
 tests/test_main_tournament.py. Here: the retired modes (no mode, the old
 platform API-key mode; ``--claim``, Testing claim codes) only print a notice
 pointing to the Official Agent Key and never touch the network, and
-``--help`` describes the one flow.
+``--help`` describes the two flags.
 """
 
 from __future__ import annotations
@@ -42,6 +42,8 @@ def no_network(monkeypatch):
 
 def _assert_points_to_the_official_key(out: str) -> None:
     assert "python -m agent --tournament" in out
+    assert "python -m agent --match" in out
+    assert "python -m agent --tournament --match" in out
     assert "ALTRUAGENT_OFFICIAL_AGENT_KEY" in out
     assert AGENT_GUIDE_URL in out
 
@@ -75,7 +77,7 @@ def test_claim_prints_the_claim_codes_retirement_notice(argv, capsys):
 
     out = capsys.readouterr().out
     assert out.splitlines()[0] == f"{CLAIM_CODES_RETIRED}."
-    assert out.startswith("Testing claim codes were retired; run with --tournament and your Official Agent Key")
+    assert out.startswith("Testing claim codes were retired; run with --match and your Official Agent Key")
     _assert_points_to_the_official_key(out)
     assert CLAIM_TOKEN not in out
 
@@ -99,18 +101,20 @@ def test_agent_without_a_mode_is_a_usage_error(capsys):
         agent_main.main(["--agent", "examples.llm_agent"])
 
     assert exc_info.value.code == 2
-    assert "--tournament" in capsys.readouterr().err
+    assert "--tournament, --match or --check-tournament" in capsys.readouterr().err
 
 
-def test_help_describes_the_one_flow(capsys):
+def test_help_describes_the_two_flags(capsys):
     with pytest.raises(SystemExit) as exc_info:
         agent_main.main(["--help"])
 
     assert exc_info.value.code == 0
     out = capsys.readouterr().out
-    assert "--tournament" in out and "--check-tournament" in out and "--agent" in out
+    assert "--tournament" in out and "--match" in out and "--check-tournament" in out and "--agent" in out
     assert "ALTRUAGENT_OFFICIAL_AGENT_KEY" in out
-    assert "Testing and tournament games" in out
+    assert "--tournament (your tournament games), --match (your test\n     matches) or both" in out
+    assert "python -m agent --tournament --match" in out
+    assert "no AI tokens" in out
     assert AGENT_GUIDE_URL in out
     # Retired modes are gone from the help text.
     assert "--claim" not in out

@@ -220,7 +220,7 @@ def test_retired_claim_codes_point_to_the_official_agent_key():
 
     error = exc_info.value
     assert (error.status_code, error.error_code) == (410, "claim_codes_retired")
-    assert str(error).startswith("Testing claim codes were retired; run with --tournament and your Official Agent Key")
+    assert str(error).startswith("Testing claim codes were retired; run with --match and your Official Agent Key")
     assert "ALTRUAGENT_OFFICIAL_AGENT_KEY" in str(error) and CLAIM_TOKEN not in str(error)
 
 

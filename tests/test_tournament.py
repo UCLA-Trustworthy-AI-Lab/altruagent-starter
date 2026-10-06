@@ -20,12 +20,18 @@ from altruagent.mcp_game import MCPGameSession
 from altruagent.models import OfficialAssignment, SeatGrant
 from altruagent.official import AUTHENTICATE_PATH, OfficialAgentClient, OfficialAgentError
 from altruagent.supervisor import (
+    ALL_KINDS,
     MISSING_POLLS_BEFORE_STOP,
+    TESTING,
+    TEST_MATCH_WAITING_NOTE,
+    TOURNAMENT,
     WAITING_MESSAGE,
     TournamentState,
+    assignment_kind,
     describe_assignment,
     run_tournament_forever,
     run_tournament_once,
+    tournament_waiting_warning,
 )
 from altruagent.worker import (
     EXIT_MATCH_FAILURE,
@@ -77,18 +83,19 @@ class FakeOfficial:
 
 
 class Harness:
-    def __init__(self, *listings, cooldown=60.0):
+    def __init__(self, *listings, cooldown=60.0, kinds=ALL_KINDS):
         self.official = FakeOfficial(*listings)
         self.state = TournamentState()
         self.factory = FakeProcessFactory()
         self.log: list[str] = []
         self.clock = {"t": 0.0}
         self.cooldown = cooldown
+        self.kinds = kinds
 
     def tick(self, advance=1.0):
         self.clock["t"] += advance
         run_tournament_once(
-            self.official, self.state, agent_spec=SPEC, now=lambda: self.clock["t"],
+            self.official, self.state, agent_spec=SPEC, kinds=self.kinds, now=lambda: self.clock["t"],
             cooldown_seconds=self.cooldown, process_factory=self.factory, log=self.log.append,
             wall_now=lambda: NOW,
         )
@@ -568,6 +575,174 @@ def test_real_client_revoked_key_still_stops_the_runtime():
     with pytest.raises(OfficialAgentError) as exc_info:
         h.tick()
     assert exc_info.value.error_code == "invalid_official_agent_key"
+
+
+# -- which kinds of game a runtime plays (--tournament / --match) ----------------------------
+
+MATCH_ONLY = frozenset({TESTING})
+TOURNAMENT_ONLY = frozenset({TOURNAMENT})
+FALL_CUP_WARNING = ("You have a tournament game waiting (Fall Cup, Swiss round 1 of 3): run with --tournament "
+                    "to play it — it counts as a loss if your agent doesn't connect within the window.")
+
+
+def match_game(seat_id="seat-t", **overrides):
+    return a(seat_id, game_type="werewolf", context="testing", **overrides)
+
+
+@pytest.mark.parametrize(
+    "context, kind",
+    [("testing", TESTING), ("Testing", TESTING), (" testing ", TESTING), ("tournament", TOURNAMENT),
+     (None, TOURNAMENT), ("", TOURNAMENT), ("exhibition", TOURNAMENT)],
+)
+def test_assignment_kind_missing_or_unknown_context_is_a_tournament_game(context, kind):
+    assert assignment_kind(a("seat-1", context=context)) == kind
+
+
+def test_match_only_plays_test_matches_and_skips_tournament_games():
+    h = Harness([tournament_game("seat-1"), match_game("seat-2")], kinds=MATCH_ONLY)
+
+    h.tick()
+
+    assert h.started() == ["seat-2"]
+    assert h.log == [FALL_CUP_WARNING, "Match assigned: werewolf (Testing)", "Starting match..."]
+
+
+def test_tournament_only_plays_tournament_games_and_notes_test_matches():
+    h = Harness([match_game("seat-2"), tournament_game("seat-1")], kinds=TOURNAMENT_ONLY)
+
+    h.tick()
+
+    assert h.started() == ["seat-1"]
+    assert h.log[0] == TEST_MATCH_WAITING_NOTE == "Test match waiting: run with --match to play it"
+    assert h.log[1] == "Match assigned: werewolf (tournament)"
+
+
+def test_an_assignment_without_a_context_is_played_as_a_tournament_game():
+    assert a("seat-1").context is None
+    tournament = Harness([a("seat-1")], kinds=TOURNAMENT_ONLY)
+    match = Harness([a("seat-1")], kinds=MATCH_ONLY)
+
+    tournament.tick()
+    match.tick()
+
+    assert tournament.started() == ["seat-1"]
+    assert match.started() == []
+    assert match.log == ["You have a tournament game waiting (pokemon_vgc_doubles_draft): run with --tournament "
+                         "to play it — it counts as a loss if your agent doesn't connect within the window."]
+
+
+def test_both_flags_play_both_kinds_in_one_runtime_without_notes():
+    h = Harness([tournament_game("seat-1"), match_game("seat-2"), a("seat-3")],
+                kinds=frozenset({TESTING, TOURNAMENT}))
+
+    h.tick()
+
+    assert h.started() == ["seat-1", "seat-2", "seat-3"]
+    assert FALL_CUP_WARNING not in h.log and TEST_MATCH_WAITING_NOTE not in h.log
+
+
+def test_the_tournament_warning_is_shown_once_per_game():
+    second = tournament_game("seat-9", match_id="match-9", tournament_name="Winter Cup", round_label="Final")
+    h = Harness([tournament_game("seat-1")], [tournament_game("seat-1"), second], kinds=MATCH_ONLY)
+
+    for _ in range(5):
+        h.tick()
+
+    assert h.log == [
+        FALL_CUP_WARNING,
+        "You have a tournament game waiting (Winter Cup, Final): run with --tournament to play it — "
+        "it counts as a loss if your agent doesn't connect within the window.",
+    ]
+    assert h.started() == []
+
+
+def test_the_test_match_note_is_shown_once_per_game_even_with_several_of_its_seats():
+    self_play = [match_game("seat-a", match_id="m-1"), match_game("seat-b", match_id="m-1")]
+    h = Harness(self_play, self_play + [match_game("seat-c", match_id="m-2")], kinds=TOURNAMENT_ONLY)
+
+    for _ in range(4):
+        h.tick()
+
+    assert h.log == [TEST_MATCH_WAITING_NOTE, TEST_MATCH_WAITING_NOTE]
+    assert h.started() == []
+
+
+@pytest.mark.parametrize(
+    "fields, detail",
+    [
+        (dict(tournament_name="Fall Cup", round_label="Swiss round 1 of 3"), " (Fall Cup, Swiss round 1 of 3)"),
+        (dict(tournament_name="Fall Cup"), " (Fall Cup)"),
+        (dict(round_label="Final"), " (Final)"),
+        (dict(), " (werewolf)"),
+        (dict(game_type=None), ""),
+        (dict(tournament_name="Bad\x1b[31mCup"), " (Bad[31mCup)"),
+    ],
+)
+def test_tournament_waiting_warning_names_what_the_server_sent(fields, detail):
+    fields = {"game_type": "werewolf", **fields}
+
+    assert tournament_waiting_warning(a("seat-1", context="tournament", **fields)) == (
+        f"You have a tournament game waiting{detail}: run with --tournament to play it — "
+        "it counts as a loss if your agent doesn't connect within the window."
+    )
+
+
+def test_a_running_game_is_not_stopped_when_its_context_changes_to_a_kind_not_played():
+    # Started as a tournament game (no context: an older backend), then the
+    # backend starts labelling the same seat "testing".
+    h = Harness([a("seat-1")], [match_game("seat-1", match_id="match-seat-1")], kinds=TOURNAMENT_ONLY)
+
+    for _ in range(MISSING_POLLS_BEFORE_STOP + 3):
+        h.tick()
+
+    assert not h.factory.processes[0].terminated
+    assert h.state.registry.is_active("seat-1")
+    assert TEST_MATCH_WAITING_NOTE not in h.log and h.started() == ["seat-1"]
+
+
+def test_a_running_game_keeps_playing_while_games_of_the_other_kind_are_skipped():
+    h = Harness([match_game("seat-1")],
+                [match_game("seat-1"), tournament_game("seat-2")], kinds=MATCH_ONLY)
+
+    for _ in range(MISSING_POLLS_BEFORE_STOP + 3):
+        h.tick()
+
+    assert h.started() == ["seat-1"] and not h.factory.processes[0].terminated
+    assert h.log.count(FALL_CUP_WARNING) == 1
+
+
+def test_a_skipped_game_is_never_started_after_a_played_one_finishes():
+    h = Harness([match_game("seat-1"), tournament_game("seat-2")], kinds=MATCH_ONLY)
+    h.tick()
+    h.factory.processes[0].finish(EXIT_SUCCESS)
+
+    for _ in range(3):
+        h.tick(advance=100.0)  # past every cooldown
+
+    assert h.started() == ["seat-1", "seat-1"]  # the test match again (still listed), never the tournament game
+    assert h.log.count(FALL_CUP_WARNING) == 1
+
+
+def test_forever_hands_its_kinds_to_every_tick():
+    official = FakeOfficial([tournament_game("seat-1"), match_game("seat-2")])
+    factory = FakeProcessFactory()
+    log: list[str] = []
+
+    run_tournament_forever(official, agent_spec=SPEC, kinds=MATCH_ONLY, sleep=lambda s: None,
+                           process_factory=factory, log=log.append, max_iterations=3)
+
+    assert [p.args[0].seat_id for p in factory.processes] == ["seat-2"]
+    assert log.count(FALL_CUP_WARNING) == 1
+
+
+def test_forever_plays_both_kinds_by_default():
+    official = FakeOfficial([tournament_game("seat-1"), match_game("seat-2")])
+    factory = FakeProcessFactory()
+
+    run_tournament_forever(official, agent_spec=SPEC, sleep=lambda s: None, process_factory=factory,
+                           log=lambda line: None, max_iterations=1)
+
+    assert [p.args[0].seat_id for p in factory.processes] == ["seat-1", "seat-2"]
 
 
 def test_forever_keeps_polling_with_no_assignments_and_stops_workers_on_ctrl_c():

@@ -25,7 +25,7 @@ from __future__ import annotations
 import multiprocessing
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Collection
 
 from .errors import AuthenticationError, PlatformError
 from .official import is_fatal_auth_error, new_execution_id
@@ -253,6 +253,15 @@ AUTH_RETRY_MAX_SECONDS = 60.0
 AUTH_RATE_LIMIT_WAIT_SECONDS = 60.0
 
 
+# The two kinds of game an assignment can be (its ``context``):
+# ``python -m agent --match`` plays TESTING games (test matches),
+# ``--tournament`` plays TOURNAMENT games, and both flags together play both.
+TESTING = "testing"
+TOURNAMENT = "tournament"
+ALL_KINDS = frozenset({TESTING, TOURNAMENT})
+TEST_MATCH_WAITING_NOTE = "Test match waiting: run with --match to play it"
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -324,11 +333,36 @@ def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | Non
     return lines
 
 
+def assignment_kind(assignment: "OfficialAssignment") -> str:
+    """``TESTING`` for a test match, ``TOURNAMENT`` for anything else.
+
+    An assignment without a ``context`` comes from an older backend, which
+    hands out only tournament games, so it is a tournament game. So is a
+    context this SDK doesn't know: a missed tournament game counts as a loss,
+    a missed test match doesn't.
+    """
+    context = (assignment.context or "").strip().lower()
+    return TESTING if context == TESTING else TOURNAMENT
+
+
+def tournament_waiting_warning(assignment: "OfficialAssignment") -> str:
+    """The warning a ``--match``-only runtime prints (once per game) for a
+    tournament game it won't play. Names the tournament and round when the
+    server sent them, else the game."""
+    name, round_label = _clean(assignment.tournament_name), _clean(assignment.round_label)
+    where = ", ".join(part for part in (name, round_label) if part) or _clean(assignment.game_type)
+    detail = f" ({where})" if where else ""
+    return (
+        f"You have a tournament game waiting{detail}: run with --tournament to play it — "
+        "it counts as a loss if your agent doesn't connect within the window."
+    )
+
+
 class TournamentState:
     """Everything the tournament loop carries between ticks — in memory only.
 
-    ``execution_id`` is generated once per tournament runtime (one
-    ``python -m agent --tournament`` process) and handed to every worker it
+    ``execution_id`` is generated once per runtime (one ``python -m agent
+    --tournament``/``--match`` process) and handed to every worker it
     starts: it's how the backend tells this runtime's seat leases apart from
     another runtime's. Never persisted or logged.
     """
@@ -339,6 +373,9 @@ class TournamentState:
         self.failed_until: dict[str, float] = {}
         self.missing_polls: dict[str, int] = {}
         self.discovery_failing = False
+        # Games (match ids) of a kind this runtime doesn't play that it has
+        # already printed a warning or note about: once per game.
+        self.noted_games: set[str] = set()
         # Temporary sign-in failures in a row, and when (on the ``now``
         # clock) the next assignment listing may try again.
         self.auth_failures = 0
@@ -351,11 +388,26 @@ def _auth_retry_delay(exc: AuthenticationError, failures: int) -> float:
     return min(AUTH_RETRY_MAX_SECONDS, AUTH_RETRY_BASE_SECONDS * 2 ** failures)
 
 
+def _note_other_kind(assignment: "OfficialAssignment", state: TournamentState, log: Callable[[str], None]) -> None:
+    """Say once per game that a game of the other kind is waiting: a clear
+    warning for a tournament game (missing it is a loss), one quiet line for
+    a test match."""
+    game = assignment.match_id or assignment.seat_id
+    if game in state.noted_games:
+        return
+    state.noted_games.add(game)
+    if assignment_kind(assignment) == TOURNAMENT:
+        log(tournament_waiting_warning(assignment))
+    else:
+        log(TEST_MATCH_WAITING_NOTE)
+
+
 def run_tournament_once(
     official: "OfficialAgentClient",
     state: TournamentState,
     *,
     agent_spec: str,
+    kinds: Collection[str] = ALL_KINDS,
     now: Callable[[], float] = time.monotonic,
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
@@ -373,10 +425,15 @@ def run_tournament_once(
        is false), which also pauses listing for a backoff; running workers
        are never touched. Only a refusal of the key or the registration
        propagates — it would affect every seat.
-    3. Start one worker per listed seat that has none and isn't cooling down,
-       logging what was picked up (``describe_assignment``).
+    3. Start one worker per listed seat of a kind in ``kinds``
+       (``assignment_kind``: ``TESTING`` and/or ``TOURNAMENT``) that has none
+       and isn't cooling down, logging what was picked up
+       (``describe_assignment``). A game of another kind is not played; it
+       gets one warning or note per game (``_note_other_kind``).
     4. Stop workers whose seat has left the list for
-       ``MISSING_POLLS_BEFORE_STOP`` consecutive listings.
+       ``MISSING_POLLS_BEFORE_STOP`` consecutive listings. Every listed seat
+       counts here, whatever its kind: ``kinds`` only decides which games
+       are started, never stops one already being played.
     """
     current_time = now()
     for seat_id, exitcode in state.registry.reap_finished().items():
@@ -426,6 +483,9 @@ def run_tournament_once(
         seat_id = assignment.seat_id
         if not seat_id or state.registry.is_active(seat_id):
             continue
+        if assignment_kind(assignment) not in kinds:
+            _note_other_kind(assignment, state, log)
+            continue
         retry_at = state.failed_until.get(seat_id)
         if retry_at is not None and current_time < retry_at:
             continue
@@ -458,6 +518,7 @@ def run_tournament_forever(
     official: "OfficialAgentClient",
     *,
     agent_spec: str,
+    kinds: Collection[str] = ALL_KINDS,
     poll_interval: float = DEFAULT_TOURNAMENT_POLL_SECONDS,
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
@@ -467,7 +528,9 @@ def run_tournament_forever(
     log: Callable[[str], None] = print,
     max_iterations: int | None = None,
 ) -> None:
-    """Keep one worker per active official assignment until interrupted.
+    """Keep one worker per active official assignment of a kind in ``kinds``
+    (``TESTING``, ``TOURNAMENT`` or both; see ``run_tournament_once``) until
+    interrupted. Between polls it only sleeps: waiting costs no AI tokens.
     Never exits just because there are no assignments, nor on a temporary
     control-plane or sign-in problem. However it stops (Ctrl+C, the platform
     refusing the key or registration, or ``max_iterations`` in tests), every
@@ -478,7 +541,7 @@ def run_tournament_forever(
     try:
         while max_iterations is None or ticks < max_iterations:
             run_tournament_once(
-                official, state, agent_spec=agent_spec, now=now, cooldown_seconds=cooldown_seconds,
+                official, state, agent_spec=agent_spec, kinds=kinds, now=now, cooldown_seconds=cooldown_seconds,
                 shutdown_join_timeout=shutdown_join_timeout, process_factory=process_factory, log=log,
             )
             ticks += 1

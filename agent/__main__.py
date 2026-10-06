@@ -3,13 +3,16 @@
 One way to run your agent: set `ALTRUAGENT_OFFICIAL_AGENT_KEY` to your
 Official Agent Key (from the tournament dashboard) and run
 
-    python -m agent --tournament
+    python -m agent --tournament          # your tournament games
+    python -m agent --match               # your test matches (Testing page)
+    python -m agent --tournament --match  # both, in one process
 
 It authenticates as your registered self-hosted agent and keeps one worker
-process per assigned game until Ctrl+C
-(`altruagent.supervisor.run_tournament_forever`). Testing games and
-tournament games both arrive this way: nobody copies an id and nobody claims
-anything. `--check-tournament` verifies the connection and the agent without
+process per assigned game of the chosen kind(s) until Ctrl+C
+(`altruagent.supervisor.run_tournament_forever`, which filters assignments
+on their `context`). Nobody copies an id and nobody claims anything. A game
+of the other kind is not played; the runtime says once per game that it is
+waiting. `--check-tournament` verifies the connection and the agent without
 playing. `--agent MODULE[:FACTORY]` picks a different factory than
 `agent.agent:create_agent`.
 
@@ -43,9 +46,9 @@ from altruagent.agent_loader import DEFAULT_AGENT_SPEC
 from altruagent.agent_loader import load_agent_factory as _load_agent_factory
 from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError
 from altruagent.notices import AGENT_GUIDE_URL, CLAIM_CODES_RETIRED_NOTICE, PLATFORM_KEY_RETIRED_NOTICE
-from altruagent.official import OFFICIAL_AGENT_KEY_ENV, OfficialAgentClient, OfficialAgentError, is_fatal_auth_error
+from altruagent.official import OfficialAgentClient, OfficialAgentError, is_fatal_auth_error
 from altruagent.runner import _resolve_decision_fn
-from altruagent.supervisor import WAITING_MESSAGE, run_tournament_forever
+from altruagent.supervisor import ALL_KINDS, TESTING, TOURNAMENT, WAITING_MESSAGE, run_tournament_forever
 
 
 CLAIM_TOKEN_ENV = "ALTRUAGENT_CLAIM_TOKEN"
@@ -57,9 +60,18 @@ def _retired(notice: str) -> int:
     return 1
 
 
-def _run_tournament(agent_spec: str) -> int:
+# What the runtime says it plays, by the kinds the flags chose.
+PLAYING_MESSAGES = {
+    ALL_KINDS: "Playing your test matches and tournament games.",
+    frozenset({TOURNAMENT}): "Playing your tournament games only. Add --match to also play your test matches.",
+    frozenset({TESTING}): "Playing your test matches only. Add --tournament to also play your tournament games.",
+}
+
+
+def _run_tournament(agent_spec: str, kinds: frozenset[str] = ALL_KINDS) -> int:
     """The runtime: authenticate with the Official Agent Key, then keep one
-    worker process per assigned game (Testing or tournament) until Ctrl+C.
+    worker process per assigned game of the chosen ``kinds`` (test matches,
+    tournament games or both) until Ctrl+C.
     """
     try:
         _load_agent_factory(agent_spec)  # validated eagerly; built once per match, in its worker
@@ -80,8 +92,9 @@ def _run_tournament(agent_spec: str) -> int:
             print(f"Could not connect with your Official Agent Key: {exc}")
             return 1
         print("Connected with your Official Agent Key.")
+        print(PLAYING_MESSAGES[kinds])
         print(f"{WAITING_MESSAGE} (Press Ctrl+C to stop.)", flush=True)
-        run_tournament_forever(official, agent_spec=agent_spec)
+        run_tournament_forever(official, agent_spec=agent_spec, kinds=kinds)
         return 0
     except KeyboardInterrupt:
         print("\nStopped.")
@@ -159,16 +172,19 @@ Run your AltruAgent agent.
 
   1. Set ALTRUAGENT_OFFICIAL_AGENT_KEY (in .env) to your Official Agent Key,
      generated on the tournament dashboard's Agent Configuration page.
-  2. Run `python -m agent --tournament` and leave it running.
+  2. Run it with --tournament (your tournament games), --match (your test
+     matches) or both, and leave it running.
 
-It picks up your Testing and tournament games automatically and plays each
-one with agent/agent.py's create_agent(). Your agent must be Self-hosted and
-your event registration complete."""
+It plays each game with agent/agent.py's create_agent(). While it waits for a
+game it uses no AI tokens (it checks every ~10 s). Your agent must be
+Self-hosted and your event registration complete."""
 
 _EPILOG = f"""examples:
-  python -m agent --check-tournament                      check your key, connection and agent
-  python -m agent --tournament                            play your games (Ctrl+C to stop)
-  python -m agent --tournament --agent examples.llm_agent play with another agent factory
+  python -m agent --check-tournament                   check your key, connection and agent
+  python -m agent --tournament                         play your tournament games (Ctrl+C to stop)
+  python -m agent --match                              play your test matches
+  python -m agent --tournament --match                 play both in one process
+  python -m agent --match --agent examples.llm_agent   play with another agent factory
 
 guide: {AGENT_GUIDE_URL}"""
 
@@ -180,13 +196,24 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # --tournament and --match may be combined (both kinds in one process);
+    # each excludes --check-tournament and --claim. --match's exclusions are
+    # checked in main(): argparse puts an option in one exclusive group only.
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--tournament",
         action="store_true",
         help=(
-            f"play your Testing and tournament games as they are assigned ({OFFICIAL_AGENT_KEY_ENV}); "
+            'play your tournament games (Swiss/bracket games, after you press "Register my agent"); '
             "runs until Ctrl+C"
+        ),
+    )
+    parser.add_argument(
+        "--match",
+        action="store_true",
+        help=(
+            'play your test matches (Testing page: matches you create with "Mine (self-hosted)" '
+            "or join from Open matches); runs until Ctrl+C"
         ),
     )
     mode.add_argument(
@@ -209,14 +236,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args([] if argv is None else argv)
 
-    if args.tournament or args.check_tournament:
-        agent_spec = args.agent or DEFAULT_AGENT_SPEC
-        return _check_tournament(agent_spec) if args.check_tournament else _run_tournament(agent_spec)
+    if args.match and args.check_tournament:
+        parser.error("argument --match: not allowed with argument --check-tournament")
+    if args.match and args.claim is not None:
+        parser.error("argument --match: not allowed with argument --claim")
+
+    if args.check_tournament:
+        return _check_tournament(args.agent or DEFAULT_AGENT_SPEC)
+    if args.tournament or args.match:
+        kinds = frozenset(kind for kind, chosen in ((TOURNAMENT, args.tournament), (TESTING, args.match)) if chosen)
+        return _run_tournament(args.agent or DEFAULT_AGENT_SPEC, kinds)
 
     if args.claim is not None:
         return _retired(CLAIM_CODES_RETIRED_NOTICE)
     if args.agent is not None:
-        parser.error("--agent is only supported together with --tournament or --check-tournament")
+        parser.error("--agent is only supported together with --tournament, --match or --check-tournament")
     if os.environ.get(CLAIM_TOKEN_ENV):
         return _retired(CLAIM_CODES_RETIRED_NOTICE)
     return _retired(PLATFORM_KEY_RETIRED_NOTICE)
