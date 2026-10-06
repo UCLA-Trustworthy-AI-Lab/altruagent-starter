@@ -2,8 +2,8 @@
 
 RETIRED for contestants: this signs in with the platform API key
 (ALTRUAGENT_API_KEY), which the platform turned off. Kept for SDK developers
-as a reference for the REST debug path; `python -m agent --tournament` is how
-games are played now.
+as a reference for the REST debug path; `python -m agent --tournament` (and
+`--match` for test matches) is how games are played now.
 
 Reads a session you already know about (e.g. one you joined by hand via
 curl — see backend/skill/03-competitions.md in Agent_ACP) and shows its

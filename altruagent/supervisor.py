@@ -305,7 +305,7 @@ def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | Non
     or tokens.
     """
     game = _clean(assignment.game_type) or "unknown game"
-    context = (assignment.context or "").lower()
+    context = (assignment.context or "").strip().lower()
     kind = {"testing": " (Testing)", "tournament": " (tournament)"}.get(context, "")
     lines = [f"Match assigned: {game}{kind}"]
 

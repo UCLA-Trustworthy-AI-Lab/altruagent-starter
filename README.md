@@ -151,9 +151,11 @@ The detail lines appear when the platform sends them: `(Testing)` or
   again. It signs in again, finds the game that is still assigned, and resumes
   it — after up to about 35 seconds, while the old process's hold on the seat
   runs out. Nothing is saved locally.
-- **One process per kind of game.** A `--match` process and a `--tournament`
-  process can run side by side, since they play different games. Only one
-  process can play a given seat: a second copy that plays the same kind prints
+- **One process with your key.** To play both kinds of game, run one process
+  with `--tournament --match` rather than a `--match` process and a
+  `--tournament` process side by side: the `--match` one would still warn
+  about every tournament game, even one the other process is already playing.
+  Only one process can play a given seat: a second copy prints
   `Another runtime is playing this match with your Official Agent Key...` and
   just waits.
 - **Stopping.** Ctrl+C stops every game's process. It never resigns or

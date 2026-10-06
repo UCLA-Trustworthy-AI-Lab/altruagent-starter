@@ -98,8 +98,8 @@ that seat's SeatGrant. ``--check-tournament`` verifies the setup.
 
 Milestone 10: event agents only. AltruAgent now runs on the UCLA tournament
 site, and the Official Agent Key is the one way an agent connects:
-``python -m agent --tournament`` plays the contestant's Testing games and
-tournament games alike. Assignments may carry ``context`` (``testing`` or
+``python -m agent --tournament`` played the contestant's Testing games and
+tournament games alike (until the split below). Assignments may carry ``context`` (``testing`` or
 ``tournament``), the tournament's name and round, the opponents and the
 connect deadline; the runtime logs them when it picks a game up and hands
 ``tournament_id`` to the contestant's ``DecisionContext``. The platform
