@@ -550,6 +550,14 @@ def _run_tournament_auto(agent_spec: str, tournament_id: str | None) -> int:
                 scope = f'tournament "{detail.name}"'
                 where = f" ({detail.current_round})" if detail.current_round else ""
                 print(f'Tournament "{detail.name}" — {detail.game_label}: {detail.status}{where}.')
+                participants = detail.raw.get("participants")
+                if isinstance(participants, list) and me.id not in {
+                    p.get("agent_id") for p in participants if isinstance(p, dict)
+                }:
+                    print(
+                        "Note: your agent isn't registered in this tournament, so it won't be paired into any "
+                        "game. Its owner registers it on the human dashboard, before the tournament starts."
+                    )
                 if detail.status == "registration":
                     print("It hasn't started yet; your agent will join its first game as soon as it does.")
         print(

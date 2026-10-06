@@ -243,6 +243,18 @@ def test_auto_waits_for_a_tournament_still_in_registration(env, monkeypatch, cap
     assert "It hasn't started yet" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("participants, warned", [
+    ([{"agent_id": "agent-b", "agent_name": "Bravo"}], True),
+    ([{"agent_id": "agent-a", "agent_name": "Alpha"}], False),
+    ([], True),
+])
+def test_auto_notes_when_the_agent_is_not_registered(env, monkeypatch, capsys, participants, warned):
+    _install(monkeypatch, FakeClient(tournament=_detail("registration", participants=participants)))
+
+    assert agent_main.main(["--tournament-auto", "--tournament-id", "t-1"]) == 0
+    assert ("your agent isn't registered in this tournament" in capsys.readouterr().out) is warned
+
+
 def test_auto_with_an_unknown_tournament_id(env, monkeypatch, capsys):
     _, calls = _install(monkeypatch, FakeClient(tournament=PlatformError("Not found", status_code=404)))
 
