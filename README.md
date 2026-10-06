@@ -170,7 +170,9 @@ The detail lines appear when the platform sends them: `(Testing)` or
     for the two messages above.
   - A game whose agent raises an error stops on its own; the seat is retried
     about a minute later if it's still assigned, and your other games keep
-    going.
+    going. A seat that keeps failing (for example a game the game server lost
+    after a restart, which the platform then closes with no result) is retried
+    less often each time: 1, 2, 4, 8, then every 10 minutes.
 
 **This is not a security sandbox.** Separate processes keep games apart from
 *each other* (state, crashes). They don't isolate your agent code from your own

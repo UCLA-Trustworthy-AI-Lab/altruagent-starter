@@ -22,6 +22,7 @@ from altruagent.official import AUTHENTICATE_PATH, OfficialAgentClient, Official
 from altruagent.supervisor import (
     ALL_KINDS,
     MISSING_POLLS_BEFORE_STOP,
+    SEAT_FAILURE_BACKOFF_MAX_SECONDS,
     TESTING,
     TEST_MATCH_WAITING_NOTE,
     TOURNAMENT,
@@ -304,6 +305,41 @@ def test_failed_worker_is_retried_after_cooldown_reconnect_path():
 
     h.tick(advance=30.0)  # cooldown over, still assigned -> new worker (re-grant)
     assert h.started() == ["seat-1", "seat-1"]
+
+
+def test_a_seat_that_keeps_failing_is_retried_less_and_less_often():
+    # A game the server lost answers SESSION_NOT_FOUND until the platform closes it.
+    h = Harness([a("seat-1")], cooldown=60.0)
+    waits = []
+    for _ in range(6):
+        h.tick()
+        h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+        h.tick(advance=0.0)  # reaped
+        waits.append(h.state.failed_until["seat-1"] - h.clock["t"])
+        h.clock["t"] = h.state.failed_until["seat-1"]  # wait it out; the next tick starts a new worker
+
+    assert waits == [60.0, 120.0, 240.0, 480.0, SEAT_FAILURE_BACKOFF_MAX_SECONDS, SEAT_FAILURE_BACKOFF_MAX_SECONDS]
+    assert "retrying that seat in 120s" in "\n".join(h.log)
+
+
+def test_a_finished_match_resets_the_seat_backoff_and_a_seat_that_left_is_forgotten():
+    h = Harness([a("seat-1")], [a("seat-1")], [a("seat-1")], [a("seat-1")], [], cooldown=10.0)
+    h.tick()
+    h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+    h.tick(advance=0.0)
+    assert h.state.seat_failures == {"seat-1": 1}
+    h.clock["t"] = h.state.failed_until["seat-1"]
+    h.tick()  # retried
+    h.factory.processes[-1].finish(EXIT_SUCCESS)
+    h.tick(advance=0.0)
+    assert h.state.seat_failures == {}
+    assert h.state.failed_until["seat-1"] - h.clock["t"] == 10.0
+
+    h2 = Harness([a("seat-1")], [], cooldown=10.0)
+    h2.tick()
+    h2.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+    h2.tick(advance=0.0)  # reaped; the seat is no longer listed
+    assert h2.state.seat_failures == {}
 
 
 def test_disappeared_assignment_stops_its_worker_after_grace_polls():

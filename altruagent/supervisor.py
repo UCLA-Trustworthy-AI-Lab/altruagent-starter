@@ -243,6 +243,11 @@ WAITING_MESSAGE = "Waiting for your next game..."
 # re-authenticated session); a seat another live runtime keeps renewing
 # just stays busy.
 SEAT_BUSY_RETRY_SECONDS = 35.0
+# A seat whose worker keeps failing (a game the server lost answers
+# SESSION_NOT_FOUND until the platform closes it, which takes a few minutes)
+# is retried less and less often: the cooldown doubles with each failure in a
+# row, up to this. A finished match or a seat_busy resets it.
+SEAT_FAILURE_BACKOFF_MAX_SECONDS = 600.0
 # The agent session lasts about an hour, so the runtime signs in again with
 # the Official Agent Key now and then. When that hits a temporary problem
 # (429, 5xx, a session the platform couldn't start or didn't accept), the
@@ -371,6 +376,8 @@ class TournamentState:
         self.execution_id = new_execution_id()
         self.registry = WorkerRegistry()
         self.failed_until: dict[str, float] = {}
+        # Failed workers in a row, per seat (see SEAT_FAILURE_BACKOFF_MAX_SECONDS).
+        self.seat_failures: dict[str, int] = {}
         self.missing_polls: dict[str, int] = {}
         self.discovery_failing = False
         # Games (match ids) of a kind this runtime doesn't play that it has
@@ -419,6 +426,8 @@ def run_tournament_once(
 
     1. Reap finished workers (a failure puts that seat in cooldown; it is
        retried later, which re-requests its grant — the reconnect path).
+       Each failure in a row doubles that seat's cooldown, up to
+       ``SEAT_FAILURE_BACKOFF_MAX_SECONDS``.
     2. List this agent's active assignments. A transient control-plane
        failure is logged and the tick skipped (the runtime keeps waiting).
        So is a temporary failure to sign in again (``is_fatal_auth_error``
@@ -443,12 +452,18 @@ def run_tournament_once(
         # one is retried (re-granted) only if it's still assigned afterwards.
         state.failed_until[seat_id] = current_time + cooldown_seconds
         if exitcode == EXIT_SUCCESS:
+            state.seat_failures.pop(seat_id, None)
             log("Match finished.")
         elif exitcode == EXIT_SEAT_BUSY:
+            state.seat_failures.pop(seat_id, None)
             state.failed_until[seat_id] = current_time + SEAT_BUSY_RETRY_SECONDS
             log(f"Another runtime is playing this match with your Official Agent Key; checking again in {SEAT_BUSY_RETRY_SECONDS:.0f}s.")
         else:
-            log(f"Match ended with an error (exit code {exitcode}); retrying that seat in {cooldown_seconds:.0f}s if it is still assigned.")
+            failures = state.seat_failures.get(seat_id, 0) + 1
+            state.seat_failures[seat_id] = failures
+            wait = min(max(SEAT_FAILURE_BACKOFF_MAX_SECONDS, cooldown_seconds), cooldown_seconds * 2 ** (failures - 1))
+            state.failed_until[seat_id] = current_time + wait
+            log(f"Match ended with an error (exit code {exitcode}); retrying that seat in {wait:.0f}s if it is still assigned.")
         if len(state.registry) == 0:
             log(WAITING_MESSAGE)
 
@@ -479,6 +494,9 @@ def run_tournament_once(
         state.discovery_failing = False
 
     listed = {assignment.seat_id for assignment in assignments}
+    # A seat that has left the list is done with: forget its failure count.
+    for seat_id in [s for s in state.seat_failures if s not in listed and not state.registry.is_active(s)]:
+        del state.seat_failures[seat_id]
     for assignment in assignments:
         seat_id = assignment.seat_id
         if not seat_id or state.registry.is_active(seat_id):

@@ -43,8 +43,8 @@ _KEY_PATTERN = re.compile(r"^eak_live_[0-9a-f]{64}$")
 _ERROR_MESSAGES = {
     "invalid_official_agent_key": (
         "The Official Agent Key was not accepted. Check that your agent is set to "
-        "Self-hosted in Agent Configuration, then copy the key again from the tournament "
-        "dashboard (or generate a new one there) and update ALTRUAGENT_OFFICIAL_AGENT_KEY."
+        "Self-hosted in Agent Configuration, then copy the key again from Agent Configuration on "
+        "the tournament dashboard (or generate a new one there) and update ALTRUAGENT_OFFICIAL_AGENT_KEY."
     ),
     "registration_incomplete": (
         f"Your event registration isn't complete yet. Finish it on the tournament dashboard "
@@ -56,7 +56,7 @@ _ERROR_MESSAGES = {
         "on the platform, not your key; try again in a minute."
     ),
     "assignment_not_found": "That tournament assignment was not found for this agent.",
-    "assignment_not_grantable": "That tournament assignment has already ended.",
+    "assignment_not_grantable": "That assignment has already ended, or is being closed with no result.",
     "seat_busy": (
         "This seat is being played by another runtime using your Official Agent Key "
         "(or a previous run's hold on it hasn't expired yet)."
@@ -121,8 +121,8 @@ def load_official_agent_key(key: str | None = None) -> str:
     key = (key if key is not None else os.environ.get(OFFICIAL_AGENT_KEY_ENV) or "").strip()
     if not key:
         raise ConfigurationError(
-            f"{OFFICIAL_AGENT_KEY_ENV} is not set. Generate your Official Agent Key in the "
-            "tournament dashboard and add it to your environment or .env."
+            f"{OFFICIAL_AGENT_KEY_ENV} is not set. Generate your Official Agent Key in Agent "
+            "Configuration on the tournament dashboard and add it to your environment or .env."
         )
     if not _KEY_PATTERN.match(key):
         raise ConfigurationError(
