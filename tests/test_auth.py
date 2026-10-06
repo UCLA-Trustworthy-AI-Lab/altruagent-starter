@@ -212,7 +212,7 @@ def test_claim_errors_map_to_clear_seat_claim_errors(status, code, phrase):
 def test_retired_claim_codes_point_to_the_official_agent_key():
     server = ClaimServer(httpx.Response(410, json={
         "error": "claim_codes_retired",
-        "detail": "Testing now uses your Official Agent Key: run your agent with --tournament.",
+        "detail": "Testing now uses your Official Agent Key: run your agent with --match and it picks up your Testing games automatically.",
     }))
 
     with pytest.raises(SeatClaimError) as exc_info:
