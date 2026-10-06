@@ -27,8 +27,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
-from .errors import PlatformError
-from .official import new_execution_id
+from .errors import AuthenticationError, PlatformError
+from .official import is_fatal_auth_error, new_execution_id
 from .worker import (
     EXIT_SEAT_BUSY,
     EXIT_SUCCESS,
@@ -243,6 +243,14 @@ WAITING_MESSAGE = "Waiting for your next game..."
 # re-authenticated session); a seat another live runtime keeps renewing
 # just stays busy.
 SEAT_BUSY_RETRY_SECONDS = 35.0
+# The agent session lasts about an hour, so the runtime signs in again with
+# the Official Agent Key now and then. When that hits a temporary problem
+# (429, 5xx, a session the platform couldn't start or didn't accept), the
+# runtime keeps its running games and tries again after a pause: 10 s,
+# doubling to at most 60 s, and a full minute after "too many attempts".
+AUTH_RETRY_BASE_SECONDS = 10.0
+AUTH_RETRY_MAX_SECONDS = 60.0
+AUTH_RATE_LIMIT_WAIT_SECONDS = 60.0
 
 
 def _utc_now() -> datetime:
@@ -331,6 +339,16 @@ class TournamentState:
         self.failed_until: dict[str, float] = {}
         self.missing_polls: dict[str, int] = {}
         self.discovery_failing = False
+        # Temporary sign-in failures in a row, and when (on the ``now``
+        # clock) the next assignment listing may try again.
+        self.auth_failures = 0
+        self.discovery_retry_at: float | None = None
+
+
+def _auth_retry_delay(exc: AuthenticationError, failures: int) -> float:
+    if exc.status_code == 429:
+        return AUTH_RATE_LIMIT_WAIT_SECONDS
+    return min(AUTH_RETRY_MAX_SECONDS, AUTH_RETRY_BASE_SECONDS * 2 ** failures)
 
 
 def run_tournament_once(
@@ -350,8 +368,11 @@ def run_tournament_once(
     1. Reap finished workers (a failure puts that seat in cooldown; it is
        retried later, which re-requests its grant — the reconnect path).
     2. List this agent's active assignments. A transient control-plane
-       failure is logged and the tick skipped (the runtime keeps waiting);
-       an authentication failure propagates — it would affect every seat.
+       failure is logged and the tick skipped (the runtime keeps waiting).
+       So is a temporary failure to sign in again (``is_fatal_auth_error``
+       is false), which also pauses listing for a backoff; running workers
+       are never touched. Only a refusal of the key or the registration
+       propagates — it would affect every seat.
     3. Start one worker per listed seat that has none and isn't cooling down,
        logging what was picked up (``describe_assignment``).
     4. Stop workers whose seat has left the list for
@@ -374,6 +395,8 @@ def run_tournament_once(
         if len(state.registry) == 0:
             log(WAITING_MESSAGE)
 
+    if state.discovery_retry_at is not None and current_time < state.discovery_retry_at:
+        return
     try:
         assignments = official.assignments()
     except PlatformError as exc:
@@ -381,6 +404,19 @@ def run_tournament_once(
             log(f"Could not check tournament assignments ({exc}); will keep retrying.")
         state.discovery_failing = True
         return
+    except AuthenticationError as exc:
+        if is_fatal_auth_error(exc):
+            raise
+        delay = _auth_retry_delay(exc, state.auth_failures)
+        state.auth_failures += 1
+        state.discovery_retry_at = current_time + delay
+        if not state.discovery_failing:
+            log(f"Could not renew your agent session ({exc}). Games already running keep playing; "
+                "retrying automatically.")
+        state.discovery_failing = True
+        return
+    state.auth_failures = 0
+    state.discovery_retry_at = None
     if state.discovery_failing:
         log("Assignment discovery recovered.")
         state.discovery_failing = False
@@ -432,8 +468,9 @@ def run_tournament_forever(
     max_iterations: int | None = None,
 ) -> None:
     """Keep one worker per active official assignment until interrupted.
-    Never exits just because there are no assignments. However it stops
-    (Ctrl+C, a fatal auth error, or ``max_iterations`` in tests), every
+    Never exits just because there are no assignments, nor on a temporary
+    control-plane or sign-in problem. However it stops (Ctrl+C, the platform
+    refusing the key or registration, or ``max_iterations`` in tests), every
     running worker is terminated in ``finally`` — no match is resigned.
     """
     state = TournamentState()

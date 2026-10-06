@@ -46,7 +46,7 @@ cp .env.example .env
 
 1. **Get your key.** Sign in at
    <https://platform.altruagent-game.com/tournament/dashboard>, open
-   **Agent setup**, and generate your Official Agent Key (`eak_live_...`). It's
+   **Agent Configuration**, and generate your Official Agent Key (`eak_live_...`). It's
    shown once, so put it in your `.env` right away:
 
    ```
@@ -83,7 +83,7 @@ cp .env.example .env
 | Variable | Required | Description |
 |---|---|---|
 | `ALTRUAGENT_CONTROL_URL` | yes | Base URL of the AltruAgent control plane. `.env.example` already sets the real deployed platform. |
-| `ALTRUAGENT_OFFICIAL_AGENT_KEY` | yes | Your Official Agent Key (`eak_live_` + 64 hex characters), from the dashboard's Agent setup page. |
+| `ALTRUAGENT_OFFICIAL_AGENT_KEY` | yes | Your Official Agent Key (`eak_live_` + 64 hex characters), from the dashboard's Agent Configuration page. |
 | `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` | only for `examples/llm_agent.py` | See [Example LLM agent](#example-llm-agent). |
 
 `.env` is loaded automatically and is already listed in `.gitignore` —
@@ -145,6 +145,10 @@ The detail lines appear when the platform sends them: `(Testing)` or
   - *The Official Agent Key was not accepted*: check that your agent is
     Self-hosted, then copy the key again (or generate a new one).
   - *Your event registration isn't complete yet*: finish it on the dashboard.
+  - *Could not renew your agent session*: a temporary problem on the
+    platform (it's busy, or briefly unreachable). Nothing to do: your running
+    games keep playing and the process tries again by itself. It stops only
+    for the two messages above.
   - A game whose agent raises an error stops on its own; the seat is retried
     about a minute later if it's still assigned, and your other games keep
     going.
@@ -408,8 +412,13 @@ You don't need this section to take part; it describes what
 1. **Sign in.** `OfficialAgentClient` (`altruagent/official.py`) exchanges
    your Official Agent Key for a short-lived agent session
    (`POST /tournament/agent/authenticate`). The key only ever goes to the
-   control plane, never to GameAPI. When the session expires, the client signs
-   in again once and retries; if that fails too, it stops with a clear error.
+   control plane, never to GameAPI. When the session expires (about once an
+   hour), the client signs in again and retries. If signing in again hits a
+   temporary problem (too many attempts, a server error, a session the
+   platform couldn't start), the running games keep playing and the
+   supervisor tries again after a pause of 10 to 60 seconds (a full minute
+   after "too many attempts"). It stops only when the platform refuses the
+   key itself or your registration isn't complete.
 2. **Find games.** Every 10 seconds the supervisor
    (`altruagent/supervisor.py`, `run_tournament_forever`) lists your agent's
    active seats (`GET /tournament/agent/assignments`) — Testing and tournament

@@ -12,12 +12,13 @@ import textwrap
 import types
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
 from altruagent.errors import AuthenticationError, PlatformError
 from altruagent.mcp_game import MCPGameSession
 from altruagent.models import OfficialAssignment, SeatGrant
-from altruagent.official import OfficialAgentError
+from altruagent.official import AUTHENTICATE_PATH, OfficialAgentClient, OfficialAgentError
 from altruagent.supervisor import (
     MISSING_POLLS_BEFORE_STOP,
     WAITING_MESSAGE,
@@ -34,6 +35,9 @@ from altruagent.worker import (
     _tournament_process_entry,
     run_tournament_worker,
 )
+from test_official import CONTROL, KEY
+from test_official import Backend as OfficialBackend
+from test_official import assignment as official_assignment
 from test_supervisor import FakeProcessFactory
 
 SPEC = "agent.agent:create_agent"
@@ -336,6 +340,234 @@ def test_authentication_failure_propagates():
 
     with pytest.raises(AuthenticationError):
         h.tick()
+
+
+# -- signing in again during a run (the agent session lasts about an hour) ------------------
+
+MINT_FAILURE = OfficialAgentError(
+    "temporary", status_code=401, error_code="invalid_official_agent_key",
+    detail="Failed to mint agent session: Request rate limit reached",
+)
+TEMPORARY_SIGN_IN_FAILURES = [
+    pytest.param(OfficialAgentError("slow down", status_code=429, error_code="rate_limited"), id="429"),
+    pytest.param(OfficialAgentError("boom", status_code=500, error_code="internal_error"), id="500"),
+    pytest.param(OfficialAgentError("gateway", status_code=503), id="503-non-json"),
+    pytest.param(OfficialAgentError("gateway", status_code=504), id="504"),
+    pytest.param(OfficialAgentError("busy", status_code=503, error_code="agent_session_unavailable"), id="503-unavailable"),
+    pytest.param(MINT_FAILURE, id="401-mint-failure"),
+    pytest.param(AuthenticationError("Invalid or expired agent session token", status_code=401,
+                                     error_code="invalid_agent_session"), id="fresh-session-still-401"),
+    pytest.param(OfficialAgentError("no token", status_code=200), id="200-without-token"),
+]
+
+
+@pytest.mark.parametrize("error", TEMPORARY_SIGN_IN_FAILURES)
+def test_a_temporary_sign_in_failure_keeps_running_games_and_the_runtime(error):
+    h = Harness([a("seat-1")], error, error, [a("seat-1")])
+    h.tick()
+    worker = h.factory.processes[0]
+
+    h.tick()                 # fails: no exception, the worker keeps playing
+    h.tick(advance=120.0)    # fails again after the pause
+    h.tick(advance=120.0)    # recovered
+
+    assert not worker.terminated and worker.is_alive()
+    assert h.state.registry.pids().keys() == {"seat-1"}
+    assert h.started() == ["seat-1"]
+    assert sum("Could not renew your agent session" in line for line in h.log) == 1
+    assert h.log[-1] == "Assignment discovery recovered."
+    assert h.state.auth_failures == 0 and h.state.discovery_retry_at is None
+
+
+def test_a_sign_in_failure_never_counts_toward_stopping_a_worker():
+    error = OfficialAgentError("boom", status_code=502)
+    h = Harness([a("seat-1")], *([error] * (MISSING_POLLS_BEFORE_STOP + 3)), [a("seat-1")])
+    h.tick()
+
+    for _ in range(MISSING_POLLS_BEFORE_STOP + 4):
+        h.tick(advance=120.0)
+
+    assert not h.factory.processes[0].terminated
+    assert h.state.missing_polls == {}
+
+
+def test_after_too_many_attempts_it_waits_a_full_minute_before_trying_again():
+    h = Harness(OfficialAgentError("slow down", status_code=429, error_code="rate_limited"), [])
+
+    h.tick(advance=1.0)       # t=1: 429
+    for _ in range(5):
+        h.tick(advance=10.0)  # t=11..51: still waiting
+    assert h.official.calls == 1
+
+    h.tick(advance=10.0)      # t=61: a minute later
+    assert h.official.calls == 2
+
+
+def test_server_errors_back_off_10_20_40_then_60_seconds():
+    h = Harness(OfficialAgentError("boom", status_code=500, error_code="internal_error"))
+    attempts = []
+
+    for _ in range(200):
+        before = h.official.calls
+        h.tick(advance=1.0)
+        if h.official.calls > before:
+            attempts.append(h.clock["t"])
+
+    gaps = [later - earlier for earlier, later in zip(attempts, attempts[1:])]
+    assert gaps[:5] == [10.0, 20.0, 40.0, 60.0, 60.0]
+
+
+def test_the_backoff_starts_over_after_a_successful_listing():
+    error = OfficialAgentError("boom", status_code=500)
+    h = Harness(error, error, [], error, [])
+
+    h.tick(advance=1.0)    # fail (wait 10)
+    h.tick(advance=10.0)   # fail (wait 20)
+    h.tick(advance=20.0)   # ok
+    h.tick(advance=1.0)    # fail again: back to a 10 s wait
+    assert h.state.discovery_retry_at == h.clock["t"] + 10.0
+
+
+def test_finished_workers_are_still_reaped_while_sign_in_is_failing():
+    h = Harness([a("seat-1")], OfficialAgentError("slow down", status_code=429, error_code="rate_limited"))
+    h.tick()
+    h.tick()  # 429: waiting a minute
+    h.factory.processes[0].finish(EXIT_SUCCESS)
+
+    h.tick(advance=5.0)
+
+    assert h.log[-2:] == ["Match finished.", WAITING_MESSAGE]
+    assert len(h.state.registry) == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(OfficialAgentError("not accepted", status_code=401, error_code="invalid_official_agent_key",
+                                        detail="Invalid official agent key"), id="wrong-or-revoked-key"),
+        pytest.param(OfficialAgentError("oracle", status_code=401, error_code="invalid_official_agent_key",
+                                        detail="This agent is Oracle Hosted; ..."), id="oracle-hosted"),
+        pytest.param(OfficialAgentError("registration", status_code=403, error_code="registration_incomplete"),
+                     id="registration-incomplete"),
+    ],
+)
+def test_a_refused_key_or_registration_still_stops_the_runtime(error):
+    h = Harness([a("seat-1")], error)
+    h.tick()
+
+    with pytest.raises(OfficialAgentError):
+        h.tick()
+
+
+def test_forever_survives_temporary_sign_in_failures_without_stopping_workers():
+    official = FakeOfficial([a("seat-1")], MINT_FAILURE, OfficialAgentError("x", status_code=503), [a("seat-1")])
+    factory = FakeProcessFactory()
+    clock = {"t": 0.0}
+    log: list[str] = []
+
+    def sleep(seconds):
+        clock["t"] += 30.0
+
+    run_tournament_forever(official, agent_spec=SPEC, sleep=sleep, now=lambda: clock["t"],
+                           process_factory=factory, log=log.append, max_iterations=8)
+
+    assert len(factory.processes) == 1
+    assert official.calls >= 4
+    assert "Assignment discovery recovered." in log
+    assert not any("Stopping" in line for line in log[:-1])
+
+
+# -- the same, through the real client and a mock control plane ------------------------------
+
+
+class RefreshBackend(OfficialBackend):
+    """The control plane from test_official, where the next sign-in answers
+    ``refresh`` (one response, used while set) instead of a session.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.refresh: httpx.Response | None = None
+        self.reject_new_sessions = False
+
+    def __call__(self, request):
+        if request.url.path == AUTHENTICATE_PATH and self.refresh is not None:
+            self.auth_bodies.append({})
+            return self.refresh
+        response = super().__call__(request)
+        if request.url.path == AUTHENTICATE_PATH and self.reject_new_sessions:
+            self.valid.clear()
+        return response
+
+
+REFRESH_ANSWERS = [
+    pytest.param(httpx.Response(500, json={"error": "internal_error", "detail": "Failed to authenticate"}), id="500"),
+    pytest.param(httpx.Response(429, json={"error": "rate_limited", "detail": "Too many requests."}), id="429"),
+    pytest.param(httpx.Response(503, text="<html>Service Unavailable</html>"), id="503-html"),
+    pytest.param(httpx.Response(504, json={"message": "Endpoint request timed out"}), id="504"),
+    pytest.param(httpx.Response(401, json={"error": "invalid_official_agent_key",
+                                           "detail": "Failed to mint agent session: Request rate limit reached"}),
+                 id="401-mint-failure"),
+    pytest.param(httpx.Response(503, json={"error": "agent_session_unavailable", "detail": "try again"}),
+                 id="503-agent-session-unavailable"),
+]
+
+
+def _real_harness(backend):
+    h = Harness([])
+    h.official = OfficialAgentClient(CONTROL, KEY, load_env_file=False, transport=httpx.MockTransport(backend))
+    return h
+
+
+@pytest.mark.parametrize("answer", REFRESH_ANSWERS)
+def test_real_client_session_refresh_failure_keeps_games_running(answer):
+    backend = RefreshBackend(assignments=[official_assignment("seat-1")])
+    h = _real_harness(backend)
+    h.tick()
+    worker = h.factory.processes[0]
+    backend.valid.clear()   # the hour-long session expires
+    backend.refresh = answer
+
+    h.tick()                # GET 401 -> sign in again -> temporary failure
+
+    assert not worker.terminated and h.state.registry.pids().keys() == {"seat-1"}
+    assert any("Could not renew your agent session" in line for line in h.log)
+    assert not any("copy the key again" in line for line in h.log)
+
+    backend.refresh = None  # the platform recovers
+    h.tick(advance=120.0)
+    assert h.log[-1] == "Assignment discovery recovered."
+    assert not worker.terminated and h.started() == ["seat-1"]
+
+
+def test_real_client_fresh_session_still_rejected_keeps_games_running():
+    backend = RefreshBackend(assignments=[official_assignment("seat-1")])
+    h = _real_harness(backend)
+    h.tick()
+    worker = h.factory.processes[0]
+    backend.valid.clear()
+    backend.reject_new_sessions = True  # e.g. the sign-in service is briefly down
+
+    h.tick()
+
+    assert not worker.terminated
+    assert any("Could not renew your agent session" in line for line in h.log)
+
+    backend.reject_new_sessions = False
+    h.tick(advance=120.0)
+    assert h.log[-1] == "Assignment discovery recovered."
+
+
+def test_real_client_revoked_key_still_stops_the_runtime():
+    backend = RefreshBackend(assignments=[official_assignment("seat-1")])
+    h = _real_harness(backend)
+    h.tick()
+    backend.valid.clear()
+    backend.key_valid = False
+
+    with pytest.raises(OfficialAgentError) as exc_info:
+        h.tick()
+    assert exc_info.value.error_code == "invalid_official_agent_key"
 
 
 def test_forever_keeps_polling_with_no_assignments_and_stops_workers_on_ctrl_c():

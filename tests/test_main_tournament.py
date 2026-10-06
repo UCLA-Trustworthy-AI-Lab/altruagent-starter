@@ -211,6 +211,12 @@ def test_check_tournament_uses_agent_override(env, monkeypatch, capsys):
         (FakeOfficial(auth_error=PlatformError("Could not reach", status_code=None)), "✗ Control plane not reachable"),
         (FakeOfficial(auth_error=OfficialAgentError("not accepted", status_code=401)), "✗ Official Agent Key rejected"),
         (FakeOfficial(auth_error=OfficialAgentError("boom", status_code=500)), "✗ Official agent authentication failed"),
+        (FakeOfficial(auth_error=OfficialAgentError(
+            "temporary", status_code=401, error_code="invalid_official_agent_key",
+            detail="Failed to mint agent session: Request rate limit reached")),
+         "✗ Official agent authentication failed"),
+        (FakeOfficial(auth_error=OfficialAgentError("slow down", status_code=429, error_code="rate_limited")),
+         "✗ Official agent authentication failed"),
         (FakeOfficial(assignments_result=AuthenticationError("session rejected")), "✗ Tournament agent session was not accepted"),
         (FakeOfficial(assignments_result=PlatformError("down", status_code=500)), "✗ Assignment discovery failed"),
     ],

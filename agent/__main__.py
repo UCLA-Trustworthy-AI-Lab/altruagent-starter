@@ -43,7 +43,7 @@ from altruagent.agent_loader import DEFAULT_AGENT_SPEC
 from altruagent.agent_loader import load_agent_factory as _load_agent_factory
 from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError
 from altruagent.notices import AGENT_GUIDE_URL, CLAIM_CODES_RETIRED_NOTICE, PLATFORM_KEY_RETIRED_NOTICE
-from altruagent.official import OFFICIAL_AGENT_KEY_ENV, OfficialAgentClient, OfficialAgentError
+from altruagent.official import OFFICIAL_AGENT_KEY_ENV, OfficialAgentClient, OfficialAgentError, is_fatal_auth_error
 from altruagent.runner import _resolve_decision_fn
 from altruagent.supervisor import WAITING_MESSAGE, run_tournament_forever
 
@@ -125,7 +125,7 @@ def _check_tournament(agent_spec: str) -> int:
             official.authenticate()
         except OfficialAgentError as exc:
             ok("Control plane reachable")
-            if exc.status_code in (400, 401):
+            if exc.status_code in (400, 401) and is_fatal_auth_error(exc):
                 return fail(f"Official Agent Key rejected: {exc}")
             return fail(f"Official agent authentication failed: {exc}")
         except AltruAgentError as exc:
@@ -158,7 +158,7 @@ _DESCRIPTION = """\
 Run your AltruAgent agent.
 
   1. Set ALTRUAGENT_OFFICIAL_AGENT_KEY (in .env) to your Official Agent Key,
-     generated on the tournament dashboard's Agent setup page.
+     generated on the tournament dashboard's Agent Configuration page.
   2. Run `python -m agent --tournament` and leave it running.
 
 It picks up your Testing and tournament games automatically and plays each

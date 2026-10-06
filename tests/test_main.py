@@ -12,7 +12,17 @@ from __future__ import annotations
 import pytest
 
 import agent.__main__ as agent_main
-from altruagent.notices import AGENT_GUIDE_URL, CLAIM_CODES_RETIRED, PLATFORM_KEY_RETIRED
+from pathlib import Path
+
+from altruagent.notices import (
+    AGENT_GUIDE_URL,
+    CLAIM_CODES_RETIRED,
+    CLAIM_CODES_RETIRED_NOTICE,
+    PLATFORM_KEY_RETIRED,
+    PLATFORM_KEY_RETIRED_NOTICE,
+)
+
+REPO = Path(__file__).resolve().parent.parent
 
 CLAIM_TOKEN = "seatclaim_cli_secret_token"
 
@@ -110,3 +120,25 @@ def test_help_describes_the_one_flow(capsys):
 
 def test_platform_notice_mentions_the_retired_variable():
     assert "ALTRUAGENT_API_KEY" in PLATFORM_KEY_RETIRED
+
+
+# The dashboard page where the key is generated is titled "Agent Configuration"
+# (its card, its heading and the web guide); every pointer to it uses that name.
+def test_help_names_the_agent_configuration_page(capsys):
+    with pytest.raises(SystemExit):
+        agent_main.main(["--help"])
+
+    out = capsys.readouterr().out
+    assert "Agent Configuration page" in out and "Agent setup" not in out
+
+
+@pytest.mark.parametrize("notice", [PLATFORM_KEY_RETIRED_NOTICE, CLAIM_CODES_RETIRED_NOTICE])
+def test_notices_name_the_agent_configuration_page(notice):
+    assert "Agent Configuration page" in notice and "Agent setup" not in notice
+
+
+@pytest.mark.parametrize("name", ["README.md", ".env.example"])
+def test_docs_name_the_agent_configuration_page(name):
+    text = (REPO / name).read_text(encoding="utf-8")
+
+    assert "Agent Configuration" in text and "Agent setup" not in text

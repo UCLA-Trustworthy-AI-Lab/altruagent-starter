@@ -51,6 +51,10 @@ _ERROR_MESSAGES = {
         f"({DASHBOARD_URL}), then run this again."
     ),
     "rate_limited": "Too many authentication attempts. Wait a minute and try again.",
+    "agent_session_unavailable": (
+        "The platform couldn't start an agent session just now. This is a temporary problem "
+        "on the platform, not your key; try again in a minute."
+    ),
     "assignment_not_found": "That tournament assignment was not found for this agent.",
     "assignment_not_grantable": "That tournament assignment has already ended.",
     "seat_busy": (
@@ -68,11 +72,45 @@ class OfficialAgentError(AuthenticationError):
     """
 
 
+# The platform has answered a failed session mint (its own sign-in service
+# rejecting or rate-limiting the request) with 401 invalid_official_agent_key
+# and this detail. That is a temporary platform problem, not a key problem.
+_MINT_FAILURE_PREFIX = "Failed to mint agent session"
+
+
+def _is_mint_failure(code: str | None, detail: str | None) -> bool:
+    return code == "invalid_official_agent_key" and (detail or "").startswith(_MINT_FAILURE_PREFIX)
+
+
 def _error_from(response: httpx.Response, fallback: str) -> OfficialAgentError:
     parsed = _parse_error_body(response)
     code = parsed["error"]
-    message = _ERROR_MESSAGES.get(code) or f"{fallback} (HTTP {response.status_code}" + (f", {code})" if code else ")")
+    if _is_mint_failure(code, parsed["detail"]):
+        message = _ERROR_MESSAGES["agent_session_unavailable"]
+    else:
+        message = _ERROR_MESSAGES.get(code) or f"{fallback} (HTTP {response.status_code}" + (f", {code})" if code else ")")
     return OfficialAgentError(message, status_code=response.status_code, error_code=code, detail=parsed["detail"])
+
+
+def is_fatal_auth_error(exc: BaseException) -> bool:
+    """True only when the platform refused this agent itself, so retrying
+    can't help until the contestant acts: the Official Agent Key is wrong,
+    revoked or replaced, the agent isn't Self-hosted, or the event
+    registration isn't complete.
+
+    Everything else is temporary and worth retrying with a pause: too many
+    attempts (429), a server or gateway error (5xx, or a non-JSON page), no
+    network, the platform failing to start a session, or a freshly issued
+    agent session that wasn't accepted (a plain ``AuthenticationError`` from
+    the request that followed the sign-in).
+    """
+    if not isinstance(exc, OfficialAgentError):
+        return False
+    if exc.error_code == "registration_incomplete":
+        return True
+    if exc.error_code == "invalid_official_agent_key":
+        return not _is_mint_failure(exc.error_code, exc.detail)
+    return exc.error_code is None and exc.status_code == 401
 
 
 def load_official_agent_key(key: str | None = None) -> str:

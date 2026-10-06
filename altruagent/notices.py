@@ -28,7 +28,7 @@ PLATFORM_KEY_RETIRED = (
 
 _HOW_TO = (
     "Set ALTRUAGENT_OFFICIAL_AGENT_KEY to your Official Agent Key (generate it on the "
-    "tournament dashboard's Agent setup page), then run:\n"
+    "tournament dashboard's Agent Configuration page), then run:\n"
     f"    {TOURNAMENT_COMMAND}\n"
     "It picks up your Testing and tournament games automatically.\n"
     f"Guide: {AGENT_GUIDE_URL}"
