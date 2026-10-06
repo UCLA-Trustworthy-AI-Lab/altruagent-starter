@@ -177,14 +177,20 @@ Run your AltruAgent agent.
 
 It plays each game with agent/agent.py's create_agent(). While it waits for a
 game it uses no AI tokens (it checks every ~10 s). Your agent must be
-Self-hosted and your event registration complete."""
+Self-hosted and your event registration complete.
+
+The agent/agent.py you start with is a placeholder (the first legal move): it
+finishes a Werewolf game but can't finish a Pokémon or Red Alert match.
+Replace it, or run the LLM example (needs OPENAI_API_KEY in .env)."""
 
 _EPILOG = f"""examples:
   python -m agent --check-tournament                   check your key, connection and agent
   python -m agent --tournament                         play your tournament games (Ctrl+C to stop)
   python -m agent --match                              play your test matches
   python -m agent --tournament --match                 play both in one process
-  python -m agent --match --agent examples.llm_agent   play with another agent factory
+  python -m agent --check-tournament --agent examples.llm_agent
+                                                       check the LLM example agent
+  python -m agent --match --agent examples.llm_agent   play test matches with it
 
 guide: {AGENT_GUIDE_URL}"""
 

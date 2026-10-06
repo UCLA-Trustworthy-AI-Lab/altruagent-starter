@@ -28,8 +28,10 @@ of a plain function, resolved with one `callable()` check and one
 `choose_action` may return, and this runner normalizes without ever
 guessing or fuzzy-coercing:
 
-    - a `LegalAction` from `state.legal_actions` (the universal pattern:
-      `return state.legal_actions[0]` works for every game)
+    - a `LegalAction` from `state.legal_actions` (`return
+      state.legal_actions[0]` is enough for Werewolf and the Pokémon draft,
+      but not for Pokémon's Team Preview/doubles templates or Red Alert,
+      whose `state.legal_actions` is empty; see GAMES.md)
     - that `LegalAction`'s `action_id` string
     - a plain `int`, ONLY accepted when `str(that int)` exactly equals some
       current legal action's `action_id` (this is what makes OpenSpiel-family

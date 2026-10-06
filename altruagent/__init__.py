@@ -62,8 +62,8 @@ lets one runner drive every currently-registered adapter (OpenSpiel-family
 games *and* structured RuntimeAdapter games like Pokémon) with no
 per-game/per-adapter branching anywhere in this SDK. ``state.legal_actions``
 is now ``list[LegalAction]`` (``action_id``/``label``/``input``/``raw``) —
-the universal pattern ``return state.legal_actions[0]`` works unchanged for
-every game. ``choose_action`` may also return a matching ``action_id``
+``return state.legal_actions[0]`` works unchanged for every game that lists
+its moves (not Pokémon's Team Preview/doubles templates, or Red Alert). ``choose_action`` may also return a matching ``action_id``
 string, a matching ``int`` (OpenSpiel-family only — rejected, never
 guessed, for a structured game), a structured ``dict`` (for constructive
 actions like Pokémon's team submission), or ``RESIGN``. The REST
