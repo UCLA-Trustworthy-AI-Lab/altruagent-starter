@@ -1561,3 +1561,88 @@ def test_too_many_waits_from_an_abandoned_wait_is_paced_and_retried():
 
     assert result.is_terminal
     assert len(game.wait_calls) == 3 and len(clock.sleeps) == 2
+
+
+# -- a move that can't be sent as JSON is the agent's own bug, not a connection problem --
+
+
+class _NumpyLikeInt:
+    """Stands in for numpy.int64 or a contestant's own class in a move."""
+
+
+def _real_transport_game(handler):
+    """A real MCPGameSession whose calls go through the real
+    mcp_transport.call_tool and MCP SDK, over a mocked HTTP layer."""
+    from functools import partial
+
+    from altruagent import mcp_game as mcp_game_module
+    from altruagent.mcp_game import MCPGameSession
+    from test_mcp_transport import FakeClient, make_factory
+
+    game = MCPGameSession(FakeClient(), session_id=SESSION_ID, game_server_url="http://game.example.test")
+    real_call_tool = partial(mcp_game_module.call_tool, httpx_client_factory=make_factory(handler))
+    game._call = lambda tool, arguments: real_call_tool(game._client, game._mcp_url(), tool, arguments)
+    return game
+
+
+def test_a_move_that_cant_be_sent_as_json_fails_at_once_as_the_agents_error():
+    # Was: classified as "no answer at all", so for 90 s the runner logged
+    # "Connection problem", asked the agent again every 1-5 s (about 26
+    # decisions, each an LLM call), then the worker said it had lost the
+    # connection. The same bug failed at once before this package.
+    import json as json_module
+
+    import httpx
+
+    from test_mcp_transport import _healthy_handler, _tool_call_response
+
+    clock = Clock()
+    lines: list[str] = []
+    asked = []
+    tools_called = []
+    state = {
+        "session_id": SESSION_ID, "game_type": "redalert", "status": "in_progress", "state_version": 4,
+        "phase": "moving", "is_current_actor": True, "is_terminal": False,
+        "legal_actions": {"session_id": SESSION_ID, "state_version": 4, "actions": []},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json_module.loads(request.content)
+        if body.get("method") == "tools/call":
+            tools_called.append(body["params"]["name"])
+            return httpx.Response(200, json=_tool_call_response(body.get("id"), state))
+        return _healthy_handler(request)
+
+    def choose(state, context):
+        asked.append(state.state_version)
+        return {"type": "move", "unit": _NumpyLikeInt()}
+
+    with pytest.raises(DecisionError) as exc_info:
+        run_game(_real_transport_game(handler), CONTEXT, choose, sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert "can't be sent" in str(exc_info.value) and "plain Python values" in str(exc_info.value)
+    assert asked == [4] and clock.sleeps == []
+    assert tools_called == ["get_game_state"]  # the move never left the process
+    assert lines == []  # no "Connection problem"
+
+
+def test_a_message_that_cant_be_sent_as_json_fails_at_once_as_the_agents_error():
+    clock = Clock()
+    lines: list[str] = []
+    unsendable = MCPToolError("MCP tool 'send_message' can't send its arguments as JSON: Unable to serialize",
+                              status_code=None, error_code=None, local_error=True)
+
+    class Talker:
+        def choose_action(self, state, context):
+            raise AssertionError("not reached")
+
+        def choose_message(self, state, context):
+            return SendMessage("hello", recipients=[1])
+
+    game = FakeMCPGameSession().queue_state(messaging_state()).queue_send_message(unsendable)
+
+    with pytest.raises(DecisionError) as exc_info:
+        run_game(game, CONTEXT, Talker(), sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert exc_info.value.__cause__ is unsendable and "can't be sent" in str(exc_info.value)
+    assert len(game.send_message_calls) == 1 and clock.sleeps == [] and lines == []

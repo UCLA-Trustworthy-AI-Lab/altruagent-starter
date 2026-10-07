@@ -92,13 +92,15 @@ def is_transient_error(exc: BaseException) -> bool:
     False for a definite answer: a game rule (``STALE_STATE``,
     ``INVALID_ACTION``, ``SESSION_NOT_FOUND``, ...), a refused key or
     registration, a seat held by another runtime, a request the platform
-    rejected as wrong (other 4xx), or a call the game server answered with an
+    rejected as wrong (other 4xx), a call the game server answered with an
     MCP tool error (``protocol_error``: arguments it couldn't accept, or the
-    tool crashed), which would most likely fail the same way again.
+    tool crashed), which would most likely fail the same way again, or a call
+    that never left this process because its arguments can't be sent as JSON
+    (``local_error``: a bug in the agent's own code, not a connection problem).
     """
     if not isinstance(exc, (PlatformError, AuthenticationError)):
         return False
-    if getattr(exc, "protocol_error", False):
+    if getattr(exc, "protocol_error", False) or getattr(exc, "local_error", False):
         return False
     code, status = exc.error_code, exc.status_code
     if code in _TRANSIENT_ERROR_CODES:

@@ -41,7 +41,7 @@ from altruagent.supervisor import (
     run_tournament_once,
     tournament_waiting_warning,
 )
-from altruagent.runner import TRANSIENT_GIVE_UP_SECONDS
+from altruagent.runner import TRANSIENT_GIVE_UP_SECONDS, DecisionError
 from altruagent.worker import (
     EXIT_CONNECTION_LOST,
     EXIT_MATCH_FAILURE,
@@ -1026,6 +1026,26 @@ def test_worker_whose_call_the_server_cant_handle_is_a_match_failure(contacted):
     code, _, _ = _worker(run_game_fn=failing)
 
     assert code == EXIT_MATCH_FAILURE
+
+
+@pytest.mark.parametrize("as_decision_error", [False, True])
+def test_worker_whose_move_cant_be_sent_as_json_is_a_match_failure_not_a_lost_connection(as_decision_error, capsys):
+    # A move holding, say, a numpy number never leaves the process. That is a
+    # bug in the agent's code: "match failed", never "lost the connection".
+    unsendable = MCPToolError("MCP tool 'play_action' can't send its arguments as JSON: Unable to serialize",
+                              status_code=None, error_code=None, local_error=True)
+
+    def failing(game, context, contestant):
+        game.contacted = True
+        if as_decision_error:  # as run_game reports it for a move or message
+            raise DecisionError("choose_action returned a move that can't be sent") from unsendable
+        raise unsendable
+
+    code, _, _ = _worker(run_game_fn=failing)
+
+    out = capsys.readouterr().out
+    assert code == EXIT_MATCH_FAILURE
+    assert "match failed" in out and "lost the connection" not in out
 
 
 def test_worker_ctrl_c_exits_quietly():

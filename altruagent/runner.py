@@ -565,6 +565,19 @@ def _is_tool_failure(exc: BaseException) -> bool:
     )
 
 
+# A move or message whose content can't be sent as JSON (``MCPToolError.
+# local_error``) is a bug in the agent's own code: it fails at once, like an
+# invalid move, never as a connection problem.
+_UNSENDABLE_HINT = (
+    "Use plain Python values only: str, int, float, bool, None, lists and dicts "
+    "(for example int(x) for a numpy number)."
+)
+
+
+def _is_unsendable(exc: BaseException) -> bool:
+    return isinstance(exc, MCPToolError) and getattr(exc, "local_error", False)
+
+
 def _is_retried(exc: BaseException) -> bool:
     """Retried in place: a temporary failure, or a first tool failure."""
     return _is_transient(exc) or _is_tool_failure(exc)
@@ -782,6 +795,11 @@ def run_game(
                         f"choose_message produced an invalid messaging action "
                         f"for session {context.session_id!r}: {exc}"
                     ) from exc
+                if _is_unsendable(exc):
+                    raise DecisionError(
+                        f"choose_message produced a message that can't be sent "
+                        f"for session {context.session_id!r} ({exc}). {_UNSENDABLE_HINT}"
+                    ) from exc
                 if _is_retried(exc):
                     state = recover(exc)
                     continue
@@ -865,6 +883,11 @@ def run_game(
                     raise DecisionError(
                         f"choose_action produced an invalid action for session "
                         f"{context.session_id!r}: {exc}"
+                    ) from exc
+                if _is_unsendable(exc):
+                    raise DecisionError(
+                        f"choose_action returned a move that can't be sent "
+                        f"for session {context.session_id!r} ({exc}). {_UNSENDABLE_HINT}"
                     ) from exc
                 if _is_retried(exc):
                     # Not resent: it may have landed. The fresh state says

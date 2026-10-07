@@ -224,6 +224,54 @@ def test_a_tool_error_answer_is_a_protocol_error_not_a_connection_problem():
     assert not is_transient_error(exc_info.value)
 
 
+class _AgentsOwnType:
+    """Stands in for a numpy number or a class of the contestant's own."""
+
+
+@pytest.mark.parametrize("value", [_AgentsOwnType(), b"\xff\xfe"], ids=["own-class", "bad-bytes"])
+def test_arguments_that_cant_be_sent_as_json_are_a_local_error_and_nothing_is_sent(value):
+    # Was: the SDK's serialization error came back wrapped in ExceptionGroups,
+    # as an MCPToolError with no code, which is_transient_error took for a
+    # dropped connection. The runner then asked the agent again and again for
+    # 90 s ("Connection problem"), for a bug in the agent's own code.
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _healthy_handler(request)
+
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "play_action", {"session_id": "s-1", "action": {"x": value}},
+                  httpx_client_factory=make_factory(handler))
+
+    assert exc_info.value.local_error is True and exc_info.value.protocol_error is False
+    assert "can't send its arguments as JSON" in str(exc_info.value)
+    assert not is_transient_error(exc_info.value)
+    assert requests == []  # checked before any connection is opened
+
+
+def test_a_serialization_error_inside_the_sdk_is_still_a_local_error(monkeypatch):
+    # Backstop, should the SDK ever convert arguments differently from the
+    # up-front check: its own PydanticSerializationError, found inside the
+    # ExceptionGroup wrapping, is still not taken for a connection problem.
+    monkeypatch.setattr(mcp_transport, "_check_arguments", lambda name, arguments: None)
+
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "play_action", {"session_id": "s-1", "action": {"x": _AgentsOwnType()}},
+                  httpx_client_factory=make_factory(_healthy_handler))
+
+    assert exc_info.value.local_error is True
+    assert not is_transient_error(exc_info.value)
+
+
+def test_plain_arguments_pass_the_up_front_check():
+    result = call_tool(FakeClient(), MCP_URL, "play_action",
+                       {"session_id": "s-1", "action": {"type": "move", "x": 3, "ids": [1, 2], "ok": None}},
+                       httpx_client_factory=make_factory(_healthy_handler))
+
+    assert result == {"session_id": "s-1"}
+
+
 def test_invalid_host_header_421_surfaces_as_mcp_tool_error_with_status_code():
     """Regression test for the real failure this transport was rewritten
     for: a 421 on the very first request (before any tool executes) must

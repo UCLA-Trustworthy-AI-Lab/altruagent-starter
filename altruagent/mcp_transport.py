@@ -58,8 +58,9 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from mcp import ClientSession
+from mcp import ClientSession, types
 from mcp.client.streamable_http import streamablehttp_client
+from pydantic_core import PydanticSerializationError
 
 from .errors import PlatformError
 
@@ -93,11 +94,57 @@ class MCPToolError(PlatformError):
     as a normal result with an ``error`` code, so this is a call the server
     can't handle, likely to fail the same way again. It is not a connection
     problem (``errors.is_transient_error`` is False for it).
+
+    ``local_error`` is True when the call never left this process: its
+    arguments can't be sent as JSON (for example a numpy number, bytes, or an
+    object of the agent's own class inside a move). Neither a connection nor
+    a server problem; sending the same arguments again fails the same way
+    (``errors.is_transient_error`` is False for it too).
     """
 
-    def __init__(self, message: str, *, protocol_error: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self, message: str, *, protocol_error: bool = False, local_error: bool = False, **kwargs: Any
+    ) -> None:
         super().__init__(message, **kwargs)
         self.protocol_error = protocol_error
+        self.local_error = local_error
+
+
+def _unsendable_arguments(name: str, exc: BaseException) -> MCPToolError:
+    return MCPToolError(
+        f"MCP tool {name!r} can't send its arguments as JSON: {exc}",
+        status_code=None,
+        error_code=None,
+        local_error=True,
+    )
+
+
+def _check_arguments(name: str, arguments: dict) -> None:
+    """Raise ``MCPToolError(local_error=True)`` if the SDK couldn't send
+    ``arguments``: the same JSON conversion ``ClientSession.call_tool`` does,
+    done before any connection is opened. Inside the SDK that failure would
+    surface wrapped in anyio ExceptionGroups, indistinguishable from a
+    dropped connection.
+    """
+    try:
+        types.CallToolRequestParams(name=name, arguments=arguments).model_dump(
+            by_alias=True, mode="json", exclude_none=True
+        )
+    except ValueError as exc:  # PydanticSerializationError, UnicodeDecodeError, ValidationError
+        raise _unsendable_arguments(name, exc) from exc
+
+
+def _find_serialization_error(exc: BaseException) -> PydanticSerializationError | None:
+    """A ``PydanticSerializationError`` anywhere in anyio's ExceptionGroup
+    wrapping: the SDK failed to turn this call's arguments into JSON (a
+    backstop for ``_check_arguments``)."""
+    if isinstance(exc, PydanticSerializationError):
+        return exc
+    for sub in getattr(exc, "exceptions", None) or ():
+        found = _find_serialization_error(sub)
+        if found is not None:
+            return found
+    return None
 
 
 async def _call_tool_once(
@@ -231,6 +278,7 @@ def call_tool(
     ``httpx_client_factory`` is a test-only seam (see ``_call_tool_once``) —
     production callers never pass it.
     """
+    _check_arguments(name, arguments)
     token = client._current_access_token()
     try:
         return asyncio.run(
@@ -244,6 +292,9 @@ def call_tool(
         # leaking out of this SDK. _find_http_status_error unwraps whatever
         # anyio's task-group wrapping did, so the 401 check below still works
         # regardless of how many ExceptionGroup layers deep it's nested.
+        serialization_exc = _find_serialization_error(exc)
+        if serialization_exc is not None:
+            raise _unsendable_arguments(name, serialization_exc) from exc
         http_exc = _find_http_status_error(exc)
         if http_exc is None:
             raise MCPToolError(
