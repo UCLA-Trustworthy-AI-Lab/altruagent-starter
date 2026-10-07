@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
 
-from altruagent.errors import AuthenticationError
+from altruagent import mcp_transport
+from altruagent.errors import AuthenticationError, is_transient_error
 from altruagent.mcp_transport import MCPToolError, call_tool
 
 MCP_URL = "http://game.example.test/mcp"
@@ -380,3 +382,59 @@ def test_call_tool_handles_unread_closed_error_response_end_to_end():
         call_tool(client, MCP_URL, "get_game_state", {"session_id": "s-1"}, httpx_client_factory=make_factory(handler))
 
     assert exc_info.value.status_code == 421
+
+
+# -- timeouts: a dead connection must not freeze the agent for minutes -------------------
+
+
+def _healthy_handler(request: httpx.Request) -> httpx.Response:
+    body = json.loads(request.content)
+    method, req_id = body.get("method"), body.get("id")
+    if method == "initialize":
+        return httpx.Response(200, json=_initialize_response(req_id))
+    if method == "notifications/initialized":
+        return httpx.Response(202)
+    if method == "tools/list":
+        return httpx.Response(200, json=_tools_list_response(req_id))
+    return httpx.Response(200, json=_tool_call_response(req_id, {"session_id": "s-1"}))
+
+
+def test_the_http_client_gets_a_short_connect_and_a_40s_read_timeout_not_the_sdks_300s():
+    # The SDK's own default is httpx.Timeout(30, read=300): one silently dropped
+    # connection would freeze a game for five minutes.
+    seen = []
+
+    def factory(headers=None, timeout=None, auth=None):
+        seen.append(timeout)
+        return httpx.AsyncClient(transport=httpx.MockTransport(_healthy_handler), headers=headers, timeout=timeout)
+
+    call_tool(FakeClient(), MCP_URL, "get_game_state", {"session_id": "s-1"}, httpx_client_factory=factory)
+
+    (timeout,) = seen
+    assert timeout == httpx.Timeout(mcp_transport.MCP_CONNECT_TIMEOUT_SECONDS, read=mcp_transport.MCP_READ_TIMEOUT_SECONDS)
+    assert (timeout.connect, timeout.read) == (10.0, 40.0)
+    # Above the server's longest healthy call: wait_for_update holds at most 25 s.
+    assert mcp_transport.MCP_READ_TIMEOUT_SECONDS >= 25.0 + 10.0
+    assert mcp_transport.MCP_SESSION_TIMEOUT_SECONDS > mcp_transport.MCP_READ_TIMEOUT_SECONDS
+
+
+def test_a_server_that_never_answers_fails_the_call_after_the_session_timeout(monkeypatch):
+    # A mock transport ignores httpx's socket timeouts, so this exercises the
+    # session-level backstop: the call fails as a transient MCPToolError
+    # (no error code) instead of hanging.
+    monkeypatch.setattr(mcp_transport, "MCP_SESSION_TIMEOUT_SECONDS", 0.3)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("method") == "tools/call":
+            await asyncio.sleep(30)
+        return _healthy_handler(request)
+
+    started = time.monotonic()
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "wait_for_update", {"session_id": "s-1"},
+                  httpx_client_factory=make_factory(handler))
+
+    assert time.monotonic() - started < 10
+    assert exc_info.value.error_code is None and exc_info.value.status_code is None
+    assert is_transient_error(exc_info.value)

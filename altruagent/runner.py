@@ -106,10 +106,12 @@ state's), never something `choose_action`/`choose_message` supply or manage.
 
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import replace
 from typing import Any, Callable, NamedTuple, Protocol, Union
 
+from .errors import AltruAgentError, is_transient_error
 from .mcp_game import MCPGameSession
 from .mcp_transport import MCPToolError
 from .models import DecisionContext, GameState, LegalAction, Match
@@ -117,9 +119,21 @@ from .models import DecisionContext, GameState, LegalAction, Match
 # The sleep between reads against a server without wait_for_update.
 DEFAULT_WAIT_SECONDS = 5.0
 
+# A temporary failure of any gameplay call (a dropped connection, a gateway or
+# server error, a game engine that is busy: ``errors.is_transient_error``)
+# doesn't end the game. The runner pauses, then reads the state again and
+# carries on; a move or message is never sent again blindly (it may have
+# landed), the decision is simply made again from the fresh state. The pause
+# grows from about 1 s to 5 s, with jitter. Only after this long without one
+# successful call does the error reach the worker.
+TRANSIENT_RETRY_FIRST_SECONDS = 1.0
+TRANSIENT_RETRY_MAX_SECONDS = 5.0
+TRANSIENT_GIVE_UP_SECONDS = 90.0
+
 # wait_for_update's long-poll timeout; it returns earlier as soon as anything
-# changes. 20 s is the server default, under the MCP client's 30 s read
-# timeout. This relies on the server honoring since_is_current_actor/
+# changes. 20 s is the server default (its maximum is 25 s), well under the
+# MCP client's 40 s read timeout (``mcp_transport.MCP_READ_TIMEOUT_SECONDS``).
+# This relies on the server honoring since_is_current_actor/
 # since_phase (Agent_ACP #24): without them, a whose-turn/phase change that
 # lands before the call — every Pokémon battle turn for the second seat to
 # submit — is only noticed at the timeout.
@@ -514,6 +528,49 @@ def _is_unknown_tool_error(exc: MCPToolError) -> bool:
     return exc.error_code is None and "unknown tool" in str(exc).lower()
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """A temporary failure worth retrying in place (see
+    ``TRANSIENT_GIVE_UP_SECONDS``). A server without ``wait_for_update``
+    also answers with no error code, but that is permanent: never retried.
+    """
+    if isinstance(exc, MCPToolError) and _is_unknown_tool_error(exc):
+        return False
+    return is_transient_error(exc)
+
+
+class _TransientRetry:
+    """Paces the retries after temporary failures in one game, and gives up
+    (re-raising the last error) once failures have lasted
+    ``TRANSIENT_GIVE_UP_SECONDS`` without a single successful call.
+    """
+
+    def __init__(self, *, sleep: Callable[[float], None], now: Callable[[], float],
+                 log: Callable[[str], None]) -> None:
+        self._sleep = sleep
+        self._now = now
+        self._log = log
+        self._since: float | None = None
+        self._streak = 0
+
+    def failed(self, exc: BaseException) -> None:
+        """Pause before the next try, or re-raise ``exc`` if it's time to give up."""
+        current = self._now()
+        if self._since is None:
+            self._since = current
+            self._log(f"Connection problem ({exc}); retrying for up to {TRANSIENT_GIVE_UP_SECONDS:.0f}s.")
+        elif current - self._since >= TRANSIENT_GIVE_UP_SECONDS:
+            raise exc
+        delay = min(TRANSIENT_RETRY_MAX_SECONDS, TRANSIENT_RETRY_FIRST_SECONDS * 2 ** self._streak)
+        self._streak += 1
+        self._sleep(delay * random.uniform(0.5, 1.0))
+
+    def succeeded(self) -> None:
+        if self._since is not None:
+            self._log("Connection back; the game goes on.")
+        self._since = None
+        self._streak = 0
+
+
 def _terminal_game_state(last_state: GameState, result: dict) -> GameState:
     """Merge a ``get_result()``/``resign()`` result (authoritative for
     ``returns``/``termination_reason``, confirmed absent from ``get_state()``/
@@ -530,6 +587,8 @@ def run_game(
     *,
     wait_seconds: float = DEFAULT_WAIT_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+    log: Callable[[str], None] = print,
 ) -> GameState:
     """Play one already-open ``MCPGameSession`` to completion.
 
@@ -571,8 +630,16 @@ def run_game(
     state and continues. ``RUNTIME_UNAVAILABLE`` (the adapter doesn't
     actually support a capability the runner expected) raises
     ``UnsupportedGameFlowError``. A contestant-caused messaging/action error
-    raises ``DecisionError``. Any other error propagates immediately — no
-    retrying.
+    raises ``DecisionError``.
+
+    A temporary failure of any call (``errors.is_transient_error``: a
+    dropped connection, a gateway or server error, a busy game engine) is
+    retried in place: a read is simply tried again after a short pause; a
+    move or message is never resent — the runner pauses, re-reads the state
+    and decides again. ``log`` gets one line when the trouble starts and one
+    when it ends. Only after ``TRANSIENT_GIVE_UP_SECONDS`` without a single
+    successful call does the error propagate. Any other error propagates
+    immediately.
 
     Returns the final ``GameState`` once the match is terminal.
     """
@@ -581,30 +648,53 @@ def run_game(
     result_hook = _resolve_result_hook(choose_action)
     long_poll_supported = True
     config_fetched = False
+    retry = _TransientRetry(sleep=sleep, now=now, log=log)
+
+    def read(call: Callable[[], Any]) -> Any:
+        """One read of the game (safe to repeat), retried in place after a
+        temporary failure."""
+        while True:
+            try:
+                answer = call()
+            except AltruAgentError as exc:
+                if not _is_transient(exc):
+                    raise
+                retry.failed(exc)
+                continue
+            retry.succeeded()
+            return answer
+
+    def recover(exc: AltruAgentError) -> GameState:
+        """After a temporary failure of a move or message: pause, then read
+        the state again. Never resend: it may have landed."""
+        retry.failed(exc)
+        return read(game.get_state)
 
     def wait(current: GameState, message_seq: int | None) -> GameState:
         nonlocal long_poll_supported
         if long_poll_supported:
             try:
-                return game.wait_for_update(
-                    since_version=current.state_version,
-                    since_message_seq=message_seq,
-                    since_is_current_actor=bool(current.is_current_actor),
-                    since_phase=current.phase,
-                    timeout_seconds=WAIT_FOR_UPDATE_TIMEOUT_SECONDS,
+                return read(
+                    lambda: game.wait_for_update(
+                        since_version=current.state_version,
+                        since_message_seq=message_seq,
+                        since_is_current_actor=bool(current.is_current_actor),
+                        since_phase=current.phase,
+                        timeout_seconds=WAIT_FOR_UPDATE_TIMEOUT_SECONDS,
+                    )
                 )
             except MCPToolError as exc:
                 if not _is_unknown_tool_error(exc):
                     raise
                 long_poll_supported = False
         sleep(wait_seconds)
-        return game.get_state()
+        return read(game.get_state)
 
-    state = game.get_state()
+    state = read(game.get_state)
 
     while True:
         if state.is_terminal:
-            result = game.get_result()
+            result = read(game.get_result)
             return _terminal_game_state(state, result)
 
         if state.raw.get("eliminated"):
@@ -624,23 +714,28 @@ def run_game(
                         content=decision.content,
                         recipients=decision.recipients,
                     )
-            except MCPToolError as exc:
-                if exc.error_code in _RACE_ERROR_CODES:
-                    state = game.get_state()
+            except AltruAgentError as exc:
+                code = exc.error_code if isinstance(exc, MCPToolError) else None
+                if code in _RACE_ERROR_CODES:
+                    state = read(game.get_state)
                     continue
-                if exc.error_code == _CAPABILITY_ERROR_CODE:
+                if code == _CAPABILITY_ERROR_CODE:
                     raise UnsupportedGameFlowError(
                         f"Match {context.session_id!r} reported phase="
                         f"{_MESSAGING_PHASE!r}, but its adapter does not support "
                         "messaging tools — a runner/adapter mismatch, not a "
                         "contestant bug."
                     ) from exc
-                if exc.error_code in _MESSAGE_SCOPED_ERROR_CODES:
+                if code in _MESSAGE_SCOPED_ERROR_CODES:
                     raise DecisionError(
                         f"choose_message produced an invalid messaging action "
                         f"for session {context.session_id!r}: {exc}"
                     ) from exc
+                if _is_transient(exc):
+                    state = recover(exc)
+                    continue
                 raise
+            retry.succeeded()
             # send_message's own result already carries the post-call phase.
             # Terminating is idempotent server-side, so a contestant that
             # already terminated this round (or the default auto-terminate)
@@ -648,7 +743,7 @@ def run_game(
             # talking — wait for the next message or the phase flip instead
             # of re-sending.
             if result.get("phase") == "moving":
-                state = game.get_state()
+                state = read(game.get_state)
             else:
                 state = wait(state, _last_message_seq(state, result))
             continue
@@ -661,7 +756,7 @@ def run_game(
             if state.raw.get("legal_actions") is None:
                 # The server omits legal_actions when a move landed between
                 # its state and legal-actions reads; fetch them directly.
-                legal = game.get_legal_actions()
+                legal = read(game.get_legal_actions)
                 state.legal_actions = [
                     LegalAction.from_dict(a) for a in legal.get("actions") or []
                 ]
@@ -696,30 +791,39 @@ def run_game(
                     state_version=state.state_version,
                     **reasoning,
                 )
-            except MCPToolError as exc:
-                recovered = exc.error_code in _RACE_ERROR_CODES or (
+            except AltruAgentError as exc:
+                code = exc.error_code if isinstance(exc, MCPToolError) else None
+                recovered = code in _RACE_ERROR_CODES or (
                     realtime
-                    and exc.error_code in _ACTION_SCOPED_ERROR_CODES | _REALTIME_TRANSIENT_ERROR_CODES
+                    and code in _ACTION_SCOPED_ERROR_CODES | _REALTIME_TRANSIENT_ERROR_CODES
                 )
                 if recovered:
-                    _report_result(result_hook, {"error": exc.error_code, "detail": str(exc)}, context)
-                    if exc.error_code in _REALTIME_TRANSIENT_ERROR_CODES:
+                    _report_result(result_hook, {"error": code, "detail": str(exc)}, context)
+                    if code in _REALTIME_TRANSIENT_ERROR_CODES:
                         sleep(REALTIME_RETRY_SECONDS)
-                    state = game.get_state()
+                    state = read(game.get_state)
                     continue
-                if exc.error_code == _CAPABILITY_ERROR_CODE:
+                if code == _CAPABILITY_ERROR_CODE:
                     raise UnsupportedGameFlowError(
                         f"Match {context.session_id!r} reported it was this "
                         "agent's turn, but its adapter rejected the move "
                         "capability — a runner/adapter mismatch, not a "
                         "contestant bug."
                     ) from exc
-                if exc.error_code in _ACTION_SCOPED_ERROR_CODES:
+                if code in _ACTION_SCOPED_ERROR_CODES:
                     raise DecisionError(
                         f"choose_action produced an invalid action for session "
                         f"{context.session_id!r}: {exc}"
                     ) from exc
+                if _is_transient(exc):
+                    # Not resent: it may have landed. The fresh state says
+                    # whether a decision is still due.
+                    if code is not None:
+                        _report_result(result_hook, {"error": code, "detail": str(exc)}, context)
+                    state = recover(exc)
+                    continue
                 raise
+            retry.succeeded()
             if isinstance(result, dict):
                 _report_result(result_hook, result, context)
             # While the game continues, play_action returns the post-move
@@ -729,7 +833,7 @@ def run_game(
             state = (
                 GameState.from_mcp_state(post_move)
                 if isinstance(post_move, dict)
-                else game.get_state()
+                else read(game.get_state)
             )
             continue
 

@@ -64,3 +64,50 @@ class PlatformError(AltruAgentError):
         self.error_code = error_code
         self.detail = detail
         self.next_action = next_action
+
+
+# The platform has answered a failed agent-session mint (its own sign-in
+# service rejecting or rate-limiting the request) with 401
+# invalid_official_agent_key and a detail starting with this. A temporary
+# platform problem, not a key problem (see ``altruagent.official``).
+MINT_FAILURE_PREFIX = "Failed to mint agent session"
+
+# Machine codes that mean "a temporary problem, try again shortly".
+_TRANSIENT_ERROR_CODES = frozenset(
+    {
+        "RUNTIME_TEMPORARILY_UNAVAILABLE",  # GameAPI: the game's engine is busy or restarting
+        "rate_limited",                     # control plane: too many requests just now
+        "agent_session_unavailable",        # control plane: couldn't start or check a session just now
+    }
+)
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True for a temporary problem between this agent and the platform, or
+    on the platform: no network or a dropped connection, a gateway or server
+    error (5xx), too many requests (429), a game engine that is busy right
+    now, or the platform failing to start a session. Retrying after a short
+    pause can help, and none of it is the agent's fault.
+
+    False for a definite answer: a game rule (``STALE_STATE``,
+    ``INVALID_ACTION``, ``SESSION_NOT_FOUND``, ...), a refused key or
+    registration, a seat held by another runtime, or a request the platform
+    rejected as wrong (other 4xx).
+    """
+    if not isinstance(exc, (PlatformError, AuthenticationError)):
+        return False
+    code, status = exc.error_code, exc.status_code
+    if code in _TRANSIENT_ERROR_CODES:
+        return True
+    if code == "invalid_official_agent_key":
+        return (exc.detail or "").startswith(MINT_FAILURE_PREFIX)
+    if status is not None and (status >= 500 or status in (408, 429)):
+        return True
+    if type(exc) is AuthenticationError and status == 401:
+        # A freshly issued agent session the platform didn't accept yet (the
+        # retry right after signing in again still got 401).
+        return True
+    if code is not None:
+        return False
+    # No answer at all: the network, or the connection to the game server.
+    return status is None and isinstance(exc, PlatformError)
