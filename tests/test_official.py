@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from altruagent.client import AltruAgentClient
-from altruagent.errors import AuthenticationError, ConfigurationError, PlatformError
+from altruagent.errors import AuthenticationError, ConfigurationError, PlatformError, is_transient_error
 from altruagent.official import (
     ASSIGNMENTS_PATH,
     AUTHENTICATE_PATH,
@@ -23,7 +23,9 @@ from altruagent.official import (
     OfficialAgentError,
     OfficialSeatAuth,
     is_fatal_auth_error,
+    is_registration_incomplete,
     load_official_agent_key,
+    registration_wait_message,
 )
 
 CONTROL = "https://control.example.test"
@@ -192,16 +194,48 @@ def test_invalid_key_message_mentions_self_hosted():
     assert "Self-hosted" in str(exc_info.value)
 
 
-def test_incomplete_registration_is_explained():
+def test_invalid_key_message_names_the_rotate_button_not_copying_again():
+    # The dashboard shows a key once; while one exists it offers only Rotate/Revoke.
+    with pytest.raises(OfficialAgentError) as exc_info:
+        official(Backend(key_valid=False)).authenticate()
+
+    message = str(exc_info.value)
+    assert "Rotate key" in message
+    assert "copy the key again" not in message and "generate a new one" not in message
+
+
+def test_updated_rules_are_explained_and_the_runtime_keeps_trying():
     def backend(request):
-        return httpx.Response(403, json={"error": "registration_incomplete", "detail": "rules", "next_step": "rules"})
+        return httpx.Response(403, json={"error": "registration_incomplete",
+                                         "detail": "Finish your tournament registration first.", "next_step": "rules"})
 
     with pytest.raises(OfficialAgentError) as exc_info:
         official(backend).authenticate()
 
     error = exc_info.value
-    assert (error.status_code, error.error_code) == (403, "registration_incomplete")
+    assert (error.status_code, error.error_code, error.next_step) == (403, "registration_incomplete", "rules")
+    assert str(error) == ("Accept the updated Official Rules on your dashboard "
+                          "(https://platform.altruagent-game.com/tournament/dashboard).")
+    assert is_registration_incomplete(error) and not is_fatal_auth_error(error)
+    assert registration_wait_message(error) == (
+        "Accept the updated Official Rules on your dashboard "
+        "(https://platform.altruagent-game.com/tournament/dashboard); I'll keep trying.")
+
+
+@pytest.mark.parametrize("next_step", ["questionnaire", "repository", None])
+def test_another_missing_registration_step_is_explained(next_step):
+    def backend(request):
+        return httpx.Response(403, json={"error": "registration_incomplete", "detail": "x", "next_step": next_step})
+
+    with pytest.raises(OfficialAgentError) as exc_info:
+        official(backend).authenticate()
+
+    error = exc_info.value
     assert "registration isn't complete" in str(error) and "platform.altruagent-game.com" in str(error)
+    assert "run this again" not in str(error)
+    assert registration_wait_message(error).startswith("Your event registration isn't complete. Finish it on your dashboard")
+    assert registration_wait_message(error).endswith("; I'll keep trying.")
+    assert not is_fatal_auth_error(error)
 
 
 def test_key_revoked_mid_run_fails_after_one_reauth_attempt():
@@ -237,7 +271,7 @@ def test_a_failed_session_mint_is_reported_as_temporary_not_as_a_bad_key():
 
     assert error.error_code == "invalid_official_agent_key"  # the platform's code is kept as sent
     assert "temporary" in str(error) and "not your key" in str(error)
-    assert "copy the key again" not in str(error)
+    assert "Rotate key" not in str(error)
     assert not is_fatal_auth_error(error)
 
 
@@ -254,7 +288,8 @@ def test_agent_session_unavailable_is_explained_as_temporary():
         (httpx.Response(401, json={"error": "invalid_official_agent_key",
                                    "detail": "This agent is Oracle Hosted; its Official Agent Key works again..."}), True),
         (httpx.Response(400, json={"error": "invalid_official_agent_key", "detail": "official_agent_key is required."}), True),
-        (httpx.Response(403, json={"error": "registration_incomplete", "detail": "rules", "next_step": "rules"}), True),
+        # Not fatal: the runtime says what to do and keeps trying (updated Official Rules).
+        (httpx.Response(403, json={"error": "registration_incomplete", "detail": "rules", "next_step": "rules"}), False),
         (httpx.Response(401, json={"error": "invalid_official_agent_key",
                                    "detail": "Failed to mint agent session: no session returned"}), False),
         (httpx.Response(429, json={"error": "rate_limited", "detail": "Too many requests."}), False),
@@ -265,7 +300,7 @@ def test_agent_session_unavailable_is_explained_as_temporary():
         (httpx.Response(200, json={}), False),  # no session token in the answer
     ],
 )
-def test_is_fatal_auth_error_only_for_a_refused_key_or_registration(response, fatal):
+def test_is_fatal_auth_error_only_for_a_refused_key(response, fatal):
     assert is_fatal_auth_error(_authenticate_error(response)) is fatal
 
 
@@ -429,3 +464,89 @@ def test_seat_auth_rejects_a_renewal_for_a_different_seat():
 
     with pytest.raises(OfficialAgentError):
         seat_auth.login(None, CONTROL)
+
+
+# -- which failures are temporary (retried in place) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PlatformError("Could not reach the control plane", status_code=None),
+        PlatformError("Bad Gateway", status_code=502),
+        PlatformError("internal", status_code=500, error_code="internal_error"),  # e.g. a seat sign-in that failed
+        PlatformError("slow down", status_code=429),
+        PlatformError("timeout", status_code=408),
+        OfficialAgentError("slow down", status_code=429, error_code="rate_limited"),
+        OfficialAgentError("busy", status_code=503, error_code="agent_session_unavailable"),
+        OfficialAgentError("gateway", status_code=504),
+        OfficialAgentError("temporary", status_code=401, error_code="invalid_official_agent_key",
+                           detail="Failed to mint agent session: Request rate limit reached"),
+        AuthenticationError("Invalid or expired agent session token", status_code=401,
+                            error_code="invalid_agent_session"),
+    ],
+    ids=lambda error: f"{type(error).__name__}-{error.status_code}-{error.error_code}",
+)
+def test_temporary_failures(error):
+    assert is_transient_error(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OfficialAgentError("not accepted", status_code=401, error_code="invalid_official_agent_key",
+                           detail="Invalid official agent key"),
+        OfficialAgentError("rules", status_code=403, error_code="registration_incomplete"),
+        OfficialAgentError("held", status_code=409, error_code="seat_busy"),
+        OfficialAgentError("ended", status_code=409, error_code="assignment_not_grantable"),
+        OfficialAgentError("missing", status_code=404, error_code="assignment_not_found"),
+        OfficialAgentError("Seat renewal returned a different seat than the one assigned."),
+        OfficialAgentError("not accepted", status_code=401),
+        PlatformError("bad request", status_code=400, error_code="invalid_request"),
+        PlatformError("retired", status_code=410, error_code="platform_agents_retired"),
+        ValueError("not ours"),
+    ],
+    ids=lambda error: f"{type(error).__name__}-{getattr(error, 'status_code', None)}-{getattr(error, 'error_code', None)}",
+)
+def test_definite_answers_are_not_temporary(error):
+    assert not is_transient_error(error)
+
+
+# -- one sign-in per runtime, not one per game ------------------------------------------------
+
+
+def test_session_token_is_none_before_signing_in_and_never_signs_in_itself():
+    backend = Backend()
+    client = official(backend)
+
+    assert client.session_token() is None
+    assert backend.auth_bodies == []
+
+    client.authenticate()
+    assert client.session_token() == "sess-1"
+
+
+def test_a_worker_reuses_the_runtimes_session_instead_of_signing_in_again():
+    backend = Backend()
+    backend.grant_responses["seat-1"] = [httpx.Response(200, json=grant())]
+    runtime = official(backend)
+    runtime.authenticate()
+
+    worker = official(backend)
+    worker.use_session_token(runtime.session_token())
+    worker.grant("seat-1", EXEC)
+
+    assert len(backend.auth_bodies) == 1  # only the runtime's own sign-in
+    assert backend.requests[-1][2] == "Bearer sess-1"
+
+
+def test_an_expired_handed_over_session_signs_in_once_as_usual():
+    backend = Backend()
+    backend.grant_responses["seat-1"] = [httpx.Response(200, json=grant())]
+    worker = official(backend)
+    worker.use_session_token("sess-expired")
+
+    worker.grant("seat-1", EXEC)
+
+    assert len(backend.auth_bodies) == 1
+    assert worker.session_token() == "sess-1"

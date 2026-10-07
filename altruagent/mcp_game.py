@@ -176,9 +176,13 @@ class MCPGameSession:
         return self._call("get_messages", {"session_id": self.session_id, "since": since})
 
     def resign(self) -> dict:
-        """``resign`` — concede the game. Returns the same terminal-result
-        shape as ``get_result()`` (confirmed identical dict literal in
-        ``openspiel_adapter.py``), so no follow-up call is needed.
+        """``resign`` — concede the game. Returns the same shape as
+        ``get_result()`` (confirmed identical dict literal in
+        ``openspiel_adapter.py``). In most games the resign ends the game, so
+        this is the final result and no follow-up call is needed. In Werewolf
+        it takes only you out and the game goes on: ``is_terminal`` is false
+        and ``eliminated`` true, and ``get_result()`` gives the final result
+        once the game ends.
         """
         return self._call("resign", {"session_id": self.session_id})
 

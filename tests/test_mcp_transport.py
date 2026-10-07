@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
 
-from altruagent.errors import AuthenticationError
+from altruagent import mcp_transport
+from altruagent.errors import AuthenticationError, is_transient_error
 from altruagent.mcp_transport import MCPToolError, call_tool
 
 MCP_URL = "http://game.example.test/mcp"
@@ -202,6 +204,72 @@ def test_call_tool_protocol_level_error_raises_mcp_tool_error_with_no_code():
         call_tool(client, MCP_URL, "bogus_tool", {}, httpx_client_factory=make_factory(handler))
 
     assert exc_info.value.error_code is None
+
+
+def test_a_tool_error_answer_is_a_protocol_error_not_a_connection_problem():
+    # The server answered, with isError (FastMCP: arguments it couldn't
+    # accept, or the tool crashed). Retrying for 90 s as if the connection
+    # had dropped would ask the agent again and again for nothing.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("method") == "tools/call":
+            return httpx.Response(200, json=_tool_call_response(body.get("id"), {}, is_error=True))
+        return _healthy_handler(request)
+
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "play_action", {"session_id": "s-1"}, httpx_client_factory=make_factory(handler))
+
+    assert exc_info.value.protocol_error is True
+    assert (exc_info.value.error_code, exc_info.value.status_code) == (None, None)
+    assert not is_transient_error(exc_info.value)
+
+
+class _AgentsOwnType:
+    """Stands in for a numpy number or a class of the contestant's own."""
+
+
+@pytest.mark.parametrize("value", [_AgentsOwnType(), b"\xff\xfe"], ids=["own-class", "bad-bytes"])
+def test_arguments_that_cant_be_sent_as_json_are_a_local_error_and_nothing_is_sent(value):
+    # Was: the SDK's serialization error came back wrapped in ExceptionGroups,
+    # as an MCPToolError with no code, which is_transient_error took for a
+    # dropped connection. The runner then asked the agent again and again for
+    # 90 s ("Connection problem"), for a bug in the agent's own code.
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _healthy_handler(request)
+
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "play_action", {"session_id": "s-1", "action": {"x": value}},
+                  httpx_client_factory=make_factory(handler))
+
+    assert exc_info.value.local_error is True and exc_info.value.protocol_error is False
+    assert "can't send its arguments as JSON" in str(exc_info.value)
+    assert not is_transient_error(exc_info.value)
+    assert requests == []  # checked before any connection is opened
+
+
+def test_a_serialization_error_inside_the_sdk_is_still_a_local_error(monkeypatch):
+    # Backstop, should the SDK ever convert arguments differently from the
+    # up-front check: its own PydanticSerializationError, found inside the
+    # ExceptionGroup wrapping, is still not taken for a connection problem.
+    monkeypatch.setattr(mcp_transport, "_check_arguments", lambda name, arguments: None)
+
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "play_action", {"session_id": "s-1", "action": {"x": _AgentsOwnType()}},
+                  httpx_client_factory=make_factory(_healthy_handler))
+
+    assert exc_info.value.local_error is True
+    assert not is_transient_error(exc_info.value)
+
+
+def test_plain_arguments_pass_the_up_front_check():
+    result = call_tool(FakeClient(), MCP_URL, "play_action",
+                       {"session_id": "s-1", "action": {"type": "move", "x": 3, "ids": [1, 2], "ok": None}},
+                       httpx_client_factory=make_factory(_healthy_handler))
+
+    assert result == {"session_id": "s-1"}
 
 
 def test_invalid_host_header_421_surfaces_as_mcp_tool_error_with_status_code():
@@ -380,3 +448,105 @@ def test_call_tool_handles_unread_closed_error_response_end_to_end():
         call_tool(client, MCP_URL, "get_game_state", {"session_id": "s-1"}, httpx_client_factory=make_factory(handler))
 
     assert exc_info.value.status_code == 421
+
+
+# -- timeouts: a dead connection must not freeze the agent for minutes -------------------
+
+
+def _healthy_handler(request: httpx.Request) -> httpx.Response:
+    body = json.loads(request.content)
+    method, req_id = body.get("method"), body.get("id")
+    if method == "initialize":
+        return httpx.Response(200, json=_initialize_response(req_id))
+    if method == "notifications/initialized":
+        return httpx.Response(202)
+    if method == "tools/list":
+        return httpx.Response(200, json=_tools_list_response(req_id))
+    return httpx.Response(200, json=_tool_call_response(req_id, {"session_id": "s-1"}))
+
+
+def test_the_http_client_gets_a_short_connect_and_a_40s_read_timeout_not_the_sdks_300s():
+    # The SDK's own default is httpx.Timeout(30, read=300): one silently dropped
+    # connection would freeze a game for five minutes.
+    seen = []
+
+    def factory(headers=None, timeout=None, auth=None):
+        seen.append(timeout)
+        return httpx.AsyncClient(transport=httpx.MockTransport(_healthy_handler), headers=headers, timeout=timeout)
+
+    call_tool(FakeClient(), MCP_URL, "get_game_state", {"session_id": "s-1"}, httpx_client_factory=factory)
+
+    (timeout,) = seen
+    assert timeout == httpx.Timeout(mcp_transport.MCP_CONNECT_TIMEOUT_SECONDS, read=mcp_transport.MCP_READ_TIMEOUT_SECONDS)
+    assert (timeout.connect, timeout.read) == (10.0, 40.0)
+    # Above the server's longest healthy call: wait_for_update holds at most 25 s.
+    assert mcp_transport.MCP_READ_TIMEOUT_SECONDS >= 25.0 + 10.0
+    assert mcp_transport.MCP_SESSION_TIMEOUT_SECONDS > mcp_transport.MCP_READ_TIMEOUT_SECONDS
+
+
+def test_a_server_that_never_answers_fails_the_call_after_the_session_timeout(monkeypatch):
+    # A mock transport ignores httpx's socket timeouts, so this exercises the
+    # session-level backstop: the call fails as a transient MCPToolError
+    # (no error code) instead of hanging.
+    monkeypatch.setattr(mcp_transport, "MCP_SESSION_TIMEOUT_SECONDS", 0.3)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("method") == "tools/call":
+            await asyncio.sleep(30)
+        return _healthy_handler(request)
+
+    started = time.monotonic()
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "wait_for_update", {"session_id": "s-1"},
+                  httpx_client_factory=make_factory(handler))
+
+    assert time.monotonic() - started < 10
+    assert exc_info.value.error_code is None and exc_info.value.status_code is None
+    assert exc_info.value.protocol_error is False  # no answer at all, unlike an isError answer
+    assert is_transient_error(exc_info.value)
+
+
+@pytest.fixture
+def silent_server():
+    """A real local TCP server that accepts each connection, reads the
+    request, and never answers: what a silently dropped connection looks like
+    from the client's side. Yields its MCP URL."""
+    import socket
+    import threading
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    held: list[socket.socket] = []
+
+    def accept() -> None:
+        while True:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            held.append(connection)
+            threading.Thread(target=connection.recv, args=(65536,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    yield f"http://127.0.0.1:{server.getsockname()[1]}/mcp"
+    server.close()
+    for connection in held:
+        connection.close()
+
+
+def test_the_read_timeout_reaches_the_real_connection(monkeypatch, silent_server):
+    # Over a real socket (not a mock transport): the HTTP read timeout itself
+    # ends a call whose server went silent, long before the session backstop.
+    monkeypatch.setattr(mcp_transport, "MCP_READ_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(mcp_transport, "MCP_SESSION_TIMEOUT_SECONDS", 30.0)
+
+    started = time.monotonic()
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), silent_server, "wait_for_update", {"session_id": "s-1"})
+
+    assert time.monotonic() - started < 10
+    assert "ReadTimeout" in str(exc_info.value)
+    assert is_transient_error(exc_info.value)

@@ -27,9 +27,15 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Collection
 
+from .console import print_line
 from .errors import AuthenticationError, PlatformError
-from .official import is_fatal_auth_error, new_execution_id
+from .official import is_fatal_auth_error, is_registration_incomplete, new_execution_id, registration_wait_message
+from .runner import TRANSIENT_GIVE_UP_SECONDS
 from .worker import (
+    EXIT_CONNECTION_LOST,
+    EXIT_KEY_REFUSED,
+    EXIT_NOT_CONNECTED,
+    EXIT_REGISTRATION_INCOMPLETE,
     EXIT_SEAT_BUSY,
     EXIT_SUCCESS,
     TournamentWorkerInput,
@@ -238,16 +244,56 @@ DEFAULT_TOURNAMENT_POLL_SECONDS = 10.0
 # ended can drop off the list a moment before its worker notices.
 MISSING_POLLS_BEFORE_STOP = 2
 WAITING_MESSAGE = "Waiting for your next game..."
+# Said once when a game's worker finds the Official Agent Key refused (it was
+# rotated or revoked while this runtime was running). The runtime's own agent
+# session still works for up to about an hour, so it would otherwise keep
+# picking up games it can't play. From then on it starts no new game; the
+# games already running keep playing. A new key needs a restart: .env is read
+# once, at startup.
+KEY_REFUSED_MESSAGE = (
+    "Your Official Agent Key is no longer accepted, so no new game will start. Put your new key in .env "
+    "(ALTRUAGENT_OFFICIAL_AGENT_KEY) and restart this process; check too that your agent is still Self-hosted. "
+    "Games already running keep playing for now."
+)
 # After seat_busy, retry the seat once the backend's 30 s execution lease
 # could have lapsed (a previous run releasing it, or this runtime's own
 # re-authenticated session); a seat another live runtime keeps renewing
 # just stays busy.
 SEAT_BUSY_RETRY_SECONDS = 35.0
 # A seat whose worker keeps failing (a game the server lost answers
-# SESSION_NOT_FOUND until the platform closes it, which takes a few minutes)
-# is retried less and less often: the cooldown doubles with each failure in a
-# row, up to this. A finished match or a seat_busy resets it.
+# SESSION_NOT_FOUND until the platform closes it, which takes a few minutes;
+# an agent that crashes on the same state again) is retried less and less
+# often: the cooldown doubles with each failure in a row, up to this. A
+# finished match or a seat_busy resets it, and a worker that ran at least this
+# long before failing starts a new count.
 SEAT_FAILURE_BACKOFF_MAX_SECONDS = 600.0
+# A worker that lost the connection to its game (EXIT_CONNECTION_LOST: the
+# in-game retries gave up after runner.TRANSIENT_GIVE_UP_SECONDS) after
+# playing for at least WORKER_PLAYED_SECONDS is picked up again after
+# RESTART_AFTER_PLAY_SECONDS, not a minute or more, and starts a new count.
+# The reason decides it, not only the time: an agent that crashes, or a
+# worker that never reached its game, keeps the doubling cooldown however
+# long it ran. A worker that lost the connection almost at once also does,
+# so a game that keeps failing can't cost a new seat grant every ~100 s.
+WORKER_PLAYED_SECONDS = 30.0
+RESTART_AFTER_PLAY_SECONDS = 10.0
+# A worker that never reached its game because of a temporary problem
+# (EXIT_NOT_CONNECTED) is replaced after this pause (0: in the same poll)
+# while the game's connect window is open, however often it happened: an
+# agent that isn't connected by the deadline loses the game as a no-show.
+# No hot loop: such a worker has already retried for a minute or more itself
+# (worker.FIRST_GRANT_RETRY_SECONDS, runner.TRANSIENT_GIVE_UP_SECONDS).
+NOT_CONNECTED_RETRY_SECONDS = 0.0
+# The connect window counts as open for at least this long after a game is
+# first listed (or until its connect_deadline_at, if later): a computer whose
+# clock is off must not cut it short, and retrying past the real deadline
+# costs little (the platform then answers that the game has ended).
+MIN_CONNECT_WINDOW_SECONDS = 300.0
+# While the platform says the event registration is incomplete (for example
+# the Official Rules were updated), the runtime keeps trying at this pace and
+# repeats what to do at most every REGISTRATION_REMINDER_SECONDS.
+REGISTRATION_RETRY_SECONDS = 30.0
+REGISTRATION_REMINDER_SECONDS = 300.0
 # The agent session lasts about an hour, so the runtime signs in again with
 # the Official Agent Key now and then. When that hits a temporary problem
 # (429, 5xx, a session the platform couldn't start or didn't accept), the
@@ -303,16 +349,33 @@ def _format_wait(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
-def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | None = None) -> list[str]:
+def _kind_label(assignment: "OfficialAssignment") -> str:
+    context = (assignment.context or "").strip().lower()
+    return {"testing": " (Testing)", "tournament": " (tournament)"}.get(context, "")
+
+
+def _players_note(players: int, player_count: int | None) -> str:
+    """How many of a match's players this runtime picked up at once, when more
+    than one (self-play, or several players in one test match)."""
+    if players <= 1:
+        return ""
+    if player_count == players:
+        return f", self-play: your agent plays all {players} players"
+    if isinstance(player_count, int) and player_count > players:
+        return f", your agent plays {players} of the {player_count} players"
+    return f", your agent plays {players} players"
+
+
+def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | None = None,
+                        players: int = 1) -> list[str]:
     """The lines logged when a game is picked up: the game, then (when the
     server sent them) Testing vs tournament, the tournament and round, the
     opponents, and the connect deadline with the time left. Never prints ids
-    or tokens.
+    or tokens. ``players``: how many of the match's players were picked up
+    together (one set of lines for all of them).
     """
     game = _clean(assignment.game_type) or "unknown game"
-    context = (assignment.context or "").strip().lower()
-    kind = {"testing": " (Testing)", "tournament": " (tournament)"}.get(context, "")
-    lines = [f"Match assigned: {game}{kind}"]
+    lines = [f"Match assigned: {game}{_kind_label(assignment)}{_players_note(players, assignment.seat_count)}"]
 
     name, round_label = _clean(assignment.tournament_name), _clean(assignment.round_label)
     if name and round_label:
@@ -378,6 +441,14 @@ class TournamentState:
         self.failed_until: dict[str, float] = {}
         # Failed workers in a row, per seat (see SEAT_FAILURE_BACKOFF_MAX_SECONDS).
         self.seat_failures: dict[str, int] = {}
+        # When (on the ``now`` clock) each seat's current worker started, and
+        # until when each listed seat's connect window is open (with the
+        # match and deadline it was worked out for: a new game for the same
+        # seat gets a new window).
+        self.started_at: dict[str, float] = {}
+        self.connect_by: dict[str, tuple[tuple[str, str | None], float]] = {}
+        # When the registration message was last printed (``now`` clock).
+        self.registration_noted_at: float | None = None
         self.missing_polls: dict[str, int] = {}
         self.discovery_failing = False
         # Games (match ids) of a kind this runtime doesn't play that it has
@@ -387,12 +458,38 @@ class TournamentState:
         # clock) the next assignment listing may try again.
         self.auth_failures = 0
         self.discovery_retry_at: float | None = None
+        # The assignment each seat's worker was started for, while the seat is
+        # listed or has a worker: which match (and game) a worker belongs to.
+        self.seat_games: dict[str, "OfficialAssignment"] = {}
+        # Seats whose last worker stopped before its game ended (an error, a
+        # lost connection, no way in yet, an incomplete registration) and
+        # that have no worker now. If the match ends before a new worker
+        # finishes it, the runtime says so, once per match.
+        self.stopped: dict[str, "OfficialAssignment"] = {}
+        # True once a worker found the Official Agent Key refused
+        # (EXIT_KEY_REFUSED): no new worker is started after that.
+        self.key_refused = False
 
 
 def _auth_retry_delay(exc: AuthenticationError, failures: int) -> float:
     if exc.status_code == 429:
         return AUTH_RATE_LIMIT_WAIT_SECONDS
     return min(AUTH_RETRY_MAX_SECONDS, AUTH_RETRY_BASE_SECONDS * 2 ** failures)
+
+
+def _connect_by(assignment: "OfficialAssignment", current_time: float, wall: datetime) -> float:
+    """The end of the assignment's connect window on the ``now`` clock:
+    ``MIN_CONNECT_WINDOW_SECONDS`` from now, or its ``connect_deadline_at``
+    if that is later."""
+    deadline = _parse_utc(assignment.connect_deadline_at) if assignment.connect_deadline_at else None
+    left = (deadline - wall).total_seconds() if deadline is not None else 0.0
+    return current_time + max(MIN_CONNECT_WINDOW_SECONDS, left)
+
+
+def _note_registration(state: TournamentState, current_time: float, message: str, log: Callable[[str], None]) -> None:
+    if state.registration_noted_at is None or current_time - state.registration_noted_at >= REGISTRATION_REMINDER_SECONDS:
+        state.registration_noted_at = current_time
+        log(message)
 
 
 def _note_other_kind(assignment: "OfficialAssignment", state: TournamentState, log: Callable[[str], None]) -> None:
@@ -419,7 +516,7 @@ def run_tournament_once(
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = print_line,
     wall_now: Callable[[], datetime] = _utc_now,
 ) -> None:
     """One non-blocking tournament tick, keyed by ``seat_id`` throughout:
@@ -427,45 +524,136 @@ def run_tournament_once(
     1. Reap finished workers (a failure puts that seat in cooldown; it is
        retried later, which re-requests its grant — the reconnect path).
        Each failure in a row doubles that seat's cooldown, up to
-       ``SEAT_FAILURE_BACKOFF_MAX_SECONDS``.
+       ``SEAT_FAILURE_BACKOFF_MAX_SECONDS`` (a worker that ran that long
+       first starts a new count). A worker that lost the connection to its
+       game (``EXIT_CONNECTION_LOST``) after playing for
+       ``WORKER_PLAYED_SECONDS`` starts a new count and is replaced after
+       ``RESTART_AFTER_PLAY_SECONDS``. A worker that never reached its game
+       because of a temporary problem (``EXIT_NOT_CONNECTED``) is replaced
+       after ``NOT_CONNECTED_RETRY_SECONDS`` while the connect window is open.
+       One turned away by an incomplete registration is retried every
+       ``REGISTRATION_RETRY_SECONDS``. One that found the Official Agent Key
+       refused (``EXIT_KEY_REFUSED``) makes the runtime say
+       ``KEY_REFUSED_MESSAGE`` once and start no new worker from then on (the
+       running ones keep playing). A worker that stopped with an error is
+       said to have stopped while the match continues, never that the match
+       ended; ``WAITING_MESSAGE`` follows only exits after which nothing of
+       that game is pending here. A match whose players this runtime plays
+       (self-play) gets one "Match finished." when the last of them is done.
     2. List this agent's active assignments. A transient control-plane
        failure is logged and the tick skipped (the runtime keeps waiting).
        So is a temporary failure to sign in again (``is_fatal_auth_error``
        is false), which also pauses listing for a backoff; running workers
-       are never touched. Only a refusal of the key or the registration
-       propagates — it would affect every seat.
-    3. Start one worker per listed seat of a kind in ``kinds``
+       are never touched. An incomplete registration (for example updated
+       Official Rules) is not fatal either: the runtime says what to do and
+       keeps trying every ``REGISTRATION_RETRY_SECONDS``. Only a refusal of
+       the key itself propagates — it would affect every seat.
+    3. A seat whose worker had stopped (``TournamentState.stopped``) and that
+       has left the list: its match ended without that worker; said once per
+       match. Then start one worker per listed seat of a kind in ``kinds``
        (``assignment_kind``: ``TESTING`` and/or ``TOURNAMENT``) that has none
        and isn't cooling down, logging what was picked up
-       (``describe_assignment``). A game of another kind is not played; it
-       gets one warning or note per game (``_note_other_kind``).
+       (``describe_assignment``, once per match however many of its players
+       start). A game of another kind is not played; it gets one warning or
+       note per game (``_note_other_kind``).
     4. Stop workers whose seat has left the list for
        ``MISSING_POLLS_BEFORE_STOP`` consecutive listings. Every listed seat
        counts here, whatever its kind: ``kinds`` only decides which games
        are started, never stops one already being played.
     """
     current_time = now()
-    for seat_id, exitcode in state.registry.reap_finished().items():
+    # Several of a match's players can be played by this runtime (self-play):
+    # what is said about one of them is said once per match and tick.
+    said: set[tuple[str, str]] = set()
+
+    def match_of(seat_id: str) -> str:
+        assignment = state.seat_games.get(seat_id)
+        return (assignment.match_id if assignment is not None else "") or seat_id
+
+    def say(seat_id: str, line: str) -> None:
+        if (match_of(seat_id), line) not in said:
+            said.add((match_of(seat_id), line))
+            log(line)
+
+    def say_waiting() -> None:  # at most once per tick; never after a refused key
+        if ("", WAITING_MESSAGE) not in said and not state.key_refused:
+            said.add(("", WAITING_MESSAGE))
+            log(WAITING_MESSAGE)
+
+    reaped = state.registry.reap_finished()
+    finished: list[str] = []  # matches with a player that finished, in order
+    idle = False  # whether "Waiting for your next game..." fits these exits
+    for seat_id, exitcode in reaped.items():
         state.missing_polls.pop(seat_id, None)
+        started = state.started_at.pop(seat_id, None)
+        ran = current_time - started if started is not None else 0.0
         # Either way the seat waits out a cooldown before any new worker: a
         # finished seat can linger in the listing for a moment, and a failed
         # one is retried (re-granted) only if it's still assigned afterwards.
         state.failed_until[seat_id] = current_time + cooldown_seconds
+        connect_by = state.connect_by[seat_id][1] if seat_id in state.connect_by else None
+        if exitcode not in (EXIT_SUCCESS, EXIT_SEAT_BUSY) and seat_id in state.seat_games:
+            state.stopped[seat_id] = state.seat_games[seat_id]
         if exitcode == EXIT_SUCCESS:
             state.seat_failures.pop(seat_id, None)
-            log("Match finished.")
+            if match_of(seat_id) not in finished:
+                finished.append(match_of(seat_id))
+            idle = True
         elif exitcode == EXIT_SEAT_BUSY:
             state.seat_failures.pop(seat_id, None)
             state.failed_until[seat_id] = current_time + SEAT_BUSY_RETRY_SECONDS
-            log(f"Another runtime is playing this match with your Official Agent Key; checking again in {SEAT_BUSY_RETRY_SECONDS:.0f}s.")
+            say(seat_id, f"Another runtime is playing this match with your Official Agent Key; checking again in "
+                         f"{SEAT_BUSY_RETRY_SECONDS:.0f}s.")
+            idle = True
+        elif exitcode == EXIT_KEY_REFUSED:
+            # No retry can help until the contestant restarts with the new key.
+            if not state.key_refused:
+                state.key_refused = True
+                log(KEY_REFUSED_MESSAGE)
+        elif exitcode == EXIT_REGISTRATION_INCOMPLETE:
+            # The worker printed what to do; nothing is counted against the game.
+            state.failed_until[seat_id] = current_time + REGISTRATION_RETRY_SECONDS
+            say(seat_id, f"That game can't start until your registration is complete; checking again in "
+                         f"{REGISTRATION_RETRY_SECONDS:.0f}s.")
+            idle = True
+        elif exitcode == EXIT_NOT_CONNECTED and connect_by is not None and current_time < connect_by:
+            # Nothing was played yet and the connect window is open: try again
+            # right away, however often it happened, so a hiccup isn't a no-show.
+            state.failed_until[seat_id] = current_time + NOT_CONNECTED_RETRY_SECONDS
+            say(seat_id, "Couldn't reach that game yet (a temporary problem); trying again now.")
         else:
-            failures = state.seat_failures.get(seat_id, 0) + 1
+            if exitcode == EXIT_CONNECTION_LOST and ran >= TRANSIENT_GIVE_UP_SECONDS + WORKER_PLAYED_SECONDS:
+                failures = 1  # it was playing: a new failure, not one more in a row
+                wait = RESTART_AFTER_PLAY_SECONDS
+            else:
+                # An agent error, a failure before the game was reached (the
+                # connect window has closed), or a connection lost almost at
+                # once: one more in a row, unless the worker ran a long while.
+                long_run = exitcode != EXIT_NOT_CONNECTED and ran >= SEAT_FAILURE_BACKOFF_MAX_SECONDS
+                failures = 1 if long_run else state.seat_failures.get(seat_id, 0) + 1
+                wait = min(max(SEAT_FAILURE_BACKOFF_MAX_SECONDS, cooldown_seconds), cooldown_seconds * 2 ** (failures - 1))
             state.seat_failures[seat_id] = failures
-            wait = min(max(SEAT_FAILURE_BACKOFF_MAX_SECONDS, cooldown_seconds), cooldown_seconds * 2 ** (failures - 1))
             state.failed_until[seat_id] = current_time + wait
-            log(f"Match ended with an error (exit code {exitcode}); retrying that seat in {wait:.0f}s if it is still assigned.")
-        if len(state.registry) == 0:
-            log(WAITING_MESSAGE)
+            if exitcode == EXIT_CONNECTION_LOST:
+                say(seat_id, f"Lost the connection to that game for a while; retrying that game in {wait:.0f}s "
+                             "if it is still assigned.")
+            elif exitcode == EXIT_NOT_CONNECTED:  # and the connect window has closed
+                say(seat_id, f"Couldn't reach that game (a temporary problem); retrying in {wait:.0f}s "
+                             "if it is still assigned.")
+            else:
+                # The game itself goes on (its timers may play for the agent).
+                say(seat_id, f"Your agent's process for this match stopped with an error (exit code {exitcode}); "
+                             f"the match continues. Retrying in {wait:.0f}s if it is still assigned.")
+    active_matches = {match_of(seat_id) for seat_id in state.registry.keys()}
+    for match in finished:
+        # The match is over: a player of it that had stopped earlier needs no
+        # word of its own.
+        for seat_id in [s for s in state.stopped if match_of(s) == match]:
+            del state.stopped[seat_id]
+        if match not in active_matches:  # said once, when its last player here is done
+            log("Match finished.")
+    if reaped and idle and len(state.registry) == 0:
+        say_waiting()
 
     if state.discovery_retry_at is not None and current_time < state.discovery_retry_at:
         return
@@ -477,6 +665,15 @@ def run_tournament_once(
         state.discovery_failing = True
         return
     except AuthenticationError as exc:
+        if is_registration_incomplete(exc):
+            # Games already running keep playing until they need a fresh
+            # agent session (within about an hour: the backend rechecks the
+            # registration at every sign-in); new ones wait until the
+            # contestant has done what the message says.
+            _note_registration(state, current_time, registration_wait_message(exc), log)
+            state.discovery_retry_at = current_time + REGISTRATION_RETRY_SECONDS
+            state.discovery_failing = True
+            return
         if is_fatal_auth_error(exc):
             raise
         delay = _auth_retry_delay(exc, state.auth_failures)
@@ -494,28 +691,59 @@ def run_tournament_once(
         state.discovery_failing = False
 
     listed = {assignment.seat_id for assignment in assignments}
-    # A seat that has left the list is done with: forget its failure count.
+    # A seat that has left the list is done with: forget its failure count
+    # and its connect window.
     for seat_id in [s for s in state.seat_failures if s not in listed and not state.registry.is_active(s)]:
         del state.seat_failures[seat_id]
-    for assignment in assignments:
+    for seat_id in [s for s in state.connect_by if s not in listed and not state.registry.is_active(s)]:
+        del state.connect_by[seat_id]
+    # A game whose worker had stopped (and wasn't started again) has ended:
+    # say so once per match, or nothing would mark the end of it.
+    ended = [s for s in state.stopped if s not in listed and not state.registry.is_active(s)]
+    for seat_id in ended:
+        assignment = state.stopped.pop(seat_id)
+        game = _clean(assignment.game_type)
+        say(seat_id, f"Your {game + ' ' if game else ''}match{_kind_label(assignment)} has ended while your "
+                     "agent's process for it was stopped.")
+    if ended and len(state.registry) == 0:
+        say_waiting()
+    for seat_id in [s for s in state.seat_games if s not in listed and not state.registry.is_active(s)]:
+        del state.seat_games[seat_id]
+
+    # The seats to start now, grouped by match: one set of lines per match,
+    # however many of its players this runtime plays (self-play).
+    to_start: dict[str, list["OfficialAssignment"]] = {}
+    for assignment in [] if state.key_refused else assignments:
         seat_id = assignment.seat_id
         if not seat_id or state.registry.is_active(seat_id):
             continue
         if assignment_kind(assignment) not in kinds:
             _note_other_kind(assignment, state, log)
             continue
+        window = (assignment.match_id, assignment.connect_deadline_at)
+        if state.connect_by.get(seat_id, (None, 0.0))[0] != window:
+            state.connect_by[seat_id] = (window, _connect_by(assignment, current_time, wall_now()))
         retry_at = state.failed_until.get(seat_id)
         if retry_at is not None and current_time < retry_at:
             continue
-        worker_input = TournamentWorkerInput(
-            seat_id=seat_id, match_id=assignment.match_id, game_type=assignment.game_type,
-            agent_spec=agent_spec, execution_id=state.execution_id,
-            tournament_id=assignment.tournament_id,
-        )
-        process = process_factory(target=_tournament_process_entry, args=(worker_input,), daemon=True)
-        process.start()
-        state.registry.start(seat_id, process)
-        for line in describe_assignment(assignment, now=wall_now()):
+        to_start.setdefault(assignment.match_id or seat_id, []).append(assignment)
+    session_token = getattr(official, "session_token", None)
+    for group in to_start.values():
+        for assignment in group:
+            seat_id = assignment.seat_id
+            worker_input = TournamentWorkerInput(
+                seat_id=seat_id, match_id=assignment.match_id, game_type=assignment.game_type,
+                agent_spec=agent_spec, execution_id=state.execution_id,
+                tournament_id=assignment.tournament_id,
+                agent_session=session_token() if callable(session_token) else None,
+            )
+            process = process_factory(target=_tournament_process_entry, args=(worker_input,), daemon=True)
+            process.start()
+            state.registry.start(seat_id, process)
+            state.started_at[seat_id] = current_time
+            state.seat_games[seat_id] = assignment
+            state.stopped.pop(seat_id, None)
+        for line in describe_assignment(group[0], now=wall_now(), players=len(group)):
             log(line)
         log("Starting match...")
 
@@ -525,11 +753,13 @@ def run_tournament_once(
             continue
         state.missing_polls[seat_id] = state.missing_polls.get(seat_id, 0) + 1
         if state.missing_polls[seat_id] >= MISSING_POLLS_BEFORE_STOP:
+            say(seat_id, "Match is no longer assigned; stopped its worker.")
             state.registry.terminate(seat_id, shutdown_join_timeout)
             state.missing_polls.pop(seat_id, None)
-            log("Match is no longer assigned; stopped its worker.")
+            state.started_at.pop(seat_id, None)
+            state.seat_games.pop(seat_id, None)
             if len(state.registry) == 0:
-                log(WAITING_MESSAGE)
+                say_waiting()
 
 
 def run_tournament_forever(
@@ -543,16 +773,19 @@ def run_tournament_forever(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
     process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = print_line,
     max_iterations: int | None = None,
 ) -> None:
     """Keep one worker per active official assignment of a kind in ``kinds``
     (``TESTING``, ``TOURNAMENT`` or both; see ``run_tournament_once``) until
     interrupted. Between polls it only sleeps: waiting costs no AI tokens.
     Never exits just because there are no assignments, nor on a temporary
-    control-plane or sign-in problem. However it stops (Ctrl+C, the platform
-    refusing the key or registration, or ``max_iterations`` in tests), every
-    running worker is terminated in ``finally`` — no match is resigned.
+    control-plane or sign-in problem, nor on an incomplete registration (it
+    says what to do and keeps trying). A game's worker finding the key refused
+    (rotated while running) stops new games only; the runtime itself stops
+    when its own sign-in is refused. However it stops (Ctrl+C, the platform
+    refusing the key, or ``max_iterations`` in tests), every running worker
+    is terminated in ``finally`` — no match is resigned.
     """
     state = TournamentState()
     ticks = 0

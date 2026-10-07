@@ -191,6 +191,10 @@ class GameState:
     ``avalon_*`` fields, Pokémon's draft/roster detail) are not individually
     modeled — always available via ``raw``, the complete unmodified response
     for whichever tool/endpoint produced this state.
+
+    ``final_result`` is the server's whole ``get_result`` (or ``resign``)
+    answer once the game is over (``your_return``, ``winner_agent_id``, the
+    game's own per-player ``result`` where it has one), and ``None`` before.
     """
 
     session_id: str
@@ -212,6 +216,7 @@ class GameState:
     terminated_messaging: list[int]
     messaging_mode: str
     raw: dict = field(default_factory=dict, repr=False)
+    final_result: dict | None = field(default=None, repr=False)
 
     @classmethod
     def from_dict(cls, data: dict) -> "GameState":
@@ -334,6 +339,7 @@ class GameState:
             terminated_messaging=list(state.get("terminated_messaging") or []),
             messaging_mode=state.get("messaging_mode", "per_move"),
             raw=state,
+            final_result=dict(result) if result else None,
         )
 
 

@@ -27,9 +27,14 @@ class ProviderError(RuntimeError):
 class LLMProvider(Protocol):
     model: str
 
-    def complete_structured(self, messages: list[dict], schema_name: str, schema: dict) -> dict:
+    def complete_structured(
+        self, messages: list[dict], schema_name: str, schema: dict, *, timeout: float | None = None
+    ) -> dict:
         """Return the model's answer as a dict matching ``schema``, or raise
-        ``ProviderError``.
+        ``ProviderError``. ``timeout`` (seconds), when given, bounds this one
+        request: a game with a clock (Pokémon) passes what's left of the
+        decision's time. A provider without the parameter still works; the
+        agent then only limits how many requests it makes.
         """
         ...
 
@@ -63,7 +68,9 @@ class OpenAIProvider:
     def __repr__(self) -> str:
         return f"OpenAIProvider(model={self.model!r})"
 
-    def complete_structured(self, messages: list[dict], schema_name: str, schema: dict) -> dict:
+    def complete_structured(
+        self, messages: list[dict], schema_name: str, schema: dict, *, timeout: float | None = None
+    ) -> dict:
         body = {
             "model": self.model,
             "messages": messages,
@@ -72,8 +79,10 @@ class OpenAIProvider:
                 "json_schema": {"name": schema_name, "strict": True, "schema": schema},
             },
         }
+        # Only a game with a clock passes a timeout; otherwise the client's own applies.
+        extra = {"timeout": timeout} if timeout is not None else {}
         try:
-            response = self._http.post("/chat/completions", json=body)
+            response = self._http.post("/chat/completions", json=body, **extra)
         except httpx.HTTPError as exc:
             raise ProviderError(f"OpenAI request failed ({type(exc).__name__})") from None
         if response.status_code != 200:

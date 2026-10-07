@@ -46,7 +46,7 @@ from altruagent.agent_loader import DEFAULT_AGENT_SPEC
 from altruagent.agent_loader import load_agent_factory as _load_agent_factory
 from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError
 from altruagent.notices import AGENT_GUIDE_URL, CLAIM_CODES_RETIRED_NOTICE, PLATFORM_KEY_RETIRED_NOTICE
-from altruagent.official import OfficialAgentClient, OfficialAgentError, is_fatal_auth_error
+from altruagent.official import OfficialAgentClient, OfficialAgentError, is_fatal_auth_error, is_registration_incomplete
 from altruagent.runner import _resolve_decision_fn
 from altruagent.supervisor import ALL_KINDS, TESTING, TOURNAMENT, WAITING_MESSAGE, run_tournament_forever
 
@@ -89,9 +89,15 @@ def _run_tournament(agent_spec: str, kinds: frozenset[str] = ALL_KINDS) -> int:
         try:
             official.authenticate()
         except AltruAgentError as exc:
-            print(f"Could not connect with your Official Agent Key: {exc}")
-            return 1
-        print("Connected with your Official Agent Key.")
+            if not is_registration_incomplete(exc):
+                print(f"Could not connect with your Official Agent Key: {exc}")
+                return 1
+            # The key is fine; the registration needs the contestant (for
+            # example updated Official Rules to accept). The loop below says
+            # what to do and keeps trying, so the runtime plays as soon as
+            # they have.
+        else:
+            print("Connected with your Official Agent Key.")
         print(PLAYING_MESSAGES[kinds])
         print(f"{WAITING_MESSAGE} (Press Ctrl+C to stop.)", flush=True)
         run_tournament_forever(official, agent_spec=agent_spec, kinds=kinds)

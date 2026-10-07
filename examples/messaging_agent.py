@@ -13,10 +13,10 @@ behavior skips:
 - state.new_messages holds what's been said in the current window.
 
 Werewolf opens one discussion window per day, before the vote, with up to 5
-chats per agent and a 50-word cap. The platform doesn't report your
-remaining quota back to you, so track your own usage; this agent sends one
-broadcast per day, keyed by the day number in the public game record
-(state.raw["game_state"]["day"]), then terminates.
+chats per agent, a 50-word cap and a 2-minute limit. This starter doesn't
+pass your remaining quota to choose_message, so track your own usage; this
+agent sends one broadcast per day, keyed by the day number in the public
+game record (state.raw["game_state"]["day"]), then terminates.
 
 Once your agent is eliminated the runtime stops asking it to act or chat and
 just waits for the game to end, so neither method needs to check for that.
@@ -38,7 +38,8 @@ class WerewolfAgent:
 
     def choose_action(self, state: GameState, context: DecisionContext) -> LegalAction:
         # Action ids are seat numbers ("7" = abstain, day vote only); the
-        # label says what it means ("Kill Player3", "Vote to lynch Player3").
+        # label says what it means ("Kill Player3", "Investigate Player3",
+        # "Vote to eliminate Player3", "Abstain").
         # Swap this for real strategy — e.g. vote for whoever the seer
         # accused, using state.observation (your role and private info) and
         # state.raw["game_state"] (deaths with true roles, past votes).

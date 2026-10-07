@@ -117,6 +117,7 @@ class FakeMCPGameSession:
                 "Unknown tool: wait_for_update",
                 status_code=None,
                 error_code=None,
+                protocol_error=True,  # as mcp_transport raises it
             )
         return self._pop(self._state_queue)
 
@@ -445,14 +446,17 @@ def test_wait_falls_back_to_sleep_when_server_lacks_wait_for_update():
     assert sleep_calls == [5.0, 5.0]  # DEFAULT_WAIT_SECONDS
 
 
-def test_wait_for_update_protocol_error_other_than_unknown_tool_propagates():
+def test_wait_for_update_transport_error_is_retried_not_mistaken_for_an_old_server():
     game = FakeMCPGameSession().queue_state(
         waiting_state(),
         MCPToolError("transport failed", status_code=None, error_code=None),
-    )
+        terminal_state(),
+    ).queue_result(result_dict())
 
-    with pytest.raises(MCPToolError):
-        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep)
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=no_sleep, log=lambda line: None)
+
+    assert result.is_terminal
+    assert len(game.wait_calls) == 2  # tried again, still with wait_for_update
 
 
 def test_wait_passes_highest_seen_message_seq():
@@ -537,6 +541,49 @@ def test_resign_still_works_when_choose_message_is_defined():
 
     assert result.is_terminal is True
     assert game.resign_calls == 1
+
+
+def test_a_werewolf_resign_waits_for_the_game_to_end():
+    # Werewolf (2026-10-07): a resign takes only this agent out and the game
+    # goes on (is_terminal false, eliminated true). The runner must not report
+    # the game over yet: it waits like any eliminated player, never asks the
+    # agent again, and returns the real final result.
+    asked = []
+    game = (
+        FakeMCPGameSession()
+        .queue_state(
+            make_mcp_state(),
+            make_mcp_state(eliminated=True, is_current_actor=False, state_version=1),
+            terminal_state(state_version=9),
+        )
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_resign(
+            result_dict(
+                is_terminal=False,
+                status="in_progress",
+                returns=None,
+                your_return=None,
+                eliminated=True,
+            )
+        )
+        .queue_result(
+            result_dict(
+                termination_reason="completed",
+                returns={"Me": -1.0, "Them": 1.0},
+                your_return=-1.0,
+            )
+        )
+    )
+    result = run_game(
+        game, CONTEXT, lambda s, c: asked.append(1) or RESIGN, sleep=no_sleep
+    )
+
+    assert game.resign_calls == 1
+    assert asked == [1]
+    assert result.is_terminal is True
+    assert result.termination_reason == "completed"
+    assert result.final_result["your_return"] == -1.0
+    assert len(game.wait_calls) == 1
 
 
 # -- messaging ----------------------------------------------------------
@@ -940,6 +987,19 @@ def test_game_already_complete_race_treated_as_natural_completion():
     assert result.termination_reason == "completed"
 
 
+def test_the_final_state_keeps_the_servers_whole_result():
+    # get_result also says how this agent did (your_return, the game's own
+    # per-player result, the winner): the worker reports won/lost from it.
+    answer = result_dict(termination_reason="completed", winner_agent_id="agent-1",
+                         result={"seats": {"agent-1": {"outcome": "win"}}})
+    game = FakeMCPGameSession().queue_state(terminal_state()).queue_result(answer)
+
+    final = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert final.final_result == answer
+    assert make_mcp_state().final_result is None
+
+
 def test_action_runtime_unavailable_becomes_unsupported_game_flow_error():
     game = (
         FakeMCPGameSession()
@@ -1159,3 +1219,533 @@ def test_player_eliminated_race_refetches_instead_of_crashing():
     result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
 
     assert result.is_terminal is True
+
+
+# -- temporary failures are retried in place (no lost turns, no restart) -----------------
+
+from altruagent import runner as runner_module  # noqa: E402
+from altruagent.errors import AuthenticationError, PlatformError  # noqa: E402
+from altruagent.official import OfficialAgentError  # noqa: E402
+
+
+class Clock:
+    """A fake monotonic clock that a fake sleep advances."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.t += seconds
+
+
+def _transport_error(text="ConnectError('connection reset')"):
+    return MCPToolError(f"MCP tool 'get_game_state' failed: {text}", status_code=None, error_code=None)
+
+
+TRANSIENT_ERRORS = [
+    pytest.param(_transport_error(), id="dropped-connection"),
+    pytest.param(MCPToolError("MCP tool request failed with HTTP 502", status_code=502, error_code=None), id="http-502"),
+    pytest.param(MCPToolError("MCP tool request failed with HTTP 504", status_code=504, error_code=None), id="http-504"),
+    pytest.param(MCPToolError("MCP tool request failed with HTTP 429", status_code=429, error_code=None), id="http-429"),
+    pytest.param(MCPToolError("busy", status_code=None, error_code="RUNTIME_TEMPORARILY_UNAVAILABLE"), id="runtime-busy"),
+    pytest.param(MCPToolError("timed out", status_code=None, error_code=None), id="read-timeout"),
+    # A GameAPI 401 whose seat re-grant hit a control-plane hiccup.
+    pytest.param(PlatformError("Request failed with status 503.", status_code=503), id="regrant-503"),
+    pytest.param(PlatformError("Could not reach /grant: ConnectError", status_code=None), id="regrant-unreachable"),
+    pytest.param(OfficialAgentError("busy", status_code=503, error_code="agent_session_unavailable"), id="regrant-session"),
+    pytest.param(OfficialAgentError("slow down", status_code=429, error_code="rate_limited"), id="regrant-429"),
+]
+
+
+@pytest.mark.parametrize("error", TRANSIENT_ERRORS)
+def test_a_temporary_failure_while_waiting_is_retried_and_the_game_goes_on(error):
+    clock = Clock()
+    log: list[str] = []
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), error, make_mcp_state(state_version=2), waiting_state(state_version=3),
+                     terminal_state())
+        .queue_legal_actions(int_actions(0, 1, state_version=2))
+        .queue_play_action(play_action_result(state_version=3))
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now,
+                      log=log.append)
+
+    assert result.is_terminal
+    assert len(game.play_action_calls) == 1
+    assert len(clock.sleeps) == 1 and 0.5 <= clock.sleeps[0] <= 1.0
+    assert log[0].startswith("Connection problem (") and log[-1] == "Connection back; the game goes on."
+    assert len(log) == 2
+
+
+@pytest.mark.parametrize("error", TRANSIENT_ERRORS[:3])
+def test_a_temporary_failure_on_the_first_read_is_retried(error):
+    clock = Clock()
+    game = FakeMCPGameSession().queue_state(error, error, terminal_state()).queue_result(result_dict())
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert result.is_terminal and game.get_state_calls == 3
+    assert len(clock.sleeps) == 2 and 1.0 <= clock.sleeps[1] <= 2.0  # the pause grows
+
+
+def test_a_move_that_failed_in_transit_is_never_resent_blindly():
+    # The answer was lost; the move may or may not have landed. The runner
+    # re-reads the state and asks the agent again from what it sees.
+    clock = Clock()
+    decisions = []
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(state_version=0), make_mcp_state(state_version=0), terminal_state())
+        .queue_legal_actions(int_actions(0, 1), int_actions(0, 1))
+        .queue_play_action(_transport_error(), play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+
+    def choose(state, context):
+        decisions.append(state.state_version)
+        return state.legal_actions[0]
+
+    run_game(game, CONTEXT, choose, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert decisions == [0, 0]  # decided again from a fresh read, not replayed
+    assert game.get_state_calls == 3 and len(game.play_action_calls) == 2
+
+
+def test_a_move_that_landed_before_its_answer_was_lost_is_not_played_twice():
+    clock = Clock()
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(state_version=0), waiting_state(state_version=1), terminal_state())
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_play_action(MCPToolError("HTTP 504", status_code=504, error_code=None))
+        .queue_result(result_dict())
+    )
+
+    run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert len(game.play_action_calls) == 1
+
+
+def test_runtime_temporarily_unavailable_on_a_turn_based_move_is_retried_and_reported():
+    clock = Clock()
+    results = []
+
+    class Agent:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def on_action_result(self, result, context):
+            results.append(result)
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(), make_mcp_state(), terminal_state())
+        .queue_legal_actions(int_actions(0), int_actions(0))
+        .queue_play_action(MCPToolError("engine busy", status_code=None, error_code="RUNTIME_TEMPORARILY_UNAVAILABLE"),
+                           play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+
+    run_game(game, CONTEXT, Agent(), sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert results[0] == {"error": "RUNTIME_TEMPORARILY_UNAVAILABLE", "detail": "engine busy"}
+    assert len(game.play_action_calls) == 2
+
+
+def test_a_chat_message_that_failed_in_transit_is_not_resent_blindly():
+    clock = Clock()
+    sent = []
+
+    class Talker:
+        def choose_action(self, state, context):
+            return state.legal_actions[0]
+
+        def choose_message(self, state, context):
+            sent.append(state.state_version)
+            return SendMessage("hello")
+
+    game = (
+        FakeMCPGameSession()
+        .queue_state(messaging_state(state_version=4), waiting_state(state_version=5), terminal_state())
+        .queue_send_message(_transport_error())
+        .queue_result(result_dict())
+    )
+
+    run_game(game, CONTEXT, Talker(), sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert sent == [4] and len(game.send_message_calls) == 1
+
+
+def test_the_terminal_result_read_is_retried_too():
+    clock = Clock()
+    game = FakeMCPGameSession().queue_state(terminal_state()).queue_result(_transport_error(), result_dict())
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert result.returns == {"Me": 1.0, "Them": -1.0}
+
+
+def test_failures_that_last_too_long_reach_the_worker():
+    clock = Clock()
+    error = _transport_error()
+    game = FakeMCPGameSession().queue_state(waiting_state(), *([error] * 200))
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert exc_info.value is error
+    assert runner_module.TRANSIENT_GIVE_UP_SECONDS <= clock.t < runner_module.TRANSIENT_GIVE_UP_SECONDS + 10
+    assert max(clock.sleeps) <= runner_module.TRANSIENT_RETRY_MAX_SECONDS
+    assert len(clock.sleeps) > 15  # tried every few seconds, not once a minute
+
+
+def test_the_give_up_clock_starts_over_after_any_successful_call():
+    clock = Clock()
+    error = _transport_error()
+    # 80 s of failures, one good read, then 80 s more: never 90 s in a row.
+    burst = [error] * 20
+    game = FakeMCPGameSession().queue_state(waiting_state(), *burst, waiting_state(), *burst, terminal_state())
+    game.queue_result(result_dict())
+
+    def sleep(seconds):
+        clock.sleeps.append(seconds)
+        clock.t += 4.0
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=sleep, now=clock.now, log=lambda line: None)
+
+    assert result.is_terminal and clock.t >= 160
+
+
+_ONE_ACTION = int_actions(0)  # embedded in the state, as GameAPI sends it
+
+
+def test_a_move_that_keeps_failing_while_reads_work_still_reaches_the_worker():
+    # Every read works, every move fails (say a gateway error on that one
+    # tool). The re-read after each failure mustn't count as "the trouble is
+    # over", or the agent would be asked and the move retried every second
+    # for the rest of the game. The pauses grow and the worker gets the error
+    # after TRANSIENT_GIVE_UP_SECONDS, like any other lasting failure.
+    clock = Clock()
+    lines: list[str] = []
+    error = MCPToolError("MCP tool 'play_action' request failed with HTTP 502", status_code=502, error_code=None)
+    game = (
+        FakeMCPGameSession()
+        .queue_state(*[make_mcp_state(legal_actions=_ONE_ACTION) for _ in range(200)])
+        .queue_play_action(*([error] * 200))
+    )
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert exc_info.value is error
+    assert runner_module.TRANSIENT_GIVE_UP_SECONDS <= clock.t < runner_module.TRANSIENT_GIVE_UP_SECONDS + 10
+    assert len(game.play_action_calls) < 40  # paced: about 1, 2, 4, then 5 s apart
+    assert len(lines) == 1 and lines[0].startswith("Connection problem")
+
+
+def test_after_a_failed_move_a_wait_that_works_ends_the_trouble():
+    # The move landed but its answer was lost; the game then went on (a wait
+    # worked) for longer than the give-up time. A later, unrelated blip is a
+    # new spell of trouble, retried as usual, not "90 s of failure".
+    clock = Clock()
+    lines: list[str] = []
+
+    class SlowOpponentGame(FakeMCPGameSession):
+        def wait_for_update(self, **kwargs) -> GameState:
+            clock.t += 120.0  # the opponent thinks for two minutes
+            return super().wait_for_update(**kwargs)
+
+    error = MCPToolError("MCP tool 'play_action' request failed with HTTP 504", status_code=504, error_code=None)
+    game = (
+        SlowOpponentGame()
+        .queue_state(
+            make_mcp_state(state_version=0, legal_actions=_ONE_ACTION),
+            waiting_state(state_version=1),  # re-read after the first failure: it landed
+            make_mcp_state(state_version=2, legal_actions=int_actions(0, state_version=2)),  # the wait's answer
+            waiting_state(state_version=3),  # re-read after the second failure: it landed
+            terminal_state(state_version=4),  # the wait's answer
+        )
+        .queue_play_action(error, error)
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert result.is_terminal and len(game.play_action_calls) == 2
+    assert [line.split(" (")[0].rstrip(".") for line in lines] == [
+        "Connection problem", "Connection back; the game goes on",
+        "Connection problem", "Connection back; the game goes on",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(MCPToolError("gone", status_code=None, error_code="SESSION_NOT_FOUND"), id="session-not-found"),
+        pytest.param(MCPToolError("bad request", status_code=400, error_code=None), id="http-400"),
+        pytest.param(MCPToolError("forbidden", status_code=403, error_code=None), id="http-403"),
+        pytest.param(MCPToolError("still 401 after a fresh grant", status_code=401, error_code=None), id="http-401"),
+        pytest.param(OfficialAgentError("held", status_code=409, error_code="seat_busy"), id="seat-busy"),
+        pytest.param(OfficialAgentError("ended", status_code=409, error_code="assignment_not_grantable"), id="ended"),
+        pytest.param(AuthenticationError("odd", status_code=403), id="auth-403"),
+    ],
+)
+def test_definite_errors_are_not_retried(error):
+    clock = Clock()
+    game = FakeMCPGameSession().queue_state(waiting_state(), error)
+
+    with pytest.raises(type(error)):
+        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert clock.sleeps == []
+
+
+def test_an_old_server_without_wait_for_update_still_falls_back_to_sleeping():
+    clock = Clock()
+    game = FakeMCPGameSession().queue_state(waiting_state(), terminal_state()).queue_result(result_dict())
+    game.supports_wait = False
+
+    run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert clock.sleeps == [5.0]  # DEFAULT_WAIT_SECONDS, no retry pauses
+
+
+def _tool_error(tool="play_action"):
+    # What mcp_transport raises for an isError answer: FastMCP rejected the
+    # arguments, or the tool crashed. GameAPI sends game errors as results.
+    return MCPToolError(
+        f"MCP tool {tool!r} failed at the protocol level: Error executing tool {tool}: 1 validation error",
+        status_code=None, error_code=None, protocol_error=True,
+    )
+
+
+def test_a_move_the_server_cant_handle_is_tried_once_more_then_reaches_the_worker():
+    # Was: retried as a "Connection problem" every few seconds for 90 s, so
+    # the agent was asked (an LLM agent: one model call) about 19 times, and
+    # the worker was then restarted to do the same again.
+    clock = Clock()
+    lines: list[str] = []
+    asked = []
+    error = _tool_error()
+    game = (
+        FakeMCPGameSession()
+        .queue_state(*[make_mcp_state(legal_actions=_ONE_ACTION) for _ in range(50)])
+        .queue_play_action(*([error] * 50))
+    )
+
+    def choose(state, context):
+        asked.append(state.state_version)
+        return state.legal_actions[0]
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, choose, sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert exc_info.value is error
+    assert len(asked) == 2 and len(game.play_action_calls) == 2
+    assert clock.t < 5
+    assert len(lines) == 1 and lines[0].startswith("The game server couldn't handle that call (")
+    assert lines[0].endswith("); trying once more.")
+    assert not any("Connection problem" in line for line in lines)
+
+
+def test_a_one_off_tool_error_on_a_move_is_tried_once_more_and_the_game_goes_on():
+    clock = Clock()
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(legal_actions=_ONE_ACTION), make_mcp_state(legal_actions=_ONE_ACTION),
+                     terminal_state())
+        .queue_play_action(_tool_error(), play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now,
+                      log=lambda line: None)
+
+    assert result.is_terminal and len(game.play_action_calls) == 2
+
+
+@pytest.mark.parametrize("tool", ["wait_for_update", "get_game_state"])
+def test_a_read_the_server_cant_answer_for_a_while_is_retried_and_the_game_goes_on(tool):
+    # A read's arguments are built by the runner, and GameAPI answers every
+    # game error as a normal result, so an isError answer to a read is the
+    # server's own trouble (a crash while its engine restarts, say). Was:
+    # tried once more, then the worker stopped and sat out at least 60 s.
+    clock = Clock()
+    lines: list[str] = []
+    error = _tool_error(tool)
+    game = FakeMCPGameSession()
+    if tool == "get_game_state":
+        game.queue_state(error, error, error, waiting_state(), terminal_state())
+    else:
+        game.queue_state(waiting_state(), error, error, error, terminal_state())
+    game.queue_result(result_dict())
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert result.is_terminal and len(clock.sleeps) == 3
+    assert lines[0].startswith("The game server couldn't answer (") and lines[0].endswith("; retrying for up to 90s.")
+    assert lines[-1] == "The game server answers again; the game goes on."
+    assert len(lines) == 2 and not any("Connection problem" in line for line in lines)
+
+
+def test_a_read_the_server_never_answers_reaches_the_worker_after_the_give_up_time():
+    clock = Clock()
+    asked = []
+    error = _tool_error("wait_for_update")
+    game = FakeMCPGameSession().queue_state(waiting_state(), *([error] * 200))
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, lambda s, c: asked.append(1) or RESIGN, sleep=clock.sleep, now=clock.now,
+                 log=lambda line: None)
+
+    assert exc_info.value is error and exc_info.value.protocol_error
+    assert runner_module.TRANSIENT_GIVE_UP_SECONDS <= clock.t < runner_module.TRANSIENT_GIVE_UP_SECONDS + 10
+    assert len(game.wait_calls) < 40  # paced: about 1, 2, 4, then 5 s apart
+    assert asked == []  # reads never ask the agent
+
+
+def test_after_a_move_the_server_cant_handle_a_read_it_cant_answer_is_retried():
+    # The move is tried once more only; the re-read that follows is a read.
+    clock = Clock()
+    move_error, read_error = _tool_error(), _tool_error("get_game_state")
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(legal_actions=_ONE_ACTION), read_error, read_error,
+                     make_mcp_state(legal_actions=_ONE_ACTION), terminal_state())
+        .queue_play_action(move_error, play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now,
+                      log=lambda line: None)
+
+    assert result.is_terminal and len(game.play_action_calls) == 2
+
+
+def test_each_success_allows_one_more_try_after_a_tool_error():
+    # One-off tool errors on separate turns, each followed by a call that
+    # works: never two in a row, so the game goes on.
+    clock = Clock()
+    error = _tool_error("wait_for_update")
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), error, waiting_state(state_version=1), error, terminal_state())
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert result.is_terminal and len(game.wait_calls) == 4
+
+
+def test_too_many_waits_from_an_abandoned_wait_is_paced_and_retried():
+    # GameAPI caps the wait_for_update calls waiting at once per agent and
+    # game. One this runtime gave up on (a dropped connection) can still be
+    # waiting there for up to 25 s, so the next ones may be refused for a
+    # moment. Not the agent's fault: pause, then wait again.
+    clock = Clock()
+    busy = MCPToolError("You already have 2 wait_for_update calls waiting in this game.",
+                        status_code=None, error_code="TOO_MANY_WAITS")
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), busy, busy, terminal_state())
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert result.is_terminal
+    assert len(game.wait_calls) == 3 and len(clock.sleeps) == 2
+
+
+# -- a move that can't be sent as JSON is the agent's own bug, not a connection problem --
+
+
+class _NumpyLikeInt:
+    """Stands in for numpy.int64 or a contestant's own class in a move."""
+
+
+def _real_transport_game(handler):
+    """A real MCPGameSession whose calls go through the real
+    mcp_transport.call_tool and MCP SDK, over a mocked HTTP layer."""
+    from functools import partial
+
+    from altruagent import mcp_game as mcp_game_module
+    from altruagent.mcp_game import MCPGameSession
+    from test_mcp_transport import FakeClient, make_factory
+
+    game = MCPGameSession(FakeClient(), session_id=SESSION_ID, game_server_url="http://game.example.test")
+    real_call_tool = partial(mcp_game_module.call_tool, httpx_client_factory=make_factory(handler))
+    game._call = lambda tool, arguments: real_call_tool(game._client, game._mcp_url(), tool, arguments)
+    return game
+
+
+def test_a_move_that_cant_be_sent_as_json_fails_at_once_as_the_agents_error():
+    # Was: classified as "no answer at all", so for 90 s the runner logged
+    # "Connection problem", asked the agent again every 1-5 s (about 26
+    # decisions, each an LLM call), then the worker said it had lost the
+    # connection. The same bug failed at once before this package.
+    import json as json_module
+
+    import httpx
+
+    from test_mcp_transport import _healthy_handler, _tool_call_response
+
+    clock = Clock()
+    lines: list[str] = []
+    asked = []
+    tools_called = []
+    state = {
+        "session_id": SESSION_ID, "game_type": "redalert", "status": "in_progress", "state_version": 4,
+        "phase": "moving", "is_current_actor": True, "is_terminal": False,
+        "legal_actions": {"session_id": SESSION_ID, "state_version": 4, "actions": []},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json_module.loads(request.content)
+        if body.get("method") == "tools/call":
+            tools_called.append(body["params"]["name"])
+            return httpx.Response(200, json=_tool_call_response(body.get("id"), state))
+        return _healthy_handler(request)
+
+    def choose(state, context):
+        asked.append(state.state_version)
+        return {"type": "move", "unit": _NumpyLikeInt()}
+
+    with pytest.raises(DecisionError) as exc_info:
+        run_game(_real_transport_game(handler), CONTEXT, choose, sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert "can't be sent" in str(exc_info.value) and "plain Python values" in str(exc_info.value)
+    assert asked == [4] and clock.sleeps == []
+    assert tools_called == ["get_game_state"]  # the move never left the process
+    assert lines == []  # no "Connection problem"
+
+
+def test_a_message_that_cant_be_sent_as_json_fails_at_once_as_the_agents_error():
+    clock = Clock()
+    lines: list[str] = []
+    unsendable = MCPToolError("MCP tool 'send_message' can't send its arguments as JSON: Unable to serialize",
+                              status_code=None, error_code=None, local_error=True)
+
+    class Talker:
+        def choose_action(self, state, context):
+            raise AssertionError("not reached")
+
+        def choose_message(self, state, context):
+            return SendMessage("hello", recipients=[1])
+
+    game = FakeMCPGameSession().queue_state(messaging_state()).queue_send_message(unsendable)
+
+    with pytest.raises(DecisionError) as exc_info:
+        run_game(game, CONTEXT, Talker(), sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert exc_info.value.__cause__ is unsendable and "can't be sent" in str(exc_info.value)
+    assert len(game.send_message_calls) == 1 and clock.sleeps == [] and lines == []

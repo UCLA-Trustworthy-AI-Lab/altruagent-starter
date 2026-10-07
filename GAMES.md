@@ -103,8 +103,26 @@ all singles) but are **not** the tournament-facing format.
 - Turns are simultaneous: after you submit you have no decision until the
   turn resolves. Between decisions the observation is a placeholder
   (`"No pending decision is currently available."`); the runtime just waits.
-- **Move timer:** a pending battle decision (move, switch, or lineup) not
-  submitted within **300 seconds** is played randomly for you.
+- **Draft clock:** each draft pick has **15 seconds** from the moment it
+  becomes your turn (`state.raw["observation"]["decision_deadline_at"]`).
+  After that the server picks a random legal card for you and the draft
+  moves on; a pick sent late is refused as stale and the runtime just
+  re-reads the state. The 15 seconds include any model call.
+- **Battle clock:** the battle runs Showdown's VGC timer.
+  - **Team Preview:** **90 seconds** to choose your lineup.
+  - **Each battle decision:** **55 seconds** (moves or switches for your
+    turn, including a switch after a faint). If your bank has less than
+    55 seconds left, you get only what is left.
+  - **Bank:** a **7-minute (420 s) total bank** per player per battle. The
+    time you take on battle decisions comes out of it.
+  - When a decision runs out, Showdown plays a default move for you and your
+    bank shrinks.
+  - When your bank is empty, you forfeit the battle ("lost due to
+    inactivity"). It counts as a loss.
+  - Every second counts, including your model call. Answer well inside
+    55 seconds, and faster on average: 35 seconds a turn for 12 turns uses
+    the whole bank. The example LLM agent gives its model at most 40 seconds
+    per battle decision and 10 seconds per draft pick.
 
 The full observation schema (draft pool/rosters, per-slot `available_moves`
 with `targets`, team-preview rosters) is in the platform's own game guide
@@ -177,8 +195,9 @@ phase) is an immediate loss.
   appear in a later state). Verdicts on accepted orders arrive in later
   states' `last_orders` / `recent_order_problems`.
 - The placeholder `agent/agent.py` (first legal action) can't play Red Alert:
-  there is no legal action to pick. `examples/llm_agent.py` plays Red Alert
-  with an LLM
+  there is no legal action to pick. If you run it anyway, its process for the
+  match prints `Your agent can't play Red Alert: ...` and stops; the match
+  goes on without it. `examples/llm_agent.py` plays Red Alert with an LLM
   (`examples/llm/redalert.py`).
 
 The full guide (every order, the observation, limits, errors, a build primer)
@@ -207,11 +226,10 @@ minutes, set per match), or when neither side has had an order accepted for
 
 ## Honor of Kings
 
-**TODO — not yet available.** No references to this game (under this or any
-other likely name) were found anywhere in the platform or starter source
-checked for this doc. Treat this as unimplemented and do
-not assume any state/action schema. This section will be filled in once the
-platform exposes it.
+**Not yet available.** The rules list Honor of Kings as a tournament game,
+but the platform doesn't run it yet: there are no Honor of Kings test
+matches or tournament games, and no state/action schema to code against.
+This section will be filled in once the platform runs it.
 
 ---
 
@@ -228,7 +246,7 @@ Hidden-role social deduction for **exactly 7 players**: **2 wolves / 1 seer /
 handful of live seats. Villagers win when both wolves are dead;
 wolves win at parity (wolves ≥ living villagers) or if **3 consecutive days**
 end with no elimination (an anti-stalling rule — a tie or an all-abstain day
-counts as "no elimination").
+counts as "no elimination"; a day on which someone resigns does not).
 
 Simplifications vs tabletop Werewolf (verified in engine): no Doctor, Hunter,
 Witch, or Cupid, and **no moderator seat** — everything a human moderator
@@ -277,8 +295,27 @@ true, moving, messaging, and resigning all become forbidden for you — you
 keep read-only access (state, observation, transcript). The runtime handles
 this: it stops calling `choose_action`/`choose_message` and just waits for
 the game to end. Every death (`state.raw["game_state"]["dead"]`)
-publishes the dead player's **true role**, tagged `night_kill` or `lynch` —
-the richest evidence source in the game.
+publishes the dead player's **true role**, tagged `night_kill`, `vote` or
+`resigned` — the richest evidence source in the game.
+
+**Resigning (`RESIGN`) takes only you out; the game goes on.** You leave
+as if you had been voted out: you count as dead and your role is revealed
+to everyone (`cause: "resigned"`). Your vote or night choice for the
+current phase is dropped, and nobody waits for you. The game ends at once
+only if your leaving decides it (the last wolf resigning gives the villagers
+the win; a villager resigning when the wolves would then equal the rest
+gives it to the wolves). After you resign, the runtime stops asking your
+agent for moves and messages and waits for the game to end, like any
+eliminated player, then reports the final result; the others play on.
+
+**When someone else resigns,** a vote or night target aimed at them no
+longer counts, and nobody is asked to choose again. A vote for them counts
+for no one, like an abstention (the vote history still shows it); if no
+counted vote is left, nobody is voted out that day. If a wolf had chosen
+them as the night's victim, the other wolf's choice is the kill; if there is
+none, nobody is killed that night. A day on which someone resigns (during
+its discussion or its vote) does not count toward the
+3-days-with-no-elimination rule.
 
 On MOVING-phase inactivity timeout: `day_vote` auto-abstains (`7`); at night,
 the first legal target is auto-submitted (the night must resolve for the
@@ -290,8 +327,12 @@ game to advance, so there's no "do nothing" default there).
   Werewolf **special-cases** discussion: a window opens **once per day**
   (right after the night resolves, before any vote), not after every
   night/vote sub-move.
-- Non-blind (open) discussion; preset caps: up to 5 chats per agent per
-  window, 50-word limit, 120s inactivity timeout (idle → auto-terminate).
+- Non-blind (open) discussion; up to 5 chats per agent per window, 50-word
+  limit. The window closes **2 minutes after it opens** (or as soon as every
+  living player has terminated, whichever comes first); a chat after that is
+  refused and the runtime just moves on to the vote. While it is open,
+  `state.raw["messaging_seconds_left"]` counts down. A 120 s inactivity
+  timeout also applies (idle → auto-terminate).
 - Only **living** players count toward quorum — the dead can't hold the
   window open and shouldn't try to message.
 - `recipients: []` broadcasts; a single other seat (`[i]`) sends a private
@@ -305,8 +346,9 @@ game to advance, so there's no "do nothing" default there).
 - Natural end: terminal `returns` are **+1** for every member of the winning
   side and **−1** for every member of the losing side, regardless of who
   died — a lynched villager on the winning side still scores **+1**.
-- Resignation: resigner **−1**, same-side teammates **0**, opposing side
-  **+1**.
+- Resignation: the player who resigned scores **−1** (a loss) whichever
+  side wins; everyone else is scored as above. A resign does not end the
+  game, so `termination_reason` is still `"completed"`.
 
 ### Notes
 

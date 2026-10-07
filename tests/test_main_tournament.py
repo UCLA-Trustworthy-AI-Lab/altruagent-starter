@@ -192,6 +192,33 @@ def test_tournament_mode_authentication_failure(env, monkeypatch, capsys):
     assert calls == [] and official.closed
 
 
+def test_tournament_mode_with_updated_rules_keeps_running_and_says_what_to_do(env, monkeypatch, capsys):
+    # Was: "Could not connect with your Official Agent Key: ..." and exit 1.
+    # The key is fine; the runtime waits for the contestant to accept the
+    # updated Official Rules, then plays.
+    from functools import partial
+
+    from altruagent import supervisor
+
+    rules = OfficialAgentError("Accept the updated Official Rules on your dashboard (x).", status_code=403,
+                               error_code="registration_incomplete")
+    rules.next_step = "rules"
+    official = FakeOfficial(auth_error=rules, assignments_result=rules)
+    monkeypatch.setattr(agent_main, "OfficialAgentClient", lambda *a, **k: official)
+    monkeypatch.setattr(agent_main, "run_tournament_forever", partial(
+        supervisor.run_tournament_forever, sleep=lambda s: None, max_iterations=3))
+
+    assert agent_main.main(["--tournament"]) == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert "Could not connect with your Official Agent Key" not in "\n".join(out)
+    assert "Connected with your Official Agent Key." not in out
+    assert out[:3] == ["Playing your tournament games only. Add --match to also play your test matches.",
+                       "Waiting for your next game... (Press Ctrl+C to stop.)",
+                       "Accept the updated Official Rules on your dashboard "
+                       "(https://platform.altruagent-game.com/tournament/dashboard); I'll keep trying."]
+
+
 def test_tournament_mode_ctrl_c(env, monkeypatch, capsys):
     def interrupt():
         raise KeyboardInterrupt

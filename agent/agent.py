@@ -40,11 +40,12 @@ which plays all three games (needs OPENAI_API_KEY in .env):
     python -m agent --check-tournament --agent examples.llm_agent
     python -m agent --match --agent examples.llm_agent
 
-Some games (e.g. repeated_pd, avalon) also have a messaging phase before/
-between moves. You don't have to do anything about it: this agent will
-automatically vote to end each messaging round and move on. If you want to
-actually negotiate, add an optional `choose_message(state, context)` method
-next to `choose_action` — see examples/messaging_agent.py.
+Werewolf also has a messaging phase (one discussion window per day, before
+the vote). You don't have to do anything about it: this agent automatically
+votes to end each discussion and moves on. To talk, switch to the class form
+above and add a `choose_message(self, state, context)` method to the class (a
+module-level `choose_message` function in this file is ignored). See
+examples/messaging_agent.py.
 """
 
 from altruagent import DecisionContext, GameState, LegalAction

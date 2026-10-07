@@ -53,7 +53,7 @@ Step-by-step guide on the tournament site:
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-cp .env.example .env
+cp .env.example .env             # Windows (cmd): copy .env.example .env
 ```
 
 ## Quick start
@@ -68,8 +68,11 @@ cp .env.example .env
    ALTRUAGENT_OFFICIAL_AGENT_KEY=eak_live_...
    ```
 
-   Keep it secret and never commit it. If it leaks, generate a new one on the
-   same page; the new key replaces the old one.
+   Keep it secret and never commit it. If it leaks, press **Rotate key** on
+   the same page. The new key replaces the old one at once, so put it in
+   `.env` and restart your agent right away. A process still running with
+   the old key is turned away within about 10 seconds and stops; a game it
+   was in the middle of can't continue from that process.
 
 2. **Check your setup** (it plays nothing):
 
@@ -133,14 +136,22 @@ Starting match...
 
 The detail lines appear when the platform sends them: `(Testing)` or
 `(tournament)`, the tournament and round, the other agents' names, and the
-**connect deadline** with the time left.
+**connect deadline** with the time left. When the game ends, the game's own
+line says how your agent did, for example
+`finished: your agent (player 2) won (termination_reason=completed, score=1.0)`
+(or `lost`, `drew`, `finished with no result` when the game couldn't be
+finished), then the runtime prints `Match finished.` and goes back to waiting.
 
 - **Test matches (`--match`).** On the dashboard's Testing page, create a test
   match and choose *Mine (self-hosted)* for the seats your agent should play,
-  or join an open match from the lobby. Your running `--match` process picks
-  each of those seats up within about 10 seconds. If you give your agent
-  several seats in one match (self-play), each seat is played in its own
-  process.
+  or join one from *Open matches*. A match with Open seats waits until other
+  contestants fill them; once the last one is filled, your running `--match`
+  process picks up each of your seats within about 10 seconds. If your agent
+  plays several players in one match (self-play), each one is played in its
+  own process. The runtime still prints one line for the whole match,
+  `Match assigned: werewolf (Testing), self-play: your agent plays all 7 players`,
+  and one `Match finished.` at the end; each player's own line says whether
+  it won or lost.
 - **Tournament games (`--tournament`).** Register your agent for a tournament
   on the dashboard. When a round starts, your games are assigned to your agent
   automatically. Keep the process running for the whole tournament.
@@ -163,30 +174,97 @@ The detail lines appear when the platform sends them: `(Testing)` or
   Use the same `--agent` value for `--check-tournament`.
 - **Reconnecting.** If the process stops mid-game, run the same command
   again. It signs in again, finds the game that is still assigned, and resumes
-  it — after up to about 35 seconds, while the old process's hold on the seat
-  runs out. Nothing is saved locally.
+  it: at once if the old process stopped more than about 30 seconds ago,
+  otherwise after up to about a minute. Until then it prints
+  `Another runtime is playing this match with your Official Agent Key; checking again in 35s.`,
+  because the stopped process's hold on the seat hasn't run out yet. Just
+  leave it running. Nothing is saved locally.
 - **One process with your key.** To play both kinds of game, run one process
   with `--tournament --match` rather than a `--match` process and a
   `--tournament` process side by side: the `--match` one would still warn
   about every tournament game, even one the other process is already playing.
-  Only one process can play a given seat: a second copy prints
-  `Another runtime is playing this match with your Official Agent Key...` and
-  just waits.
+  Don't run two copies with the same key either. Each of your agent's
+  players in a game is played by whichever copy picks it up first; the other
+  copy prints
+  `Another runtime is playing this match with your Official Agent Key...` for
+  it and leaves it alone. So nothing is played twice, and the game still
+  finishes. But in a match where your agent plays several players
+  (self-play), the two copies split the players: each terminal shows only
+  part of the match. If the copies run different agents (say the placeholder
+  and `--agent examples.llm_agent`), which agent plays which player is down
+  to chance, and the match's result and history don't say.
 - **Stopping.** Ctrl+C stops every game's process. It never resigns or
   otherwise touches a game.
 - **If something goes wrong**, the message says what to do:
   - *The Official Agent Key was not accepted*: check that your agent is
-    Self-hosted, then copy the key again (or generate a new one).
-  - *Your event registration isn't complete yet*: finish it on the dashboard.
+    Self-hosted and that `.env` has the key exactly as it was shown. The
+    dashboard can't show a key again: if you no longer have it, press
+    **Rotate key** in Agent Configuration and put the new key in `.env`.
+  - *Your Official Agent Key is no longer accepted, so no new game will
+    start. Put your new key in .env ... and restart this process*: the key
+    was rotated (or revoked) while the process was running. The platform
+    turns the old key's sign-in away within about 10 seconds, so the process
+    starts no new game, not even a test match, and stops. Put the new key in
+    `.env` and restart it: the process reads `.env` only when it starts.
+  - *Accept the updated Official Rules on your dashboard; I'll keep trying.*
+    (or *Your event registration isn't complete. Finish it on your
+    dashboard; I'll keep trying.*): do that on the dashboard. You don't need
+    to restart: the process keeps running, checks again every 30 seconds and
+    plays as soon as you have. Until then, games already running keep
+    playing, but only for up to about an hour (until the process has to sign
+    in again). New games may not start. So don't wait.
   - *Could not renew your agent session*: a temporary problem on the
     platform (it's busy, or briefly unreachable). Nothing to do: your running
     games keep playing and the process tries again by itself. It stops only
-    for the two messages above.
-  - A game whose agent raises an error stops on its own; the seat is retried
-    about a minute later if it's still assigned, and your other games keep
-    going. A seat that keeps failing (for example a game the game server lost
-    after a restart, which the platform then closes with no result) is retried
-    less often each time: 1, 2, 4, 8, then every 10 minutes.
+    for the first message above (the key itself was refused). (That's once
+    it's running. If signing in fails when you start it, for any reason but
+    the registration message above, it prints
+    `Could not connect with your Official Agent Key: ...` and exits, so check
+    that it printed `Connected with your Official Agent Key.` and run it
+    again if not.)
+  - *Connection problem (...); retrying for up to 90s.*: a dropped
+    connection or a busy server during a game. Nothing to do: the game keeps
+    going, the process tries again every few seconds, and your agent is asked
+    again from the fresh state (a move is never sent twice blindly). It prints
+    *Connection back; the game goes on.* when it's over.
+  - *couldn't get into the game yet*: the same kind of problem before a game
+    has started. The process keeps trying every few seconds until the connect
+    deadline, so a short hiccup doesn't make you miss the game. After the
+    deadline it prints *Couldn't reach that game (a temporary problem);
+    retrying in 60s if it is still assigned.* and tries less often.
+  - *Lost the connection to that game for a while*: the connection stayed
+    down for 90 seconds during a game. The game is started again about 10
+    seconds later, or after a longer pause if it keeps happening right after
+    each restart. Nothing to do.
+  - *The game server couldn't answer (...); retrying for up to 90s.*: the
+    game server had a problem of its own while the process was reading the
+    game. Nothing to do: it is retried like a connection problem and prints
+    *The game server answers again; the game goes on.* when it's over.
+  - *choose_action returned a move that can't be sent*: the move holds
+    something that isn't plain JSON, such as a numpy number or an object of
+    your own class. Use only `str`, `int`, `float`, `bool`, `None`, lists and
+    dicts (for example `int(x)` for a numpy number). The game stops and is
+    started again like after an agent error (see below).
+  - *The game server couldn't handle that call (...); trying once more.*:
+    the game server answered your move or message, but couldn't accept it
+    (for example a move in a shape it doesn't take) or ran into a problem of
+    its own. This isn't a connection problem, so your agent is asked once
+    more. If it happens again, that game stops and is started again like
+    after an agent error (next point).
+  - *Your agent's process for this match stopped with an error (exit code 1);
+    the match continues. Retrying in 60s if it is still assigned.*: your
+    agent raised an error or made a move the game refused (the line just
+    before it says what went wrong). The match itself goes on without your
+    agent, and the game's own timers may play for it. The process is started
+    again about a minute later if the match is still assigned. Your other
+    games keep going. A game that keeps failing (for example one the game
+    server lost after a restart, which the platform then closes with no
+    result, or an agent that crashes on the same thing again) is retried less
+    often each time: 1, 2, 4, 8, then every 10 minutes. After 10 minutes of
+    play without trouble, the count starts over.
+  - *Your red_alert match (Testing) has ended while your agent's process for
+    it was stopped.*: the match ended before your agent was back in it, so it
+    didn't play to the end.
 
 **This is not a security sandbox.** Separate processes keep games apart from
 *each other* (state, crashes). They don't isolate your agent code from your own
@@ -280,8 +358,10 @@ def create_agent():
 ```
 
 `create_agent()` may return a plain function or any object exposing a
-callable `choose_action(self, state, context)` — nothing fancier, and nothing
-about the return value is inspected beyond that.
+callable `choose_action(self, state, context)`, optionally with the
+`choose_message` and `on_action_result` methods described below. If the
+object is itself callable (defines `__call__`), the runtime calls it directly
+instead of its `choose_action`.
 
 **Your `create_agent()` is called once per game, in that game's own process**
 — never once for the whole run. Two games at once always get two separate
@@ -311,8 +391,11 @@ one.
 
 If your `choose_action` raises, returns something this SDK doesn't recognize,
 or picks an action outside `state.legal_actions`, that one game's process
-stops with a `DecisionError` (it's never retried, so a bug in your logic is
-visible right away) and your other games keep going. A genuine server-side
+stops with a `DecisionError` and prints it, so a bug in your logic is visible
+right away, and your other games keep going. The runtime starts that game
+again about a minute later if it's still assigned, then less and less often
+(see *If something goes wrong* above). Until your agent is back, the game's
+own timers may play for you. A genuine server-side
 race (a stale read producing `STALE_STATE`, or the game finishing between
 your last read and your move) is handled automatically and never blamed on
 your code.
@@ -345,7 +428,7 @@ class MyAgent:
         return state.legal_actions[0]
 
     def choose_message(self, state, context):
-        for message in state.new_messages:   # what others sent since you last checked
+        for message in state.new_messages:   # everything said in this window so far (you get it again on every call)
             ...
         return SendMessage("let's cooperate")   # or: return TERMINATE_MESSAGING
 
@@ -358,6 +441,9 @@ def create_agent():
   sends a private message (2+ recipients is rejected server-side today).
 - `TERMINATE_MESSAGING` votes to end the round; once every active player has
   voted to end it, the phase flips back to moves.
+- `state.new_messages` holds the whole current window (yours too) and is
+  emptied when the phase changes, so it is empty when `choose_action` is
+  asked for the day vote. Keep what you need from `choose_message` on `self`.
 - `choose_message` is looked up the same way `choose_action` is (an
   attribute on whatever `create_agent()` returned) — **a plain function
   agent has no way to define one and just gets the default (auto-terminate)
@@ -442,6 +528,15 @@ python -m agent --tournament --agent examples.llm_agent         # your tournamen
 - **Validation and fallback:** every answer is checked against the server's
   options. An invalid one is retried once with the reason, then replaced by a
   default legal action (logged as `FALLBACK`).
+- **Pokémon's clocks:** battles run Showdown's VGC timer: 90 seconds at Team
+  Preview, 55 seconds for each battle decision, and a 7-minute (420 s) total
+  bank per player per battle. When a decision runs out, Showdown plays a
+  default move for you and your bank shrinks. When your bank is empty, you
+  forfeit the battle ("lost due to inactivity"). Each draft pick has 15
+  seconds (see [`GAMES.md`](GAMES.md)). So for Pokémon the model gets at most
+  40 seconds per battle decision or Team Preview and 10 seconds per draft
+  pick, retry included (no single request over 25 seconds); then the agent
+  plays its fallback. Werewolf and Red Alert have no such limit here.
 - **No wasted calls:** the model is never called while you're waiting for
   another player or after the game ends.
 - **Other providers:** the model provider is a small class (`examples/llm/providers.py`),
@@ -460,8 +555,15 @@ You don't need this section to take part; it describes what
    temporary problem (too many attempts, a server error, a session the
    platform couldn't start), the running games keep playing and the
    supervisor tries again after a pause of 10 to 60 seconds (a full minute
-   after "too many attempts"). It stops only when the platform refuses the
-   key itself or your registration isn't complete.
+   after "too many attempts"). If your registration isn't complete (for
+   example the Official Rules were updated), it says what to do and tries
+   again every 30 seconds. It stops only when the platform refuses the key
+   itself. A rotated or revoked key also ends the sessions started with it:
+   the next request (a poll or a lease renewal, within about 10 seconds) is
+   refused, signing in again with the old key is refused too, and the
+   process stops. If a game's worker is the first to find the key refused, it
+   exits with its own code and the supervisor starts no new worker from then
+   on, saying once what to do.
 2. **Find games.** Every 10 seconds the supervisor
    (`altruagent/supervisor.py`, `run_tournament_forever`) lists your agent's
    active seats (`GET /tournament/agent/assignments`) and starts one worker
@@ -470,20 +572,40 @@ You don't need this section to take part; it describes what
    `tournament` (`--tournament`); a seat without one (an older backend) counts
    as a tournament game. A game of the other kind is left alone, with one
    warning or note per game. It logs each game it picks up
-   (`describe_assignment`). A seat that drops off the list for two polls in a
-   row has its worker stopped; the kind filter never stops a running worker.
+   (`describe_assignment`), once per match however many of its players it
+   starts. A seat that drops off the list for two polls in a row has its
+   worker stopped; the kind filter never stops a running worker. A game whose
+   worker had stopped and that drops off the list is reported as ended. Each
+   log line is written in one piece, so lines from several games never run
+   together.
 3. **Get a seat.** The worker (`altruagent/worker.py`) builds your agent, then
    asks for the seat's grant (`POST /tournament/agent/assignments/:seatId/grant`
-   with this process's random `execution_id`). The grant holds a temporary
+   with this process's random `execution_id`), using the supervisor's agent
+   session rather than signing in again. The grant holds a temporary
    GameAPI token for that one seat; it's kept only in memory and asked for
-   again when it expires.
+   again when it expires. A temporary failure is retried in the worker every
+   few seconds for up to a minute; a worker that still can't get in is
+   replaced at once while the game's connect deadline hasn't passed.
 4. **Hold the seat.** While the game runs, the worker renews the seat's lease
    every 10 seconds (`.../lease/renew`). If another process takes the seat, the
    worker stops acting on it.
 5. **Play.** The worker plays the game through `MCPGameSession`
    (`altruagent/mcp_game.py`) and `run_game` (`altruagent/runner.py`), calling
    your `choose_action`/`choose_message` when a decision is due, until the game
-   ends.
+   ends. A call that fails for a temporary reason (a dropped connection, a
+   gateway or server error, a busy game engine) is retried in place every few
+   seconds; a move is never resent blindly, the state is read again instead.
+   Only after 90 seconds without one successful call does the worker stop;
+   the supervisor starts it again about 10 seconds later if the game had been
+   playing, otherwise after the usual pause (1, 2, 4, 8, then every 10
+   minutes). Each call gives up after 40 seconds without an answer, so a
+   silently dropped connection costs seconds, not minutes. A move or message
+   the game server answers with an MCP tool error (it couldn't accept the
+   arguments, or the tool failed) is not a connection problem: it is tried
+   once more, then the worker stops. A read answered that way is the
+   server's own trouble and is retried like a connection problem. A move or
+   message that can't be sent as JSON stops the worker at once, as an agent
+   error.
 
 ### Playing one game by hand
 

@@ -54,16 +54,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from mcp import ClientSession
+from mcp import ClientSession, types
 from mcp.client.streamable_http import streamablehttp_client
+from pydantic_core import PydanticSerializationError
 
 from .errors import PlatformError
 
 if TYPE_CHECKING:
     from .client import AltruAgentClient
+
+# How long one tool call may take. The SDK's own defaults are 30 s to connect
+# and 300 s to read, so a connection that silently died (a Wi-Fi or VPN
+# switch, a laptop waking up) would freeze the agent for five minutes. The
+# longest healthy call is wait_for_update: the server holds it at most 25 s
+# (GameAPI's WAIT_MAX_TIMEOUT_SECONDS), so the read timeout stays well above
+# that plus network time. The session timeout is a backstop for an answer
+# that trickles in without ever finishing. A call that times out raises
+# MCPToolError (no error code), which the runner retries in place.
+MCP_CONNECT_TIMEOUT_SECONDS = 10.0
+MCP_READ_TIMEOUT_SECONDS = 40.0
+MCP_SESSION_TIMEOUT_SECONDS = 45.0
 
 
 class MCPToolError(PlatformError):
@@ -73,14 +87,76 @@ class MCPToolError(PlatformError):
     protocol/transport-level failure (``error_code`` is ``None`` in that
     case — including an HTTP-level rejection, surfaced with its
     ``status_code``).
+
+    ``protocol_error`` is True when the server answered, but with an MCP tool
+    error (``isError``) rather than a result: the tool's arguments failed
+    validation, or the tool itself crashed. GameAPI sends every game error
+    as a normal result with an ``error`` code, so this is a call the server
+    can't handle, likely to fail the same way again. It is not a connection
+    problem (``errors.is_transient_error`` is False for it).
+
+    ``local_error`` is True when the call never left this process: its
+    arguments can't be sent as JSON (for example a numpy number, bytes, or an
+    object of the agent's own class inside a move). Neither a connection nor
+    a server problem; sending the same arguments again fails the same way
+    (``errors.is_transient_error`` is False for it too).
     """
+
+    def __init__(
+        self, message: str, *, protocol_error: bool = False, local_error: bool = False, **kwargs: Any
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.protocol_error = protocol_error
+        self.local_error = local_error
+
+
+def _unsendable_arguments(name: str, exc: BaseException) -> MCPToolError:
+    return MCPToolError(
+        f"MCP tool {name!r} can't send its arguments as JSON: {exc}",
+        status_code=None,
+        error_code=None,
+        local_error=True,
+    )
+
+
+def _check_arguments(name: str, arguments: dict) -> None:
+    """Raise ``MCPToolError(local_error=True)`` if the SDK couldn't send
+    ``arguments``: the same JSON conversion ``ClientSession.call_tool`` does,
+    done before any connection is opened. Inside the SDK that failure would
+    surface wrapped in anyio ExceptionGroups, indistinguishable from a
+    dropped connection.
+    """
+    try:
+        types.CallToolRequestParams(name=name, arguments=arguments).model_dump(
+            by_alias=True, mode="json", exclude_none=True
+        )
+    except ValueError as exc:  # PydanticSerializationError, UnicodeDecodeError, ValidationError
+        raise _unsendable_arguments(name, exc) from exc
+
+
+def _find_serialization_error(exc: BaseException) -> PydanticSerializationError | None:
+    """A ``PydanticSerializationError`` anywhere in anyio's ExceptionGroup
+    wrapping: the SDK failed to turn this call's arguments into JSON (a
+    backstop for ``_check_arguments``)."""
+    if isinstance(exc, PydanticSerializationError):
+        return exc
+    for sub in getattr(exc, "exceptions", None) or ():
+        found = _find_serialization_error(sub)
+        if found is not None:
+            return found
+    return None
 
 
 async def _call_tool_once(
     mcp_url: str, token: str, name: str, arguments: dict, *, httpx_client_factory=None
 ) -> dict:
     headers = {"Authorization": f"Bearer {token}"}
-    kwargs: dict[str, Any] = {"headers": headers}
+    kwargs: dict[str, Any] = {
+        "headers": headers,
+        # The SDK builds httpx.Timeout(timeout, read=sse_read_timeout) from these.
+        "timeout": MCP_CONNECT_TIMEOUT_SECONDS,
+        "sse_read_timeout": MCP_READ_TIMEOUT_SECONDS,
+    }
     if httpx_client_factory is not None:
         # Test-only seam: lets unit tests exercise the real streamablehttp_client
         # / ClientSession code paths (JSON-RPC framing, error unwrapping) against
@@ -88,7 +164,9 @@ async def _call_tool_once(
         # rather than replacing the SDK's classes with hand-built fakes.
         kwargs["httpx_client_factory"] = httpx_client_factory
     async with streamablehttp_client(mcp_url, **kwargs) as (read, write, _):
-        async with ClientSession(read, write) as session:
+        async with ClientSession(
+            read, write, read_timeout_seconds=timedelta(seconds=MCP_SESSION_TIMEOUT_SECONDS)
+        ) as session:
             await session.initialize()
             result = await session.call_tool(name, arguments)
 
@@ -97,6 +175,7 @@ async def _call_tool_once(
             f"MCP tool {name!r} failed at the protocol level: {_extract_text(result)}",
             status_code=None,
             error_code=None,
+            protocol_error=True,
         )
 
     payload = result.structuredContent
@@ -199,6 +278,7 @@ def call_tool(
     ``httpx_client_factory`` is a test-only seam (see ``_call_tool_once``) —
     production callers never pass it.
     """
+    _check_arguments(name, arguments)
     token = client._current_access_token()
     try:
         return asyncio.run(
@@ -212,6 +292,9 @@ def call_tool(
         # leaking out of this SDK. _find_http_status_error unwraps whatever
         # anyio's task-group wrapping did, so the 401 check below still works
         # regardless of how many ExceptionGroup layers deep it's nested.
+        serialization_exc = _find_serialization_error(exc)
+        if serialization_exc is not None:
+            raise _unsendable_arguments(name, serialization_exc) from exc
         http_exc = _find_http_status_error(exc)
         if http_exc is None:
             raise MCPToolError(
