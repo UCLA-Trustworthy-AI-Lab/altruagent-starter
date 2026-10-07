@@ -438,3 +438,48 @@ def test_a_server_that_never_answers_fails_the_call_after_the_session_timeout(mo
     assert time.monotonic() - started < 10
     assert exc_info.value.error_code is None and exc_info.value.status_code is None
     assert is_transient_error(exc_info.value)
+
+
+@pytest.fixture
+def silent_server():
+    """A real local TCP server that accepts each connection, reads the
+    request, and never answers: what a silently dropped connection looks like
+    from the client's side. Yields its MCP URL."""
+    import socket
+    import threading
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    held: list[socket.socket] = []
+
+    def accept() -> None:
+        while True:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            held.append(connection)
+            threading.Thread(target=connection.recv, args=(65536,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    yield f"http://127.0.0.1:{server.getsockname()[1]}/mcp"
+    server.close()
+    for connection in held:
+        connection.close()
+
+
+def test_the_read_timeout_reaches_the_real_connection(monkeypatch, silent_server):
+    # Over a real socket (not a mock transport): the HTTP read timeout itself
+    # ends a call whose server went silent, long before the session backstop.
+    monkeypatch.setattr(mcp_transport, "MCP_READ_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(mcp_transport, "MCP_SESSION_TIMEOUT_SECONDS", 30.0)
+
+    started = time.monotonic()
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), silent_server, "wait_for_update", {"session_id": "s-1"})
+
+    assert time.monotonic() - started < 10
+    assert "ReadTimeout" in str(exc_info.value)
+    assert is_transient_error(exc_info.value)
