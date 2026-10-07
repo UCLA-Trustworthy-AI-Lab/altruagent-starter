@@ -207,12 +207,23 @@ The detail lines appear when the platform sends them: `(Testing)` or
   - *couldn't get into the game yet*: the same kind of problem before a game
     has started. The process keeps trying every few seconds until the connect
     deadline, so a short hiccup doesn't make you miss the game.
+  - *Lost the connection to that game for a while*: the connection stayed
+    down for 90 seconds during a game. The game is started again about 10
+    seconds later, or after a longer pause if it keeps happening right after
+    each restart. Nothing to do.
+  - *The game server couldn't handle that call (...); trying once more.*:
+    the game server answered, but couldn't accept the call (for example a
+    move in a shape it doesn't take) or ran into a problem of its own. This
+    isn't a connection problem, so the process tries only once more. If it
+    happens again, that game stops and is started again like after an agent
+    error (next point).
   - A game whose agent raises an error stops on its own and is started again
-    if it's still assigned: about 10 seconds later if it had been playing for
-    a while, otherwise about a minute later. Your other games keep going. A
-    game that keeps failing straight away (for example one the game server
-    lost after a restart, which the platform then closes with no result) is
-    retried less often each time: 1, 2, 4, 8, then every 10 minutes.
+    about a minute later if it's still assigned. Your other games keep going.
+    A game that keeps failing (for example one the game server lost after a
+    restart, which the platform then closes with no result, or an agent that
+    crashes on the same thing again) is retried less often each time: 1, 2,
+    4, 8, then every 10 minutes. After 10 minutes of play without trouble,
+    the count starts over.
 
 **This is not a security sandbox.** Separate processes keep games apart from
 *each other* (state, crashes). They don't isolate your agent code from your own
@@ -341,10 +352,9 @@ If your `choose_action` raises, returns something this SDK doesn't recognize,
 or picks an action outside `state.legal_actions`, that one game's process
 stops with a `DecisionError` and prints it, so a bug in your logic is visible
 right away, and your other games keep going. The runtime starts that game
-again if it's still assigned: about 10 seconds later if it had been playing
-for a while, otherwise about a minute later, then less and less often (see
-*If something goes wrong* above). Until your agent is back, the game's own
-timers may play for you. A genuine server-side
+again about a minute later if it's still assigned, then less and less often
+(see *If something goes wrong* above). Until your agent is back, the game's
+own timers may play for you. A genuine server-side
 race (a stale read producing `STALE_STATE`, or the game finishing between
 your last read and your move) is handled automatically and never blamed on
 your code.
@@ -535,10 +545,14 @@ You don't need this section to take part; it describes what
    ends. A call that fails for a temporary reason (a dropped connection, a
    gateway or server error, a busy game engine) is retried in place every few
    seconds; a move is never resent blindly, the state is read again instead.
-   Only after 90 seconds without one successful call does the worker stop
-   (and the supervisor start it again). Each call gives up after 40 seconds
-   without an answer, so a silently dropped connection costs seconds, not
-   minutes.
+   Only after 90 seconds without one successful call does the worker stop;
+   the supervisor starts it again about 10 seconds later if the game had been
+   playing, otherwise after the usual pause (1, 2, 4, 8, then every 10
+   minutes). Each call gives up after 40 seconds without an answer, so a
+   silently dropped connection costs seconds, not minutes. A call the game
+   server answers with an MCP tool error (it couldn't accept the arguments,
+   or the tool failed) is not a connection problem: it is tried once more,
+   then the worker stops.
 
 ### Playing one game by hand
 
