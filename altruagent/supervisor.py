@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Collection
 
+from .console import print_line
 from .errors import AuthenticationError, PlatformError
 from .official import is_fatal_auth_error, is_registration_incomplete, new_execution_id, registration_wait_message
 from .runner import TRANSIENT_GIVE_UP_SECONDS
@@ -475,7 +476,7 @@ def run_tournament_once(
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     shutdown_join_timeout: float = DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = print_line,
     wall_now: Callable[[], datetime] = _utc_now,
 ) -> None:
     """One non-blocking tournament tick, keyed by ``seat_id`` throughout:
@@ -651,7 +652,7 @@ def run_tournament_forever(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
     process_factory: Callable[..., "multiprocessing.process.BaseProcess"] = _MP_CONTEXT.Process,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = print_line,
     max_iterations: int | None = None,
 ) -> None:
     """Keep one worker per active official assignment of a kind in ``kinds``
