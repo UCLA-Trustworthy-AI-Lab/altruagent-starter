@@ -130,6 +130,12 @@ TRANSIENT_RETRY_FIRST_SECONDS = 1.0
 TRANSIENT_RETRY_MAX_SECONDS = 5.0
 TRANSIENT_GIVE_UP_SECONDS = 90.0
 
+# GameAPI lets only a couple of wait_for_update calls wait at once per agent
+# and game; another answers TOO_MANY_WAITS. A call this runtime already gave
+# up on (a dropped connection) can still be waiting there for up to 25 s, so
+# this is paced and retried like a temporary failure, never the agent's fault.
+_WAIT_BUSY_ERROR_CODE = "TOO_MANY_WAITS"
+
 # wait_for_update's long-poll timeout; it returns earlier as soon as anything
 # changes. 20 s is the server default (its maximum is 25 s), well under the
 # MCP client's 40 s read timeout (``mcp_transport.MCP_READ_TIMEOUT_SECONDS``).
@@ -428,8 +434,12 @@ def _with_game_config(game: Any, context: DecisionContext) -> DecisionContext:
         return context
     try:
         config = getter(context.game_type)
-    except MCPToolError:
-        return context
+    except AltruAgentError as exc:
+        # Best-effort: also a temporary failure of the seat's re-grant, which
+        # arrives as a control-plane error rather than an MCPToolError.
+        if isinstance(exc, MCPToolError) or _is_transient(exc):
+            return context
+        raise
     return replace(context, game_config=config) if isinstance(config, dict) else context
 
 
@@ -533,8 +543,11 @@ def _is_transient(exc: BaseException) -> bool:
     ``TRANSIENT_GIVE_UP_SECONDS``). A server without ``wait_for_update``
     also answers with no error code, but that is permanent: never retried.
     """
-    if isinstance(exc, MCPToolError) and _is_unknown_tool_error(exc):
-        return False
+    if isinstance(exc, MCPToolError):
+        if _is_unknown_tool_error(exc):
+            return False
+        if exc.error_code == _WAIT_BUSY_ERROR_CODE:
+            return True
     return is_transient_error(exc)
 
 
@@ -633,7 +646,8 @@ def run_game(
     raises ``DecisionError``.
 
     A temporary failure of any call (``errors.is_transient_error``: a
-    dropped connection, a gateway or server error, a busy game engine) is
+    dropped connection, a gateway or server error, a busy game engine; or
+    ``TOO_MANY_WAITS`` while an abandoned wait still runs on the server) is
     retried in place: a read is simply tried again after a short pause; a
     move or message is never resent — the runner pauses, re-reads the state
     and decides again. ``log`` gets one line when the trouble starts and one

@@ -384,3 +384,27 @@ def test_llm_agent_plays_a_whole_red_alert_match_through_the_runner():
     assert [c["action"]["orders"][0]["cmd"] for c in game.play_action_calls] == ["deploy", "build"]
     assert game.play_action_calls[0]["reasoning_summary"] == "Build power."
     assert len(game.wait_calls) == 1  # the empty batch waited for the next view
+
+
+def test_a_temporary_regrant_failure_while_reading_the_config_leaves_it_unset():
+    # get_game_config is best-effort: a seat re-grant that hits a control-plane
+    # hiccup (it arrives as a PlatformError, not an MCPToolError) mustn't end
+    # the game.
+    from altruagent.errors import PlatformError
+
+    game = RealtimeFakeGame(PlatformError("Request failed with status 503.", status_code=503))
+    game.queue_state(ra_state(100), terminal_state())
+    game.queue_play_action(accepted(("build", "pending", "pending"))).queue_result(result_dict())
+    agent = Recorder(ORDERS)
+    run_game(game, RED_ALERT, agent, sleep=lambda s: None)
+    assert agent.contexts[0].game_config is None
+    assert len(game.play_action_calls) == 1
+
+
+def test_a_definite_refusal_while_reading_the_config_still_stops_the_game():
+    from altruagent.official import OfficialAgentError
+
+    game = RealtimeFakeGame(OfficialAgentError("held", status_code=409, error_code="seat_busy"))
+    game.queue_state(ra_state(100))
+    with pytest.raises(OfficialAgentError):
+        run_game(game, RED_ALERT, Recorder(ORDERS), sleep=lambda s: None)

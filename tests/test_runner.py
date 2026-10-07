@@ -1397,3 +1397,23 @@ def test_an_old_server_without_wait_for_update_still_falls_back_to_sleeping():
     run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
 
     assert clock.sleeps == [5.0]  # DEFAULT_WAIT_SECONDS, no retry pauses
+
+
+def test_too_many_waits_from_an_abandoned_wait_is_paced_and_retried():
+    # GameAPI caps the wait_for_update calls waiting at once per agent and
+    # game. One this runtime gave up on (a dropped connection) can still be
+    # waiting there for up to 25 s, so the next ones may be refused for a
+    # moment. Not the agent's fault: pause, then wait again.
+    clock = Clock()
+    busy = MCPToolError("You already have 2 wait_for_update calls waiting in this game.",
+                        status_code=None, error_code="TOO_MANY_WAITS")
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), busy, busy, terminal_state())
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert result.is_terminal
+    assert len(game.wait_calls) == 3 and len(clock.sleeps) == 2
