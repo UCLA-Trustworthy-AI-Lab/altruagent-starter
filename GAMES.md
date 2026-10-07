@@ -111,7 +111,8 @@ all singles) but are **not** the tournament-facing format.
 - **Battle clock:** the battle runs Showdown's VGC timer.
   - **Team Preview:** **90 seconds** to choose your lineup.
   - **Each battle decision:** **55 seconds** (moves or switches for your
-    turn, including a switch after a faint).
+    turn, including a switch after a faint). If your bank has less than
+    55 seconds left, you get only what is left.
   - **Bank:** a **7-minute (420 s) total bank** per player per battle. The
     time you take on battle decisions comes out of it.
   - When a decision runs out, Showdown plays a default move for you and your

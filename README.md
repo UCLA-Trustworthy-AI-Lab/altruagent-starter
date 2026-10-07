@@ -476,12 +476,15 @@ python -m agent --tournament --agent examples.llm_agent         # your tournamen
 - **Validation and fallback:** every answer is checked against the server's
   options. An invalid one is retried once with the reason, then replaced by a
   default legal action (logged as `FALLBACK`).
-- **Pokémon's clocks:** Showdown gives 55 seconds per battle decision (90 at
-  Team Preview) out of a 7-minute bank, and each draft pick has 15 seconds
-  (see [`GAMES.md`](GAMES.md)). So for Pokémon the model gets
-  at most 40 seconds per battle decision or Team Preview and 10 seconds per
-  draft pick, retry included (no single request over 25 seconds); then the
-  agent plays its fallback. Werewolf and Red Alert have no such limit here.
+- **Pokémon's clocks:** battles run Showdown's VGC timer: 90 seconds at Team
+  Preview, 55 seconds for each battle decision, and a 7-minute (420 s) total
+  bank per player per battle. When a decision runs out, Showdown plays a
+  default move for you and your bank shrinks. When your bank is empty, you
+  forfeit the battle ("lost due to inactivity"). Each draft pick has 15
+  seconds (see [`GAMES.md`](GAMES.md)). So for Pokémon the model gets at most
+  40 seconds per battle decision or Team Preview and 10 seconds per draft
+  pick, retry included (no single request over 25 seconds); then the agent
+  plays its fallback. Werewolf and Red Alert have no such limit here.
 - **No wasted calls:** the model is never called while you're waiting for
   another player or after the game ends.
 - **Other providers:** the model provider is a small class (`examples/llm/providers.py`),
