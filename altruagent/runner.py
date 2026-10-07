@@ -554,10 +554,13 @@ def _is_transient(exc: BaseException) -> bool:
 def _is_tool_failure(exc: BaseException) -> bool:
     """The game server answered the call with an MCP tool error
     (``MCPToolError.protocol_error``: arguments it couldn't accept, or the
-    tool crashed). Not a connection problem, and most likely to fail the same
-    way again, so it is tried once more only, in case it was a one-off (a
-    read again; a move decided again from a fresh read). A missing
-    ``wait_for_update`` is handled on its own."""
+    tool crashed). Not a connection problem. After a move or message (whose
+    content comes from the agent) it is most likely to fail the same way
+    again, so it is tried once more only, in case it was a one-off (the move
+    decided again from a fresh read). After a read, whose arguments the runner
+    builds itself, it is the server's own trouble (GameAPI answers every game
+    error as a normal result), so it is retried like a connection problem. A
+    missing ``wait_for_update`` is handled on its own."""
     return (
         isinstance(exc, MCPToolError)
         and getattr(exc, "protocol_error", False)
@@ -587,8 +590,9 @@ class _TransientRetry:
     """Paces the retries after temporary failures in one game, and gives up
     (re-raising the last error) once failures have lasted
     ``TRANSIENT_GIVE_UP_SECONDS`` without a single successful call. A tool
-    failure (``_is_tool_failure``) is retried once, and re-raised if it
-    happens again before a call succeeds.
+    failure (``_is_tool_failure``) of a move or message is retried once, and
+    re-raised if it happens again before a call succeeds; one of a read is
+    retried like a temporary failure.
     """
 
     def __init__(self, *, sleep: Callable[[float], None], now: Callable[[], float],
@@ -597,20 +601,28 @@ class _TransientRetry:
         self._now = now
         self._log = log
         self._since: float | None = None
+        self._back = ""
         self._streak = 0
         self._tool_failure_retried = False
 
-    def failed(self, exc: BaseException) -> None:
-        """Pause before the next try, or re-raise ``exc`` if it's time to give up."""
+    def failed(self, exc: BaseException, *, read: bool = False) -> None:
+        """Pause before the next try, or re-raise ``exc`` if it's time to give
+        up. ``read``: the call was a read the runner built itself."""
         current = self._now()
-        if _is_tool_failure(exc):
+        if _is_tool_failure(exc) and not read:
             if self._tool_failure_retried:
                 raise exc
             self._tool_failure_retried = True
             self._log(f"The game server couldn't handle that call ({exc}); trying once more.")
         elif self._since is None:
             self._since = current
-            self._log(f"Connection problem ({exc}); retrying for up to {TRANSIENT_GIVE_UP_SECONDS:.0f}s.")
+            if _is_tool_failure(exc):
+                self._back = "The game server answers again; the game goes on."
+                self._log(f"The game server couldn't answer ({exc}); retrying for up to "
+                          f"{TRANSIENT_GIVE_UP_SECONDS:.0f}s.")
+            else:
+                self._back = "Connection back; the game goes on."
+                self._log(f"Connection problem ({exc}); retrying for up to {TRANSIENT_GIVE_UP_SECONDS:.0f}s.")
         elif current - self._since >= TRANSIENT_GIVE_UP_SECONDS:
             raise exc
         delay = min(TRANSIENT_RETRY_MAX_SECONDS, TRANSIENT_RETRY_FIRST_SECONDS * 2 ** self._streak)
@@ -619,7 +631,7 @@ class _TransientRetry:
 
     def succeeded(self) -> None:
         if self._since is not None:
-            self._log("Connection back; the game goes on.")
+            self._log(self._back)
         self._since = None
         self._streak = 0
         self._tool_failure_retried = False
@@ -693,9 +705,12 @@ def run_game(
     move or message is never resent — the runner pauses, re-reads the state
     and decides again. ``log`` gets one line when the trouble starts and one
     when it ends. Only after ``TRANSIENT_GIVE_UP_SECONDS`` without a single
-    successful call does the error propagate. A call the server answers with
-    an MCP tool error (``MCPToolError.protocol_error``) is retried the same
-    way once; a second one before any call succeeds propagates. Any other
+    successful call does the error propagate. A read the server answers with
+    an MCP tool error (``MCPToolError.protocol_error``: its own trouble) is
+    retried the same way. A move or message answered that way is retried once
+    (decided again from a fresh read); a second one before any call succeeds
+    propagates. A move or message that can't be sent as JSON
+    (``MCPToolError.local_error``) raises ``DecisionError`` at once. Any other
     error propagates immediately.
 
     Returns the final ``GameState`` once the match is terminal.
@@ -717,7 +732,7 @@ def run_game(
             except AltruAgentError as exc:
                 if not _is_retried(exc):
                     raise
-                retry.failed(exc)
+                retry.failed(exc, read=True)
                 continue
             if settles:
                 retry.succeeded()

@@ -1516,15 +1516,62 @@ def test_a_one_off_tool_error_on_a_move_is_tried_once_more_and_the_game_goes_on(
     assert result.is_terminal and len(game.play_action_calls) == 2
 
 
-def test_a_read_the_server_cant_handle_is_tried_once_more_then_reaches_the_worker():
+@pytest.mark.parametrize("tool", ["wait_for_update", "get_game_state"])
+def test_a_read_the_server_cant_answer_for_a_while_is_retried_and_the_game_goes_on(tool):
+    # A read's arguments are built by the runner, and GameAPI answers every
+    # game error as a normal result, so an isError answer to a read is the
+    # server's own trouble (a crash while its engine restarts, say). Was:
+    # tried once more, then the worker stopped and sat out at least 60 s.
     clock = Clock()
+    lines: list[str] = []
+    error = _tool_error(tool)
+    game = FakeMCPGameSession()
+    if tool == "get_game_state":
+        game.queue_state(error, error, error, waiting_state(), terminal_state())
+    else:
+        game.queue_state(waiting_state(), error, error, error, terminal_state())
+    game.queue_result(result_dict())
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert result.is_terminal and len(clock.sleeps) == 3
+    assert lines[0].startswith("The game server couldn't answer (") and lines[0].endswith("; retrying for up to 90s.")
+    assert lines[-1] == "The game server answers again; the game goes on."
+    assert len(lines) == 2 and not any("Connection problem" in line for line in lines)
+
+
+def test_a_read_the_server_never_answers_reaches_the_worker_after_the_give_up_time():
+    clock = Clock()
+    asked = []
     error = _tool_error("wait_for_update")
-    game = FakeMCPGameSession().queue_state(waiting_state(), error, error, terminal_state())
+    game = FakeMCPGameSession().queue_state(waiting_state(), *([error] * 200))
 
     with pytest.raises(MCPToolError) as exc_info:
-        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+        run_game(game, CONTEXT, lambda s, c: asked.append(1) or RESIGN, sleep=clock.sleep, now=clock.now,
+                 log=lambda line: None)
 
-    assert exc_info.value is error and len(game.wait_calls) == 2
+    assert exc_info.value is error and exc_info.value.protocol_error
+    assert runner_module.TRANSIENT_GIVE_UP_SECONDS <= clock.t < runner_module.TRANSIENT_GIVE_UP_SECONDS + 10
+    assert len(game.wait_calls) < 40  # paced: about 1, 2, 4, then 5 s apart
+    assert asked == []  # reads never ask the agent
+
+
+def test_after_a_move_the_server_cant_handle_a_read_it_cant_answer_is_retried():
+    # The move is tried once more only; the re-read that follows is a read.
+    clock = Clock()
+    move_error, read_error = _tool_error(), _tool_error("get_game_state")
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(legal_actions=_ONE_ACTION), read_error, read_error,
+                     make_mcp_state(legal_actions=_ONE_ACTION), terminal_state())
+        .queue_play_action(move_error, play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now,
+                      log=lambda line: None)
+
+    assert result.is_terminal and len(game.play_action_calls) == 2
 
 
 def test_each_success_allows_one_more_try_after_a_tool_error():
