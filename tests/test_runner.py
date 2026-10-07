@@ -1367,6 +1367,68 @@ def test_the_give_up_clock_starts_over_after_any_successful_call():
     assert result.is_terminal and clock.t >= 160
 
 
+_ONE_ACTION = int_actions(0)  # embedded in the state, as GameAPI sends it
+
+
+def test_a_move_that_keeps_failing_while_reads_work_still_reaches_the_worker():
+    # Every read works, every move fails (say a gateway error on that one
+    # tool). The re-read after each failure mustn't count as "the trouble is
+    # over", or the agent would be asked and the move retried every second
+    # for the rest of the game. The pauses grow and the worker gets the error
+    # after TRANSIENT_GIVE_UP_SECONDS, like any other lasting failure.
+    clock = Clock()
+    lines: list[str] = []
+    error = MCPToolError("MCP tool 'play_action' request failed with HTTP 502", status_code=502, error_code=None)
+    game = (
+        FakeMCPGameSession()
+        .queue_state(*[make_mcp_state(legal_actions=_ONE_ACTION) for _ in range(200)])
+        .queue_play_action(*([error] * 200))
+    )
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert exc_info.value is error
+    assert runner_module.TRANSIENT_GIVE_UP_SECONDS <= clock.t < runner_module.TRANSIENT_GIVE_UP_SECONDS + 10
+    assert len(game.play_action_calls) < 40  # paced: about 1, 2, 4, then 5 s apart
+    assert len(lines) == 1 and lines[0].startswith("Connection problem")
+
+
+def test_after_a_failed_move_a_wait_that_works_ends_the_trouble():
+    # The move landed but its answer was lost; the game then went on (a wait
+    # worked) for longer than the give-up time. A later, unrelated blip is a
+    # new spell of trouble, retried as usual, not "90 s of failure".
+    clock = Clock()
+    lines: list[str] = []
+
+    class SlowOpponentGame(FakeMCPGameSession):
+        def wait_for_update(self, **kwargs) -> GameState:
+            clock.t += 120.0  # the opponent thinks for two minutes
+            return super().wait_for_update(**kwargs)
+
+    error = MCPToolError("MCP tool 'play_action' request failed with HTTP 504", status_code=504, error_code=None)
+    game = (
+        SlowOpponentGame()
+        .queue_state(
+            make_mcp_state(state_version=0, legal_actions=_ONE_ACTION),
+            waiting_state(state_version=1),  # re-read after the first failure: it landed
+            make_mcp_state(state_version=2, legal_actions=int_actions(0, state_version=2)),  # the wait's answer
+            waiting_state(state_version=3),  # re-read after the second failure: it landed
+            terminal_state(state_version=4),  # the wait's answer
+        )
+        .queue_play_action(error, error)
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert result.is_terminal and len(game.play_action_calls) == 2
+    assert [line.split(" (")[0].rstrip(".") for line in lines] == [
+        "Connection problem", "Connection back; the game goes on",
+        "Connection problem", "Connection back; the game goes on",
+    ]
+
+
 @pytest.mark.parametrize(
     "error",
     [

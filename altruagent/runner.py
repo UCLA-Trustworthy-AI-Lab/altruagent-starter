@@ -664,9 +664,10 @@ def run_game(
     config_fetched = False
     retry = _TransientRetry(sleep=sleep, now=now, log=log)
 
-    def read(call: Callable[[], Any]) -> Any:
+    def read(call: Callable[[], Any], *, settles: bool = True) -> Any:
         """One read of the game (safe to repeat), retried in place after a
-        temporary failure."""
+        temporary failure. ``settles=False``: the read alone doesn't end a
+        spell of trouble (see ``recover``)."""
         while True:
             try:
                 answer = call()
@@ -675,14 +676,20 @@ def run_game(
                     raise
                 retry.failed(exc)
                 continue
-            retry.succeeded()
+            if settles:
+                retry.succeeded()
             return answer
 
     def recover(exc: AltruAgentError) -> GameState:
         """After a temporary failure of a move or message: pause, then read
-        the state again. Never resend: it may have landed."""
+        the state again. Never resend: it may have landed. The re-read doesn't
+        end the trouble; a move or message that goes through, or a wait (the
+        game moved on), does. So a move that keeps failing while reads work is
+        retried at a slowing pace and reaches the worker after
+        ``TRANSIENT_GIVE_UP_SECONDS``, instead of being retried every second
+        for the rest of the game."""
         retry.failed(exc)
-        return read(game.get_state)
+        return read(game.get_state, settles=False)
 
     def wait(current: GameState, message_seq: int | None) -> GameState:
         nonlocal long_poll_supported
@@ -770,7 +777,7 @@ def run_game(
             if state.raw.get("legal_actions") is None:
                 # The server omits legal_actions when a move landed between
                 # its state and legal-actions reads; fetch them directly.
-                legal = read(game.get_legal_actions)
+                legal = read(game.get_legal_actions, settles=False)  # the move that follows settles
                 state.legal_actions = [
                     LegalAction.from_dict(a) for a in legal.get("actions") or []
                 ]
