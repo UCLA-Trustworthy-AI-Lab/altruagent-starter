@@ -237,6 +237,71 @@ def test_other_agent_errors_in_a_real_time_game_keep_the_usual_message():
         run_game(game, RED_ALERT, broken, sleep=lambda s: None)
 
 
+def test_the_real_placeholder_module_in_red_alert_says_plainly_it_cant_play_it():
+    from agent.agent import create_agent
+
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError, match=r"^Your agent can't play Red Alert:"):
+        run_game(game, RED_ALERT, create_agent(), sleep=lambda s: None)
+
+
+def test_picking_at_random_from_the_empty_legal_actions_says_it_cant_play_either():
+    import random
+
+    def random_pick(state, context):
+        return random.choice(state.legal_actions)  # IndexError raised inside random.py
+
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError, match=r"^Your agent can't play Red Alert:"):
+        run_game(game, RED_ALERT, random_pick, sleep=lambda s: None)
+
+
+def test_an_unrelated_index_error_in_a_real_red_alert_agent_keeps_the_real_error():
+    # Was: "Your agent can't play Red Alert: ..." for any IndexError, since
+    # Red Alert's legal_actions is always empty; the real error was dropped.
+    def own_bug(state, context):
+        units = []
+        return {"orders": [{"cmd": "stop", "units": [units[0]]}]}
+
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError) as excinfo:
+        run_game(game, RED_ALERT, own_bug, sleep=lambda s: None)
+
+    message = str(excinfo.value)
+    assert message.startswith("choose_action raised IndexError('list index out of range')")
+    assert "can't play" not in message
+
+
+def test_an_index_error_in_a_helper_given_legal_actions_keeps_the_real_error():
+    # The line that failed is the helper's own units[0], not a pick from
+    # legal_actions, even though the caller's line names legal_actions.
+    def first_unit(legal_actions, units):
+        return units[0]
+
+    def agent(state, context):
+        return {"orders": [{"cmd": "stop", "units": [first_unit(state.legal_actions, [])]}]}
+
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError, match=r"^choose_action raised IndexError"):
+        run_game(game, RED_ALERT, agent, sleep=lambda s: None)
+
+
+def test_only_the_expression_that_failed_counts_not_the_rest_of_its_line():
+    # The line names legal_actions, but what failed was units[0].
+    def fallback(state, context):
+        units = []
+        return state.legal_actions[0] if state.legal_actions else {"orders": [{"cmd": "stop", "units": [units[0]]}]}
+
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError, match=r"^choose_action raised IndexError"):
+        run_game(game, RED_ALERT, fallback, sleep=lambda s: None)
+
+
 def test_an_index_error_in_a_turn_based_game_keeps_the_usual_message():
     game = RealtimeFakeGame().queue_state(make_mcp_state(legal_actions={"actions": []}))
 

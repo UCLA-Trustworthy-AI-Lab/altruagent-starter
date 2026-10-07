@@ -106,8 +106,13 @@ state's), never something `choose_action`/`choose_message` supply or manage.
 
 from __future__ import annotations
 
+import linecache
+import os
 import random
+import re
+import sysconfig
 import time
+import traceback
 from dataclasses import replace
 from typing import Any, Callable, NamedTuple, Protocol, Union
 
@@ -402,11 +407,57 @@ def _cant_play_realtime_message(context: DecisionContext) -> str:
     )
 
 
+# The standard library's own folders, for ``_picked_from_legal_actions``.
+_STDLIB_DIRS = tuple(
+    {
+        os.path.realpath(path) + os.sep
+        for path in (sysconfig.get_path("stdlib"), sysconfig.get_path("platstdlib"))
+        if path
+    }
+)
+_NAMES_LEGAL_ACTIONS = re.compile(r"\blegal_actions\b")
+
+
+def _is_stdlib_file(filename: str) -> bool:
+    if filename.startswith("<frozen "):
+        return True
+    path = os.path.realpath(filename)
+    return path.startswith(_STDLIB_DIRS) and "site-packages" not in path and "dist-packages" not in path
+
+
+def _failing_expression(frame: traceback.FrameSummary) -> str:
+    """The source of the expression a frame was running when the error was
+    raised (Python 3.11+ records its columns, as UTF-8 byte offsets), or the
+    whole line when the columns aren't known; "" without the source."""
+    line = linecache.getline(frame.filename, frame.lineno or 0)
+    if line and frame.end_lineno == frame.lineno and frame.colno is not None and frame.end_colno is not None:
+        return line.encode("utf-8")[frame.colno : frame.end_colno].decode("utf-8", "replace")
+    return line
+
+
+def _picked_from_legal_actions(exc: BaseException) -> bool:
+    """Whether this error came from picking a move out of ``legal_actions``:
+    in the innermost frame outside the standard library (so
+    ``random.choice(state.legal_actions)`` counts as well as
+    ``state.legal_actions[0]``), the expression that failed names
+    ``legal_actions``. An agent's own bug, such as ``units[0]`` on an empty
+    list, doesn't, and keeps its real error."""
+    for frame in reversed(traceback.extract_tb(exc.__traceback__)):
+        if not _is_stdlib_file(frame.filename):
+            return bool(_NAMES_LEGAL_ACTIONS.search(_failing_expression(frame)))
+    return False
+
+
 def _invoke_decision(decision_fn: DecisionFn, state: GameState, context: DecisionContext) -> Any:
     try:
         return decision_fn(state, context)
     except Exception as exc:
-        if isinstance(exc, IndexError) and not state.legal_actions and _is_realtime(state):
+        if (
+            isinstance(exc, IndexError)
+            and not state.legal_actions
+            and _is_realtime(state)
+            and _picked_from_legal_actions(exc)
+        ):
             raise DecisionError(_cant_play_realtime_message(context)) from exc
         raise DecisionError(
             f"choose_action raised {exc!r} for session {context.session_id!r}."
