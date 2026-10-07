@@ -31,7 +31,7 @@ import httpx
 
 from ._responses import _parse_error_body, _parse_json_body
 from .client import AltruAgentClient
-from .errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
+from .errors import MINT_FAILURE_PREFIX, AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from .models import OfficialAssignment, SeatGrant
 from .notices import DASHBOARD_URL
 
@@ -50,8 +50,7 @@ _ERROR_MESSAGES = {
         "in ALTRUAGENT_OFFICIAL_AGENT_KEY, and restart."
     ),
     "registration_incomplete": (
-        f"Your event registration isn't complete yet. Finish it on the tournament dashboard "
-        f"({DASHBOARD_URL}), then run this again."
+        f"Your event registration isn't complete. Finish it on your dashboard ({DASHBOARD_URL})."
     ),
     "rate_limited": "Too many authentication attempts. Wait a minute and try again.",
     "agent_session_unavailable": (
@@ -72,13 +71,23 @@ class OfficialAgentError(AuthenticationError):
     """Official authentication or a seat grant failed. ``error_code`` is the
     platform's machine code when it sent one (``invalid_official_agent_key``,
     ``assignment_not_found``, ``assignment_not_grantable``, ...).
+    ``next_step`` is the registration step still missing, for
+    ``registration_incomplete`` (``"rules"``, ``"questionnaire"``, ...).
     """
+
+    next_step: str | None = None
+
+
+# A registration that is incomplete only because the Official Rules changed
+# (the platform's next_step "rules"): the agent was registered, then the Rules
+# were updated and must be accepted again.
+_RULES_MESSAGE = f"Accept the updated Official Rules on your dashboard ({DASHBOARD_URL})."
 
 
 # The platform has answered a failed session mint (its own sign-in service
 # rejecting or rate-limiting the request) with 401 invalid_official_agent_key
 # and this detail. That is a temporary platform problem, not a key problem.
-_MINT_FAILURE_PREFIX = "Failed to mint agent session"
+_MINT_FAILURE_PREFIX = MINT_FAILURE_PREFIX
 
 
 def _is_mint_failure(code: str | None, detail: str | None) -> bool:
@@ -88,29 +97,56 @@ def _is_mint_failure(code: str | None, detail: str | None) -> bool:
 def _error_from(response: httpx.Response, fallback: str) -> OfficialAgentError:
     parsed = _parse_error_body(response)
     code = parsed["error"]
+    body = _parse_json_body(response)
+    next_step = body.get("next_step") if isinstance(body, dict) else None
     if _is_mint_failure(code, parsed["detail"]):
         message = _ERROR_MESSAGES["agent_session_unavailable"]
+    elif code == "registration_incomplete" and next_step == "rules":
+        message = _RULES_MESSAGE
     else:
         message = _ERROR_MESSAGES.get(code) or f"{fallback} (HTTP {response.status_code}" + (f", {code})" if code else ")")
-    return OfficialAgentError(message, status_code=response.status_code, error_code=code, detail=parsed["detail"])
+    error = OfficialAgentError(message, status_code=response.status_code, error_code=code, detail=parsed["detail"])
+    error.next_step = next_step if isinstance(next_step, str) else None
+    return error
+
+
+def is_registration_incomplete(exc: BaseException) -> bool:
+    """The platform turned this agent away because the event registration
+    isn't complete, most likely because the Official Rules were updated and
+    must be accepted again. Only the contestant can fix it (on the
+    dashboard), but it isn't a reason to stop: the runtime keeps trying, so it
+    plays again as soon as they have.
+    """
+    return isinstance(exc, OfficialAgentError) and exc.error_code == "registration_incomplete"
+
+
+def registration_wait_message(exc: BaseException) -> str:
+    """What the runtime prints while the registration is incomplete: what to
+    do, and that it keeps trying meanwhile."""
+    if getattr(exc, "next_step", None) == "rules":
+        what = f"Accept the updated Official Rules on your dashboard ({DASHBOARD_URL})"
+    else:
+        what = f"Your event registration isn't complete. Finish it on your dashboard ({DASHBOARD_URL})"
+    return f"{what}; I'll keep trying."
 
 
 def is_fatal_auth_error(exc: BaseException) -> bool:
-    """True only when the platform refused this agent itself, so retrying
-    can't help until the contestant acts: the Official Agent Key is wrong,
-    revoked or replaced, the agent isn't Self-hosted, or the event
-    registration isn't complete.
+    """True only when the platform refused this agent's key itself, so
+    retrying can't help until the contestant acts: the Official Agent Key is
+    wrong, revoked or replaced, or the agent isn't Self-hosted.
 
     Everything else is temporary and worth retrying with a pause: too many
     attempts (429), a server or gateway error (5xx, or a non-JSON page), no
     network, the platform failing to start a session, or a freshly issued
     agent session that wasn't accepted (a plain ``AuthenticationError`` from
-    the request that followed the sign-in).
+    the request that followed the sign-in). An incomplete registration
+    (``is_registration_incomplete``) isn't fatal either: the runtime says
+    what to do and keeps trying slowly until the contestant has done it.
     """
     if not isinstance(exc, OfficialAgentError):
         return False
     if exc.error_code == "registration_incomplete":
-        return True
+        return False
     if exc.error_code == "invalid_official_agent_key":
         return not _is_mint_failure(exc.error_code, exc.detail)
     return exc.error_code is None and exc.status_code == 401
@@ -199,6 +235,21 @@ class OfficialAgentClient:
         lazily by the first request)."""
         with self._lock:
             self._client.login()
+
+    def session_token(self) -> str | None:
+        """The current agent session token, or None before the first sign-in.
+        Never signs in. The supervisor hands it to each game's worker, which
+        then needn't sign in again (``use_session_token``). Never log it.
+        """
+        with self._lock:
+            return self._client._access_token
+
+    def use_session_token(self, token: str) -> None:
+        """Start from an agent session this runtime already holds instead of
+        signing in again. If it has expired, the first request gets a 401 and
+        signs in once as usual."""
+        with self._lock:
+            self._client._access_token = token
 
     def assignments(self) -> list[OfficialAssignment]:
         """``GET /tournament/agent/assignments`` — this agent's active seats

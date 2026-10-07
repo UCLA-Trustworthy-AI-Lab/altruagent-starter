@@ -17,12 +17,19 @@ import pytest
 
 from altruagent.errors import AuthenticationError, PlatformError
 from altruagent.mcp_game import MCPGameSession
+from altruagent.mcp_transport import MCPToolError
 from altruagent.models import OfficialAssignment, SeatGrant
 from altruagent.official import AUTHENTICATE_PATH, OfficialAgentClient, OfficialAgentError
 from altruagent.supervisor import (
     ALL_KINDS,
+    MIN_CONNECT_WINDOW_SECONDS,
     MISSING_POLLS_BEFORE_STOP,
+    NOT_CONNECTED_RETRY_SECONDS,
+    REGISTRATION_REMINDER_SECONDS,
+    REGISTRATION_RETRY_SECONDS,
+    RESTART_AFTER_PLAY_SECONDS,
     SEAT_FAILURE_BACKOFF_MAX_SECONDS,
+    WORKER_PLAYED_SECONDS,
     TESTING,
     TEST_MATCH_WAITING_NOTE,
     TOURNAMENT,
@@ -36,8 +43,12 @@ from altruagent.supervisor import (
 )
 from altruagent.worker import (
     EXIT_MATCH_FAILURE,
+    EXIT_NOT_CONNECTED,
+    EXIT_REGISTRATION_INCOMPLETE,
+    EXIT_SEAT_BUSY,
     EXIT_SUCCESS,
     EXIT_UNEXPECTED,
+    FIRST_GRANT_RETRY_SECONDS,
     TournamentWorkerInput,
     _tournament_process_entry,
     run_tournament_worker,
@@ -301,7 +312,7 @@ def test_failed_worker_is_retried_after_cooldown_reconnect_path():
     h.tick(advance=1.0)   # reaped -> cooldown
     h.tick(advance=10.0)  # still cooling down
     assert h.started() == ["seat-1"]
-    assert "retrying that seat" in h.log[2]
+    assert "retrying that game" in h.log[2]
 
     h.tick(advance=30.0)  # cooldown over, still assigned -> new worker (re-grant)
     assert h.started() == ["seat-1", "seat-1"]
@@ -319,7 +330,7 @@ def test_a_seat_that_keeps_failing_is_retried_less_and_less_often():
         h.clock["t"] = h.state.failed_until["seat-1"]  # wait it out; the next tick starts a new worker
 
     assert waits == [60.0, 120.0, 240.0, 480.0, SEAT_FAILURE_BACKOFF_MAX_SECONDS, SEAT_FAILURE_BACKOFF_MAX_SECONDS]
-    assert "retrying that seat in 120s" in "\n".join(h.log)
+    assert "retrying that game in 120s" in "\n".join(h.log)
 
 
 def test_a_finished_match_resets_the_seat_backoff_and_a_seat_that_left_is_forgotten():
@@ -490,11 +501,9 @@ def test_finished_workers_are_still_reaped_while_sign_in_is_failing():
                                         detail="Invalid official agent key"), id="wrong-or-revoked-key"),
         pytest.param(OfficialAgentError("oracle", status_code=401, error_code="invalid_official_agent_key",
                                         detail="This agent is Oracle Hosted; ..."), id="oracle-hosted"),
-        pytest.param(OfficialAgentError("registration", status_code=403, error_code="registration_incomplete"),
-                     id="registration-incomplete"),
     ],
 )
-def test_a_refused_key_or_registration_still_stops_the_runtime(error):
+def test_a_refused_key_still_stops_the_runtime(error):
     h = Harness([a("seat-1")], error)
     h.tick()
 
@@ -828,15 +837,22 @@ class FakeWorkerOfficial:
         self.grants: list[str] = []
         self.execution_ids: list[str] = []
         self.renewals: list[tuple[str, str]] = []
+        self.session_tokens: list[str] = []
         self.closed = False
         FakeWorkerOfficial.instances.append(self)
 
     def grant(self, seat_id, execution_id):
         self.execution_ids.append(execution_id)
         self.grants.append(seat_id)
-        if isinstance(self.grant_result, Exception):
-            raise self.grant_result
-        return self.grant_result
+        result = self.grant_result
+        if isinstance(result, list):  # one answer per call; the last one repeats
+            result = result.pop(0) if len(result) > 1 else result[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def use_session_token(self, token):
+        self.session_tokens.append(token)
 
     def renew_lease(self, seat_id, execution_id):
         self.renewals.append((seat_id, execution_id))
@@ -958,11 +974,30 @@ def test_worker_factory_error_fails_before_any_grant(monkeypatch, tmp_path):
 
 def test_worker_match_failure_exit_code():
     def failing(game, context, contestant):
-        raise PlatformError("GameAPI error", status_code=500)
+        raise MCPToolError("The game session was not found.", status_code=None, error_code="SESSION_NOT_FOUND")
 
     code, _, officials = _worker(run_game_fn=failing)
 
     assert code == EXIT_MATCH_FAILURE and officials[0].closed
+
+
+def test_worker_temporary_failure_before_reaching_the_game_is_not_connected():
+    def failing(game, context, contestant):
+        raise PlatformError("GameAPI error", status_code=500)
+
+    code, _, officials = _worker(run_game_fn=failing)
+
+    assert code == EXIT_NOT_CONNECTED and officials[0].closed
+
+
+def test_worker_temporary_failure_after_reaching_the_game_is_a_match_failure():
+    def failing(game, context, contestant):
+        game.contacted = True  # GameAPI answered at least once
+        raise MCPToolError("MCP tool 'wait_for_update' failed: ReadTimeout('')", status_code=None, error_code=None)
+
+    code, _, _ = _worker(run_game_fn=failing)
+
+    assert code == EXIT_MATCH_FAILURE
 
 
 def test_worker_ctrl_c_exits_quietly():
@@ -972,3 +1007,333 @@ def test_worker_ctrl_c_exits_quietly():
     code, _, _ = _worker(run_game_fn=interrupted)
 
     assert code == EXIT_SUCCESS
+
+
+# -- resilience: hiccups never become no-shows, and a game that was playing is picked up fast --
+
+
+def _run_ticks(h, ticks, advance, exitcode):
+    """Tick ``ticks`` times; every worker started fails at once with
+    ``exitcode``. Returns the clock times at which workers started."""
+    starts = []
+    for _ in range(ticks):
+        before = len(h.factory.processes)
+        h.tick(advance=advance)
+        if len(h.factory.processes) > before:
+            starts.append(h.clock["t"])
+            h.factory.processes[-1].finish(exitcode)
+    return starts
+
+
+def test_a_game_not_reached_yet_is_tried_again_every_poll_while_its_connect_window_is_open():
+    # Was: attempts at 0, 70, 200 and 450 s, so a burst of failures at round
+    # start (the platform busy) missed the 220 s window: a no-show loss.
+    h = Harness([tournament_game()])  # connect by 15:03:40, 220 s after NOW
+
+    starts = _run_ticks(h, 80, 10.0, EXIT_NOT_CONNECTED)
+
+    in_window = [t for t in starts if t - starts[0] < MIN_CONNECT_WINDOW_SECONDS]
+    gaps = [later - earlier for earlier, later in zip(in_window, in_window[1:])]
+    assert len(in_window) == MIN_CONNECT_WINDOW_SECONDS / 10.0 and max(gaps) == 10.0
+    assert "Couldn't reach that game yet (a temporary problem); trying again now." in h.log
+    # Once the window has closed (the platform has decided the game), the
+    # normal backoff applies (each gap also includes the poll that notices the exit).
+    late = [t for t in starts if t - starts[0] >= MIN_CONNECT_WINDOW_SECONDS]
+    assert [later - earlier for earlier, later in zip(late, late[1:])][:2] == [130.0, 250.0]
+
+
+def test_without_a_deadline_the_connect_window_is_five_minutes_from_when_the_game_was_listed():
+    h = Harness([a("seat-1", context="testing")])
+
+    starts = _run_ticks(h, 60, 10.0, EXIT_NOT_CONNECTED)
+
+    assert h.state.connect_by["seat-1"][1] == starts[0] + MIN_CONNECT_WINDOW_SECONDS
+    fast = [t for t in starts if t - starts[0] < MIN_CONNECT_WINDOW_SECONDS]
+    assert len(fast) == MIN_CONNECT_WINDOW_SECONDS / 10.0
+    assert len(starts) - len(fast) <= 3
+
+
+def test_a_clock_that_makes_the_deadline_look_passed_still_gets_the_fast_retries():
+    h = Harness([tournament_game(connect_deadline_at="2026-10-16T14:50:00Z")])  # 10 min "ago"
+
+    starts = _run_ticks(h, 20, 10.0, EXIT_NOT_CONNECTED)
+
+    assert {later - earlier for earlier, later in zip(starts, starts[1:])} == {10.0}
+
+
+def test_a_later_deadline_keeps_the_window_open_until_then():
+    h = Harness([tournament_game(connect_deadline_at="2026-10-16T15:10:00Z")])  # 600 s after NOW
+
+    h.tick(advance=10.0)
+
+    assert h.state.connect_by["seat-1"][1] == 10.0 + 600.0
+
+
+def test_a_new_game_for_the_same_seat_gets_a_new_connect_window():
+    first = tournament_game()
+    replay = tournament_game(match_id="match-replay", connect_deadline_at="2026-10-16T15:30:00Z")
+    h = Harness([first], [replay])
+
+    h.tick(advance=10.0)
+    h.factory.processes[-1].finish(EXIT_SUCCESS)
+    h.tick(advance=10.0)
+
+    assert h.state.connect_by["seat-1"] == (("match-replay", "2026-10-16T15:30:00Z"), 20.0 + 1800.0)
+
+
+def test_a_game_that_was_playing_is_picked_up_again_within_seconds_and_its_count_starts_over():
+    # Was: a worker that played five minutes then hit a blip counted as one
+    # more failure in a row, so the agent was absent 60, 120, 240, 480, 600 s.
+    h = Harness([a("seat-1")])
+    absences = []
+    h.tick()
+    for _ in range(5):
+        h.clock["t"] += 300.0  # plays for five minutes, then the worker gives up on a long outage
+        h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+        h.tick(advance=0.0)
+        absences.append(h.state.failed_until["seat-1"] - h.clock["t"])
+        h.clock["t"] = h.state.failed_until["seat-1"]
+        h.tick(advance=0.0)
+
+    assert absences == [RESTART_AFTER_PLAY_SECONDS] * 5
+    assert h.state.seat_failures == {"seat-1": 1}
+    assert len(h.factory.processes) == 6
+    assert "retrying that game in 10s" in "\n".join(h.log)
+
+
+def test_a_fast_failure_right_after_a_long_run_continues_the_doubling_from_one():
+    h = Harness([a("seat-1")])
+    h.tick()
+    h.clock["t"] += WORKER_PLAYED_SECONDS
+    h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+    h.tick(advance=0.0)
+    h.clock["t"] = h.state.failed_until["seat-1"]
+    h.tick(advance=0.0)  # restarted; this one fails at once
+    h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+    h.tick(advance=0.0)
+
+    assert h.state.seat_failures == {"seat-1": 2}
+    assert h.state.failed_until["seat-1"] - h.clock["t"] == 120.0
+
+
+def test_a_worker_turned_away_by_its_registration_is_retried_every_30s_without_counting():
+    h = Harness([a("seat-1")])
+    starts = _run_ticks(h, 10, 10.0, EXIT_REGISTRATION_INCOMPLETE)
+
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert gaps and set(gaps) == {REGISTRATION_RETRY_SECONDS + 10.0}  # plus the poll that notices the exit
+    assert h.state.seat_failures == {}
+    assert "That game can't start until your registration is complete; checking again in 30s." in h.log
+
+
+RULES_UPDATED = OfficialAgentError(
+    "Accept the updated Official Rules on your dashboard (https://platform.altruagent-game.com/tournament/dashboard).",
+    status_code=403, error_code="registration_incomplete",
+)
+RULES_UPDATED.next_step = "rules"
+RULES_MESSAGE = ("Accept the updated Official Rules on your dashboard "
+                 "(https://platform.altruagent-game.com/tournament/dashboard); I'll keep trying.")
+
+
+def test_updated_rules_never_stop_the_runtime_or_its_running_games():
+    # Was: fatal; the runtime printed "Stopped due to an unrecoverable error"
+    # and exited, and every later game was a no-show.
+    h = Harness([a("seat-1")], *([RULES_UPDATED] * 4), [a("seat-1"), a("seat-2")])
+    h.tick()
+    worker = h.factory.processes[0]
+
+    for _ in range(4):
+        h.tick(advance=REGISTRATION_RETRY_SECONDS)
+
+    assert not worker.terminated and h.state.registry.is_active("seat-1")
+    assert h.log.count(RULES_MESSAGE) == 1  # said once, not every 30 s
+    assert h.official.calls == 5
+    h.tick(advance=REGISTRATION_RETRY_SECONDS)  # accepted on the dashboard
+    assert h.log[-3:] == ["Assignment discovery recovered.", "Match assigned: pokemon_vgc_doubles_draft",
+                          "Starting match..."]
+    assert h.started() == ["seat-1", "seat-2"]
+
+
+def test_while_the_registration_is_incomplete_it_retries_slowly_and_reminds_every_few_minutes():
+    h = Harness(RULES_UPDATED)
+    attempts = []
+    for _ in range(700):
+        before = h.official.calls
+        h.tick(advance=1.0)
+        if h.official.calls > before:
+            attempts.append(h.clock["t"])
+
+    gaps = {later - earlier for earlier, later in zip(attempts, attempts[1:])}
+    assert gaps == {REGISTRATION_RETRY_SECONDS}
+    assert h.log.count(RULES_MESSAGE) == 1 + int((attempts[-1] - attempts[0]) // REGISTRATION_REMINDER_SECONDS)
+
+
+def test_real_client_updated_rules_mid_run_keep_the_runtime_going():
+    backend = RefreshBackend(assignments=[official_assignment("seat-1")])
+    h = _real_harness(backend)
+    h.tick()
+    backend.valid.clear()  # the hour-long session expires...
+    backend.refresh = httpx.Response(403, json={"error": "registration_incomplete",
+                                                "detail": "Finish your tournament registration first.",
+                                                "next_step": "rules"})  # ...after a Rules update
+
+    h.tick()
+
+    assert RULES_MESSAGE in h.log and not h.factory.processes[0].terminated
+
+    backend.refresh = None  # the contestant accepted the new Rules
+    h.tick(advance=REGISTRATION_RETRY_SECONDS)
+    assert h.log[-1] == "Assignment discovery recovered."
+
+
+def test_workers_get_the_runtimes_session_so_they_needn_t_sign_in_again():
+    backend = OfficialBackend(assignments=[official_assignment("seat-1")])
+    h = _real_harness(backend)
+
+    h.tick()
+
+    (process,) = h.factory.processes
+    token = process.args[0].agent_session
+    assert token == "sess-1" and len(backend.auth_bodies) == 1
+    assert token not in repr(process.args[0])
+
+
+def test_a_fake_official_without_a_session_hands_none():
+    h = Harness([a("seat-1")])
+
+    h.tick()
+
+    assert h.factory.processes[0].args[0].agent_session is None
+
+
+# -- worker: getting into the game ------------------------------------------------------------
+
+
+class WorkerClock:
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.t += seconds
+
+
+def _clocked_worker(grant_result, run_game_fn=None, **input_fields):
+    clock = WorkerClock()
+    runs, officials = [], []
+
+    def fake_run_game(game, context, contestant):
+        runs.append(game)
+        return types.SimpleNamespace(termination_reason="normal", returns={})
+
+    def factory():
+        officials.append(FakeWorkerOfficial(grant_result))
+        return officials[-1]
+
+    worker_input = TournamentWorkerInput("seat-1", "match-1", "werewolf", SPEC, EXEC, **input_fields)
+    code = run_tournament_worker(worker_input, official_factory=factory, run_game_fn=run_game_fn or fake_run_game,
+                                 sleep=clock.sleep, now=clock.now)
+    return code, runs, officials, clock
+
+
+GRANT_HICCUPS = [
+    pytest.param(PlatformError("internal", status_code=500, error_code="internal_error"), id="seat-sign-in-500"),
+    pytest.param(PlatformError("Could not reach", status_code=None), id="unreachable"),
+    pytest.param(OfficialAgentError("slow down", status_code=429, error_code="rate_limited"), id="429"),
+    pytest.param(OfficialAgentError("busy", status_code=503, error_code="agent_session_unavailable"), id="503"),
+    pytest.param(AuthenticationError("Invalid or expired agent session token", status_code=401,
+                                     error_code="invalid_agent_session"), id="fresh-session-401"),
+]
+
+
+@pytest.mark.parametrize("hiccup", GRANT_HICCUPS)
+def test_worker_retries_a_temporary_grant_failure_within_seconds_and_plays(hiccup, capsys):
+    code, runs, officials, clock = _clocked_worker([hiccup, hiccup, _grant()])
+
+    assert code == EXIT_SUCCESS and len(runs) == 1
+    assert officials[0].grants == ["seat-1"] * 3
+    assert len(clock.sleeps) == 2 and 2.25 <= clock.sleeps[0] <= 3.75 and 4.5 <= clock.sleeps[1] <= 7.5
+    assert "couldn't get into the game yet" in capsys.readouterr().out
+
+
+def test_worker_that_never_gets_into_the_game_exits_not_connected_after_a_minute():
+    code, runs, officials, clock = _clocked_worker(PlatformError("internal", status_code=500))
+
+    assert code == EXIT_NOT_CONNECTED and runs == []
+    assert FIRST_GRANT_RETRY_SECONDS <= clock.t <= FIRST_GRANT_RETRY_SECONDS + 20
+    assert 5 <= len(officials[0].grants) <= 8
+    assert max(clock.sleeps) <= 15 * 1.25
+
+
+def test_worker_does_not_retry_a_definite_grant_refusal():
+    code, _, officials, clock = _clocked_worker(
+        OfficialAgentError("missing", status_code=404, error_code="assignment_not_found"))
+
+    assert code == EXIT_UNEXPECTED and officials[0].grants == ["seat-1"] and clock.sleeps == []
+
+
+def test_worker_turned_away_by_updated_rules_says_what_to_do(capsys):
+    code, runs, _, clock = _clocked_worker(RULES_UPDATED)
+
+    assert code == EXIT_REGISTRATION_INCOMPLETE and runs == [] and clock.sleeps == []
+    assert RULES_MESSAGE in capsys.readouterr().out
+
+
+def test_worker_uses_the_handed_over_session():
+    code, _, officials, _ = _clocked_worker(_grant(), agent_session="sess-7")
+
+    assert code == EXIT_SUCCESS and officials[0].session_tokens == ["sess-7"]
+
+
+def test_worker_without_a_handed_over_session_signs_in_itself():
+    _, _, officials, _ = _clocked_worker(_grant())
+
+    assert officials[0].session_tokens == []
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        pytest.param(OfficialAgentError("held", status_code=409, error_code="seat_busy"), EXIT_SEAT_BUSY,
+                     id="seat-busy"),
+        pytest.param(OfficialAgentError("ended", status_code=409, error_code="assignment_not_grantable"), EXIT_SUCCESS,
+                     id="game-ended"),
+    ],
+)
+def test_worker_maps_a_regrant_refusal_during_play(error, expected):
+    def regrant_refused(game, context, contestant):
+        game.contacted = True
+        raise error
+
+    code, _, _, _ = _clocked_worker(_grant(), run_game_fn=regrant_refused)
+
+    assert code == expected
+
+
+def test_the_game_session_counts_as_reached_only_after_gameapi_answers(monkeypatch):
+    import threading
+
+    from altruagent import mcp_game
+    from altruagent.worker import _LeaseGuardedGameSession
+
+    answers = [MCPToolError("down", status_code=502), {"session_id": "game-1", "state_version": 0}]
+
+    def fake_call_tool(client, url, tool, arguments):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(mcp_game, "call_tool", fake_call_tool)
+    game = _LeaseGuardedGameSession(object(), lost=threading.Event(), session_id="game-1",
+                                    game_server_url="https://gameapi.example.test")
+
+    with pytest.raises(MCPToolError):
+        game.get_state()
+    assert game.contacted is False
+    game.get_state()
+    assert game.contacted is True
