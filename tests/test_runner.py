@@ -117,6 +117,7 @@ class FakeMCPGameSession:
                 "Unknown tool: wait_for_update",
                 status_code=None,
                 error_code=None,
+                protocol_error=True,  # as mcp_transport raises it
             )
         return self._pop(self._state_queue)
 
@@ -1459,6 +1460,87 @@ def test_an_old_server_without_wait_for_update_still_falls_back_to_sleeping():
     run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
 
     assert clock.sleeps == [5.0]  # DEFAULT_WAIT_SECONDS, no retry pauses
+
+
+def _tool_error(tool="play_action"):
+    # What mcp_transport raises for an isError answer: FastMCP rejected the
+    # arguments, or the tool crashed. GameAPI sends game errors as results.
+    return MCPToolError(
+        f"MCP tool {tool!r} failed at the protocol level: Error executing tool {tool}: 1 validation error",
+        status_code=None, error_code=None, protocol_error=True,
+    )
+
+
+def test_a_move_the_server_cant_handle_is_tried_once_more_then_reaches_the_worker():
+    # Was: retried as a "Connection problem" every few seconds for 90 s, so
+    # the agent was asked (an LLM agent: one model call) about 19 times, and
+    # the worker was then restarted to do the same again.
+    clock = Clock()
+    lines: list[str] = []
+    asked = []
+    error = _tool_error()
+    game = (
+        FakeMCPGameSession()
+        .queue_state(*[make_mcp_state(legal_actions=_ONE_ACTION) for _ in range(50)])
+        .queue_play_action(*([error] * 50))
+    )
+
+    def choose(state, context):
+        asked.append(state.state_version)
+        return state.legal_actions[0]
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, choose, sleep=clock.sleep, now=clock.now, log=lines.append)
+
+    assert exc_info.value is error
+    assert len(asked) == 2 and len(game.play_action_calls) == 2
+    assert clock.t < 5
+    assert len(lines) == 1 and lines[0].startswith("The game server couldn't handle that call (")
+    assert lines[0].endswith("); trying once more.")
+    assert not any("Connection problem" in line for line in lines)
+
+
+def test_a_one_off_tool_error_on_a_move_is_tried_once_more_and_the_game_goes_on():
+    clock = Clock()
+    game = (
+        FakeMCPGameSession()
+        .queue_state(make_mcp_state(legal_actions=_ONE_ACTION), make_mcp_state(legal_actions=_ONE_ACTION),
+                     terminal_state())
+        .queue_play_action(_tool_error(), play_action_result(status="completed"))
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=clock.sleep, now=clock.now,
+                      log=lambda line: None)
+
+    assert result.is_terminal and len(game.play_action_calls) == 2
+
+
+def test_a_read_the_server_cant_handle_is_tried_once_more_then_reaches_the_worker():
+    clock = Clock()
+    error = _tool_error("wait_for_update")
+    game = FakeMCPGameSession().queue_state(waiting_state(), error, error, terminal_state())
+
+    with pytest.raises(MCPToolError) as exc_info:
+        run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert exc_info.value is error and len(game.wait_calls) == 2
+
+
+def test_each_success_allows_one_more_try_after_a_tool_error():
+    # One-off tool errors on separate turns, each followed by a call that
+    # works: never two in a row, so the game goes on.
+    clock = Clock()
+    error = _tool_error("wait_for_update")
+    game = (
+        FakeMCPGameSession()
+        .queue_state(waiting_state(), error, waiting_state(state_version=1), error, terminal_state())
+        .queue_result(result_dict())
+    )
+
+    result = run_game(game, CONTEXT, lambda s, c: RESIGN, sleep=clock.sleep, now=clock.now, log=lambda line: None)
+
+    assert result.is_terminal and len(game.wait_calls) == 4
 
 
 def test_too_many_waits_from_an_abandoned_wait_is_paced_and_retried():

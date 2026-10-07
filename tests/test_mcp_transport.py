@@ -206,6 +206,24 @@ def test_call_tool_protocol_level_error_raises_mcp_tool_error_with_no_code():
     assert exc_info.value.error_code is None
 
 
+def test_a_tool_error_answer_is_a_protocol_error_not_a_connection_problem():
+    # The server answered, with isError (FastMCP: arguments it couldn't
+    # accept, or the tool crashed). Retrying for 90 s as if the connection
+    # had dropped would ask the agent again and again for nothing.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("method") == "tools/call":
+            return httpx.Response(200, json=_tool_call_response(body.get("id"), {}, is_error=True))
+        return _healthy_handler(request)
+
+    with pytest.raises(MCPToolError) as exc_info:
+        call_tool(FakeClient(), MCP_URL, "play_action", {"session_id": "s-1"}, httpx_client_factory=make_factory(handler))
+
+    assert exc_info.value.protocol_error is True
+    assert (exc_info.value.error_code, exc_info.value.status_code) == (None, None)
+    assert not is_transient_error(exc_info.value)
+
+
 def test_invalid_host_header_421_surfaces_as_mcp_tool_error_with_status_code():
     """Regression test for the real failure this transport was rewritten
     for: a 421 on the very first request (before any tool executes) must
@@ -437,6 +455,7 @@ def test_a_server_that_never_answers_fails_the_call_after_the_session_timeout(mo
 
     assert time.monotonic() - started < 10
     assert exc_info.value.error_code is None and exc_info.value.status_code is None
+    assert exc_info.value.protocol_error is False  # no answer at all, unlike an isError answer
     assert is_transient_error(exc_info.value)
 
 

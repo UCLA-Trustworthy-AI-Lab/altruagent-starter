@@ -86,7 +86,18 @@ class MCPToolError(PlatformError):
     protocol/transport-level failure (``error_code`` is ``None`` in that
     case — including an HTTP-level rejection, surfaced with its
     ``status_code``).
+
+    ``protocol_error`` is True when the server answered, but with an MCP tool
+    error (``isError``) rather than a result: the tool's arguments failed
+    validation, or the tool itself crashed. GameAPI sends every game error
+    as a normal result with an ``error`` code, so this is a call the server
+    can't handle, likely to fail the same way again. It is not a connection
+    problem (``errors.is_transient_error`` is False for it).
     """
+
+    def __init__(self, message: str, *, protocol_error: bool = False, **kwargs: Any) -> None:
+        super().__init__(message, **kwargs)
+        self.protocol_error = protocol_error
 
 
 async def _call_tool_once(
@@ -117,6 +128,7 @@ async def _call_tool_once(
             f"MCP tool {name!r} failed at the protocol level: {_extract_text(result)}",
             status_code=None,
             error_code=None,
+            protocol_error=True,
         )
 
     payload = result.structuredContent

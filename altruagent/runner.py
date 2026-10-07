@@ -551,10 +551,31 @@ def _is_transient(exc: BaseException) -> bool:
     return is_transient_error(exc)
 
 
+def _is_tool_failure(exc: BaseException) -> bool:
+    """The game server answered the call with an MCP tool error
+    (``MCPToolError.protocol_error``: arguments it couldn't accept, or the
+    tool crashed). Not a connection problem, and most likely to fail the same
+    way again, so it is tried once more only, in case it was a one-off (a
+    read again; a move decided again from a fresh read). A missing
+    ``wait_for_update`` is handled on its own."""
+    return (
+        isinstance(exc, MCPToolError)
+        and getattr(exc, "protocol_error", False)
+        and not _is_unknown_tool_error(exc)
+    )
+
+
+def _is_retried(exc: BaseException) -> bool:
+    """Retried in place: a temporary failure, or a first tool failure."""
+    return _is_transient(exc) or _is_tool_failure(exc)
+
+
 class _TransientRetry:
     """Paces the retries after temporary failures in one game, and gives up
     (re-raising the last error) once failures have lasted
-    ``TRANSIENT_GIVE_UP_SECONDS`` without a single successful call.
+    ``TRANSIENT_GIVE_UP_SECONDS`` without a single successful call. A tool
+    failure (``_is_tool_failure``) is retried once, and re-raised if it
+    happens again before a call succeeds.
     """
 
     def __init__(self, *, sleep: Callable[[float], None], now: Callable[[], float],
@@ -564,11 +585,17 @@ class _TransientRetry:
         self._log = log
         self._since: float | None = None
         self._streak = 0
+        self._tool_failure_retried = False
 
     def failed(self, exc: BaseException) -> None:
         """Pause before the next try, or re-raise ``exc`` if it's time to give up."""
         current = self._now()
-        if self._since is None:
+        if _is_tool_failure(exc):
+            if self._tool_failure_retried:
+                raise exc
+            self._tool_failure_retried = True
+            self._log(f"The game server couldn't handle that call ({exc}); trying once more.")
+        elif self._since is None:
             self._since = current
             self._log(f"Connection problem ({exc}); retrying for up to {TRANSIENT_GIVE_UP_SECONDS:.0f}s.")
         elif current - self._since >= TRANSIENT_GIVE_UP_SECONDS:
@@ -582,6 +609,7 @@ class _TransientRetry:
             self._log("Connection back; the game goes on.")
         self._since = None
         self._streak = 0
+        self._tool_failure_retried = False
 
 
 def _terminal_game_state(last_state: GameState, result: dict) -> GameState:
@@ -652,8 +680,10 @@ def run_game(
     move or message is never resent — the runner pauses, re-reads the state
     and decides again. ``log`` gets one line when the trouble starts and one
     when it ends. Only after ``TRANSIENT_GIVE_UP_SECONDS`` without a single
-    successful call does the error propagate. Any other error propagates
-    immediately.
+    successful call does the error propagate. A call the server answers with
+    an MCP tool error (``MCPToolError.protocol_error``) is retried the same
+    way once; a second one before any call succeeds propagates. Any other
+    error propagates immediately.
 
     Returns the final ``GameState`` once the match is terminal.
     """
@@ -672,7 +702,7 @@ def run_game(
             try:
                 answer = call()
             except AltruAgentError as exc:
-                if not _is_transient(exc):
+                if not _is_retried(exc):
                     raise
                 retry.failed(exc)
                 continue
@@ -752,7 +782,7 @@ def run_game(
                         f"choose_message produced an invalid messaging action "
                         f"for session {context.session_id!r}: {exc}"
                     ) from exc
-                if _is_transient(exc):
+                if _is_retried(exc):
                     state = recover(exc)
                     continue
                 raise
@@ -836,7 +866,7 @@ def run_game(
                         f"choose_action produced an invalid action for session "
                         f"{context.session_id!r}: {exc}"
                     ) from exc
-                if _is_transient(exc):
+                if _is_retried(exc):
                     # Not resent: it may have landed. The fresh state says
                     # whether a decision is still due.
                     if code is not None:
