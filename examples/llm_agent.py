@@ -43,6 +43,15 @@ An invalid answer is retried once with the reason; after that the agent
 plays a deterministic fallback (logged as FALLBACK): the first legal action,
 the adapter's fallback for a template, or ending the discussion round.
 
+Pokémon has clocks (see GAMES.md): Showdown's VGC timer gives 90 s at Team
+Preview and 55 s for each battle decision out of a 7-minute bank, and each
+draft pick has 15 s. So for Pokémon the model's whole answer, retry
+included, must arrive within ``POKEMON_DECISION_SECONDS`` (battle decisions
+and Team Preview) or ``POKEMON_DRAFT_SECONDS`` (draft picks); no single
+request may run past ``POKEMON_REQUEST_SECONDS``. Out of time, the agent
+plays its fallback rather than let the clock run out. Werewolf and Red Alert
+are unchanged.
+
 Configuration (environment or the starter's gitignored ``.env``):
 ``OPENAI_API_KEY`` (required), ``OPENAI_MODEL`` (default ``gpt-4o-mini``),
 ``OPENAI_BASE_URL`` (optional). The key is never printed or logged.
@@ -50,7 +59,9 @@ Configuration (environment or the starter's gitignored ``.env``):
 
 from __future__ import annotations
 
+import inspect
 import json
+import time
 from typing import Any, Callable
 
 from dotenv import load_dotenv
@@ -84,6 +95,16 @@ MESSAGE_WORD_LIMIT = 40
 MESSAGE_CHAR_LIMIT = 280
 TRANSCRIPT_LIMIT = 30
 
+# Pokémon's clocks: 55 s per battle decision and 90 s at Team Preview
+# (Showdown's VGC timer; the platform plays a move for you at about 50 s),
+# 15 s per draft pick. The model's answer, retry included, must arrive well
+# inside them, leaving a few seconds for the runtime to read the state and
+# send the move. A hung first request still leaves time for a retry.
+POKEMON_DECISION_SECONDS = 40.0
+POKEMON_DRAFT_SECONDS = 10.0
+POKEMON_REQUEST_SECONDS = 25.0
+MIN_ATTEMPT_SECONDS = 3.0  # less time left than this: play the fallback now
+
 # Keys of GameAPI's state payload the model doesn't need (options are sent
 # separately, the rest is transport bookkeeping).
 _OMITTED_STATE_KEYS = frozenset(
@@ -116,12 +137,15 @@ class LLMAgent:
         adapters: dict[str, AdapterFactory] | None = None,
         realtime_players: dict[str, Callable[..., Any]] | None = None,
         log: Callable[[str], None] = print,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._provider = provider
+        self._provider_takes_timeout = _accepts_timeout(provider)
         self._adapters = STRUCTURED_ADAPTERS if adapters is None else adapters
         self._realtime_players = REALTIME_PLAYERS if realtime_players is None else realtime_players
         self._realtime: Any = None  # this match's real-time player, created on first use
         self._log = log
+        self._clock = clock
         self._transcript: list[dict] = []
         self._seen_messages: set[int] = set()
         self._round: int | None = None
@@ -139,7 +163,7 @@ class LLMAgent:
         choice = self._action_choice(state)
         value, answer = self._ask(choice, state, context, counter="decision_calls")
         if value is None:
-            self._log(f"[llm] {choice.kind}: FALLBACK to a default legal action after {MAX_ATTEMPTS} invalid responses")
+            self._log(f"[llm] {choice.kind}: FALLBACK to a default legal action (no valid model answer in time)")
             return WithReasoning(choice.fallback(), "Fallback: the model gave no valid answer, so a default legal action was played.")
         summary = str(answer.get("reasoning_summary") or "").strip()[:REASONING_CHAR_LIMIT]
         self._log(f"[llm] {choice.kind}: {summary or '(no summary)'}")
@@ -194,7 +218,7 @@ class LLMAgent:
         choice = _message_choice(state, requests_left=MESSAGE_REQUESTS_PER_ROUND - self._round_requests)
         value, _ = self._ask(choice, state, context, counter="message_calls")
         if value is None:
-            self._log(f"[llm] message: FALLBACK to ending the discussion round after {MAX_ATTEMPTS} invalid responses")
+            self._log("[llm] message: FALLBACK to ending the discussion round (no valid model answer in time)")
             value = TERMINATE_MESSAGING
         if value is TERMINATE_MESSAGING:
             self._round_ended = True
@@ -226,10 +250,20 @@ class LLMAgent:
                 ),
             },
         ]
+        budget = _time_budget(state, context)
+        deadline = None if budget is None else self._clock() + budget
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            limit: dict = {}
+            if deadline is not None:
+                left = deadline - self._clock()
+                if left < MIN_ATTEMPT_SECONDS:
+                    self._log(f"[llm] {choice.kind}: out of time for another model call")
+                    break
+                if self._provider_takes_timeout:
+                    limit["timeout"] = min(POKEMON_REQUEST_SECONDS, left)
             setattr(self, counter, getattr(self, counter) + 1)
             try:
-                answer = self._provider.complete_structured(messages, choice.kind, choice.schema)
+                answer = self._provider.complete_structured(messages, choice.kind, choice.schema, **limit)
                 return choice.build(answer), answer
             except (ProviderError, InvalidChoice) as exc:
                 self._log(f"[llm] {choice.kind}: invalid model response (attempt {attempt}/{MAX_ATTEMPTS}): {exc}")
@@ -247,6 +281,24 @@ class LLMAgent:
                 {"from": f"Player{message.sender}", "to": [f"Player{r}" for r in message.recipients] or "everyone",
                  "text": message.content}
             )
+
+
+def _time_budget(state: GameState, context: DecisionContext) -> float | None:
+    """Seconds the model may take for this decision, or None for no limit
+    (every game but Pokémon, as before)."""
+    if not (context.game_type or "").startswith("pokemon"):
+        return None
+    return POKEMON_DRAFT_SECONDS if state.phase == "draft" else POKEMON_DECISION_SECONDS
+
+
+def _accepts_timeout(provider: Any) -> bool:
+    """Whether ``provider.complete_structured`` takes a ``timeout`` keyword
+    (a provider written before it existed doesn't)."""
+    try:
+        parameters = inspect.signature(provider.complete_structured).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return any(p.name == "timeout" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
 
 
 def _is_realtime(state: GameState) -> bool:

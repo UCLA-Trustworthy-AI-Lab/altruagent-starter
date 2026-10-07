@@ -811,3 +811,153 @@ def test_pokemon_prompt_without_target_options_keeps_the_raw_integers():
     _agent(provider).choose_action(_state(_doubles([_move("fakeout", [1, 2])], [PASS])), POKEMON)
 
     assert provider.prompt()["slots"][0]["options"][0]["targets"] == [1, 2]
+
+
+# -- Pokémon's clocks: 55 s per battle decision, 90 s at Team Preview, 15 s per draft pick ------
+
+
+class TimedProvider:
+    """A provider that takes ``timeout`` and spends scripted seconds on a fake clock."""
+
+    model = "fake-model"
+
+    def __init__(self, clock, *steps, honors_timeout=True):
+        self.clock = clock
+        self.steps = list(steps)  # (seconds spent, answer or exception)
+        self.honors_timeout = honors_timeout
+        self.timeouts: list[float | None] = []
+
+    def complete_structured(self, messages, schema_name, schema, *, timeout=None):
+        self.timeouts.append(timeout)
+        spent, answer = self.steps.pop(0)
+        if self.honors_timeout and timeout is not None and spent > timeout:
+            self.clock["t"] += timeout
+            raise ProviderError("OpenAI request failed (ReadTimeout)")
+        self.clock["t"] += spent
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def _timed_agent(provider, clock, log=None):
+    return LLMAgent(provider, log=(log if log is not None else []).append, clock=lambda: clock["t"])
+
+
+def test_a_pokemon_battle_decision_never_waits_longer_than_its_budget_even_when_the_model_hangs():
+    clock = {"t": 0.0}
+    legal = _doubles([_move("fakeout", [-2, 1]), _move("protect", [])], [_switch("Amoonguss"), PASS])
+    provider = TimedProvider(clock, (999, None), (999, None))
+    log: list[str] = []
+
+    decision = _timed_agent(provider, clock, log).choose_action(_state(legal), POKEMON)
+
+    assert decision.action == smoke_agent.choose_action(_state(legal), POKEMON)  # the fallback, in time
+    assert clock["t"] <= llm_agent.POKEMON_DECISION_SECONDS < 45  # Showdown plays a default move at 55 s
+    assert provider.timeouts == [llm_agent.POKEMON_REQUEST_SECONDS,
+                                 llm_agent.POKEMON_DECISION_SECONDS - llm_agent.POKEMON_REQUEST_SECONDS]
+    assert any("FALLBACK" in line for line in log)
+
+
+def test_a_slow_invalid_first_answer_leaves_the_retry_only_the_time_that_is_left():
+    clock = {"t": 0.0}
+    provider = TimedProvider(clock, (20, _answer(action_id="nope")), (5, _answer(action_id="b")))
+
+    decision = _timed_agent(provider, clock).choose_action(
+        _state({"action_id": "a"}, {"action_id": "b"}), POKEMON)
+
+    assert decision.action.action_id == "b"
+    assert provider.timeouts == [25.0, 20.0]
+
+
+def test_no_retry_is_started_with_almost_no_time_left():
+    clock = {"t": 0.0}
+    # A request that overran its timeout (slow DNS, a proxy) leaves 2 s: too little to try again.
+    provider = TimedProvider(clock, (38, _answer(action_id="nope")), honors_timeout=False)
+    log: list[str] = []
+
+    decision = _timed_agent(provider, clock, log).choose_action(
+        _state({"action_id": "a"}, {"action_id": "b"}), POKEMON)
+
+    assert decision.action.action_id == "a" and len(provider.timeouts) == 1
+    assert any("out of time" in line for line in log)
+
+
+def test_team_preview_fits_its_90_seconds():
+    clock = {"t": 0.0}
+    provider = TimedProvider(clock, (999, None), (999, None))
+
+    decision = _timed_agent(provider, clock).choose_action(_state(_lineup(), phase="team_preview"), POKEMON)
+
+    assert decision.action["type"] == "select_lineup"
+    assert clock["t"] <= llm_agent.POKEMON_DECISION_SECONDS < 90
+
+
+def test_a_draft_pick_fits_its_15_seconds():
+    clock = {"t": 0.0}
+    provider = TimedProvider(clock, (999, None), (999, None))
+
+    decision = _timed_agent(provider, clock).choose_action(_state(*_draft("a", "b"), phase="draft"), POKEMON)
+
+    assert decision.action.action_id == "draft_pick:a"
+    assert clock["t"] <= llm_agent.POKEMON_DRAFT_SECONDS < 15
+    assert provider.timeouts[0] == llm_agent.POKEMON_DRAFT_SECONDS
+
+
+def test_werewolf_keeps_its_old_timing():
+    clock = {"t": 0.0}
+    provider = TimedProvider(clock, (70, _answer(action_id="1")))
+
+    decision = _timed_agent(provider, clock).choose_action(_ww(*_ww_actions(("1", "Player1"))), WEREWOLF)
+
+    assert decision.action.action_id == "1" and provider.timeouts == [None]
+
+
+def test_a_provider_without_a_timeout_parameter_still_works_and_only_its_attempts_are_limited():
+    clock = {"t": 0.0}
+
+    class OldProvider:
+        model = "old"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete_structured(self, messages, schema_name, schema):
+            self.calls += 1
+            clock["t"] += 39
+            return _answer(action_id="nope")
+
+    provider = OldProvider()
+    decision = _timed_agent(provider, clock).choose_action(_state({"action_id": "a"}), POKEMON)
+
+    assert decision.action.action_id == "a" and provider.calls == 1
+
+
+def test_openai_provider_applies_a_per_request_timeout_only_when_asked():
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions.get("timeout"))
+        content = json.dumps({"action_id": "a", "reasoning_summary": "ok"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    provider = _openai(handler)
+    provider.complete_structured([], "x", {})
+    provider.complete_structured([], "x", {}, timeout=12.5)
+
+    assert seen[0]["read"] == providers.REQUEST_TIMEOUT_SECONDS
+    assert seen[1] == {"connect": 12.5, "read": 12.5, "write": 12.5, "pool": 12.5}
+
+
+def test_the_real_openai_provider_is_given_the_pokemon_timeout():
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions["timeout"]["read"])
+        content = json.dumps({"action_id": "a", "reasoning_summary": "ok"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    LLMAgent(_openai(handler), log=lambda line: None).choose_action(_state({"action_id": "a"}), POKEMON)
+    LLMAgent(_openai(handler), log=lambda line: None).choose_action(_ww(*_ww_actions(("1", "Player1"))), WEREWOLF)
+
+    assert seen[0] <= llm_agent.POKEMON_REQUEST_SECONDS
+    assert seen[1] == providers.REQUEST_TIMEOUT_SECONDS
