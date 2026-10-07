@@ -308,13 +308,14 @@ gives it to the wolves). After you resign, the runtime stops asking your
 agent for moves and messages and waits for the game to end, like any
 eliminated player, then reports the final result; the others play on.
 
-**When someone else resigns,** a vote or night target aimed at them is
-handed back: whoever chose them is on the clock again and chooses someone
-else (or abstains by day). So your agent can be asked to vote twice in one
-day; the runtime just calls `choose_action` again. If the wolves had already
-finished choosing and the seer was still to look, the night goes back to
-the wolves first. A day on which someone resigns (during its discussion or its
-vote) does not count toward the 3-days-with-no-elimination rule.
+**When someone else resigns,** a vote or night target aimed at them no
+longer counts, and nobody is asked to choose again. A vote for them counts
+for no one, like an abstention (the vote history still shows it); if no
+counted vote is left, nobody is voted out that day. If a wolf had chosen
+them as the night's victim, the other wolf's choice is the kill; if there is
+none, nobody is killed that night. A day on which someone resigns (during
+its discussion or its vote) does not count toward the
+3-days-with-no-elimination rule.
 
 On MOVING-phase inactivity timeout: `day_vote` auto-abstains (`7`); at night,
 the first legal target is auto-submitted (the night must resolve for the

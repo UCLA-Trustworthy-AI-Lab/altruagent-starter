@@ -164,12 +164,17 @@ def test_games_md_says_a_werewolf_resign_takes_only_that_player_out():
     assert "takes only you out; the game goes on" in werewolf
     assert "whichever\n  side wins" in werewolf
     assert "same-side teammates" not in werewolf
-    # The runtime watches the rest of the game, and a choice aimed at a
-    # resigner is handed back.
+    # The runtime watches the rest of the game. A choice aimed at a resigner
+    # no longer counts and nobody chooses again (decided 2026-10-07, replacing
+    # the hand-back).
     assert "waits for the game to end" in werewolf
     assert "The starter stops playing that game" not in werewolf
-    assert "handed back: whoever chose them" in " ".join(werewolf.split())
-    assert "a day on which someone resigns does not" in " ".join(werewolf.split())
+    flat = " ".join(werewolf.split())
+    assert "aimed at them no longer counts, and nobody is asked to choose again" in flat
+    assert "if there is none, nobody is killed that night" in flat
+    assert "handed back" not in flat
+    assert "vote twice in one day" not in flat
+    assert "a day on which someone resigns does not" in flat
 
 
 def test_readme_says_waiting_uses_no_ai_tokens():
