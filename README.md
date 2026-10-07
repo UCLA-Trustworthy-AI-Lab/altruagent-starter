@@ -211,12 +211,21 @@ The detail lines appear when the platform sends them: `(Testing)` or
     down for 90 seconds during a game. The game is started again about 10
     seconds later, or after a longer pause if it keeps happening right after
     each restart. Nothing to do.
+  - *The game server couldn't answer (...); retrying for up to 90s.*: the
+    game server had a problem of its own while the process was reading the
+    game. Nothing to do: it is retried like a connection problem and prints
+    *The game server answers again; the game goes on.* when it's over.
+  - *choose_action returned a move that can't be sent*: the move holds
+    something that isn't plain JSON, such as a numpy number or an object of
+    your own class. Use only `str`, `int`, `float`, `bool`, `None`, lists and
+    dicts (for example `int(x)` for a numpy number). The game stops and is
+    started again like after an agent error (see below).
   - *The game server couldn't handle that call (...); trying once more.*:
-    the game server answered, but couldn't accept the call (for example a
-    move in a shape it doesn't take) or ran into a problem of its own. This
-    isn't a connection problem, so the process tries only once more. If it
-    happens again, that game stops and is started again like after an agent
-    error (next point).
+    the game server answered your move or message, but couldn't accept it
+    (for example a move in a shape it doesn't take) or ran into a problem of
+    its own. This isn't a connection problem, so your agent is asked once
+    more. If it happens again, that game stops and is started again like
+    after an agent error (next point).
   - A game whose agent raises an error stops on its own and is started again
     about a minute later if it's still assigned. Your other games keep going.
     A game that keeps failing (for example one the game server lost after a
@@ -549,10 +558,13 @@ You don't need this section to take part; it describes what
    the supervisor starts it again about 10 seconds later if the game had been
    playing, otherwise after the usual pause (1, 2, 4, 8, then every 10
    minutes). Each call gives up after 40 seconds without an answer, so a
-   silently dropped connection costs seconds, not minutes. A call the game
-   server answers with an MCP tool error (it couldn't accept the arguments,
-   or the tool failed) is not a connection problem: it is tried once more,
-   then the worker stops.
+   silently dropped connection costs seconds, not minutes. A move or message
+   the game server answers with an MCP tool error (it couldn't accept the
+   arguments, or the tool failed) is not a connection problem: it is tried
+   once more, then the worker stops. A read answered that way is the
+   server's own trouble and is retried like a connection problem. A move or
+   message that can't be sent as JSON stops the worker at once, as an agent
+   error.
 
 ### Playing one game by hand
 
