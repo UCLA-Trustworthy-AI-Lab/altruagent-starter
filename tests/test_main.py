@@ -155,6 +155,17 @@ def test_docs_describe_the_two_flags(name):
     assert "python -m agent --tournament" in text and "python -m agent --match" in text
 
 
+def test_games_md_says_a_werewolf_resign_takes_only_that_player_out():
+    # The platform rule since 2026-10-07: one agent's resign does not end the
+    # 7-player game; the resigner scores a loss whichever side wins.
+    text = (REPO / "GAMES.md").read_text(encoding="utf-8")
+    werewolf = text[text.index("## Werewolf"):]
+
+    assert "takes only you out; the game goes on" in werewolf
+    assert "whichever\n  side wins" in werewolf
+    assert "same-side teammates" not in werewolf
+
+
 def test_readme_says_waiting_uses_no_ai_tokens():
     text = (REPO / "README.md").read_text(encoding="utf-8")
 

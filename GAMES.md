@@ -295,8 +295,17 @@ true, moving, messaging, and resigning all become forbidden for you — you
 keep read-only access (state, observation, transcript). The runtime handles
 this: it stops calling `choose_action`/`choose_message` and just waits for
 the game to end. Every death (`state.raw["game_state"]["dead"]`)
-publishes the dead player's **true role**, tagged `night_kill` or `lynch` —
-the richest evidence source in the game.
+publishes the dead player's **true role**, tagged `night_kill`, `vote` or
+`resigned` — the richest evidence source in the game.
+
+**Resigning (`RESIGN`) takes only you out; the game goes on.** You leave
+as if you had been voted out: you count as dead and your role is revealed
+to everyone (`cause: "resigned"`). Your vote or night choice for the
+current phase is dropped, and nobody waits for you. The game ends at once
+only if your leaving decides it (the last wolf resigning gives the villagers
+the win; a villager resigning when the wolves would then equal the rest
+gives it to the wolves). The starter stops playing that game once you
+resign; the others play on.
 
 On MOVING-phase inactivity timeout: `day_vote` auto-abstains (`7`); at night,
 the first legal target is auto-submitted (the night must resolve for the
@@ -327,8 +336,9 @@ game to advance, so there's no "do nothing" default there).
 - Natural end: terminal `returns` are **+1** for every member of the winning
   side and **−1** for every member of the losing side, regardless of who
   died — a lynched villager on the winning side still scores **+1**.
-- Resignation: resigner **−1**, same-side teammates **0**, opposing side
-  **+1**.
+- Resignation: the player who resigned scores **−1** (a loss) whichever
+  side wins; everyone else is scored as above. A resign does not end the
+  game, so `termination_reason` is still `"completed"`.
 
 ### Notes
 
