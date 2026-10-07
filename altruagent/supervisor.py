@@ -33,6 +33,7 @@ from .official import is_fatal_auth_error, is_registration_incomplete, new_execu
 from .runner import TRANSIENT_GIVE_UP_SECONDS
 from .worker import (
     EXIT_CONNECTION_LOST,
+    EXIT_KEY_REFUSED,
     EXIT_NOT_CONNECTED,
     EXIT_REGISTRATION_INCOMPLETE,
     EXIT_SEAT_BUSY,
@@ -243,6 +244,17 @@ DEFAULT_TOURNAMENT_POLL_SECONDS = 10.0
 # ended can drop off the list a moment before its worker notices.
 MISSING_POLLS_BEFORE_STOP = 2
 WAITING_MESSAGE = "Waiting for your next game..."
+# Said once when a game's worker finds the Official Agent Key refused (it was
+# rotated or revoked while this runtime was running). The runtime's own agent
+# session still works for up to about an hour, so it would otherwise keep
+# picking up games it can't play. From then on it starts no new game; the
+# games already running keep playing. A new key needs a restart: .env is read
+# once, at startup.
+KEY_REFUSED_MESSAGE = (
+    "Your Official Agent Key is no longer accepted, so no new game will start. Put your new key in .env "
+    "(ALTRUAGENT_OFFICIAL_AGENT_KEY) and restart this process; check too that your agent is still Self-hosted. "
+    "Games already running keep playing for now."
+)
 # After seat_busy, retry the seat once the backend's 30 s execution lease
 # could have lapsed (a previous run releasing it, or this runtime's own
 # re-authenticated session); a seat another live runtime keeps renewing
@@ -454,6 +466,9 @@ class TournamentState:
         # that have no worker now. If the match ends before a new worker
         # finishes it, the runtime says so, once per match.
         self.stopped: dict[str, "OfficialAssignment"] = {}
+        # True once a worker found the Official Agent Key refused
+        # (EXIT_KEY_REFUSED): no new worker is started after that.
+        self.key_refused = False
 
 
 def _auth_retry_delay(exc: AuthenticationError, failures: int) -> float:
@@ -517,7 +532,10 @@ def run_tournament_once(
        because of a temporary problem (``EXIT_NOT_CONNECTED``) is replaced
        after ``NOT_CONNECTED_RETRY_SECONDS`` while the connect window is open.
        One turned away by an incomplete registration is retried every
-       ``REGISTRATION_RETRY_SECONDS``. A worker that stopped with an error is
+       ``REGISTRATION_RETRY_SECONDS``. One that found the Official Agent Key
+       refused (``EXIT_KEY_REFUSED``) makes the runtime say
+       ``KEY_REFUSED_MESSAGE`` once and start no new worker from then on (the
+       running ones keep playing). A worker that stopped with an error is
        said to have stopped while the match continues, never that the match
        ended; ``WAITING_MESSAGE`` follows only exits after which nothing of
        that game is pending here. A match whose players this runtime plays
@@ -557,8 +575,8 @@ def run_tournament_once(
             said.add((match_of(seat_id), line))
             log(line)
 
-    def say_waiting() -> None:  # at most once per tick
-        if ("", WAITING_MESSAGE) not in said:
+    def say_waiting() -> None:  # at most once per tick; never after a refused key
+        if ("", WAITING_MESSAGE) not in said and not state.key_refused:
             said.add(("", WAITING_MESSAGE))
             log(WAITING_MESSAGE)
 
@@ -587,6 +605,11 @@ def run_tournament_once(
             say(seat_id, f"Another runtime is playing this match with your Official Agent Key; checking again in "
                          f"{SEAT_BUSY_RETRY_SECONDS:.0f}s.")
             idle = True
+        elif exitcode == EXIT_KEY_REFUSED:
+            # No retry can help until the contestant restarts with the new key.
+            if not state.key_refused:
+                state.key_refused = True
+                log(KEY_REFUSED_MESSAGE)
         elif exitcode == EXIT_REGISTRATION_INCOMPLETE:
             # The worker printed what to do; nothing is counted against the game.
             state.failed_until[seat_id] = current_time + REGISTRATION_RETRY_SECONDS
@@ -690,7 +713,7 @@ def run_tournament_once(
     # The seats to start now, grouped by match: one set of lines per match,
     # however many of its players this runtime plays (self-play).
     to_start: dict[str, list["OfficialAssignment"]] = {}
-    for assignment in assignments:
+    for assignment in [] if state.key_refused else assignments:
         seat_id = assignment.seat_id
         if not seat_id or state.registry.is_active(seat_id):
             continue
@@ -758,7 +781,9 @@ def run_tournament_forever(
     interrupted. Between polls it only sleeps: waiting costs no AI tokens.
     Never exits just because there are no assignments, nor on a temporary
     control-plane or sign-in problem, nor on an incomplete registration (it
-    says what to do and keeps trying). However it stops (Ctrl+C, the platform
+    says what to do and keeps trying). A game's worker finding the key refused
+    (rotated while running) stops new games only; the runtime itself stops
+    when its own sign-in is refused. However it stops (Ctrl+C, the platform
     refusing the key, or ``max_iterations`` in tests), every running worker
     is terminated in ``finally`` — no match is resigned.
     """

@@ -66,6 +66,11 @@ EXIT_REGISTRATION_INCOMPLETE = 5
 # outage or a dropped connection), so the runner gave up. Not the agent's
 # fault: the supervisor picks the game up again soon if it had been playing.
 EXIT_CONNECTION_LOST = 6
+# Tournament workers only: the platform refused the Official Agent Key itself
+# (``official.is_fatal_auth_error``: it was rotated or revoked, or the agent
+# is no longer Self-hosted). No retry can help until the contestant puts the
+# new key in .env and restarts, so the supervisor starts no new workers.
+EXIT_KEY_REFUSED = 7
 
 # Before the game is reached, a temporary failure to get the seat's grant is
 # retried inside the worker (no new process, no new agent): after about 3 s,
@@ -282,7 +287,8 @@ def run_tournament_worker(
     and then lost the connection for good (``run_game`` gave up on temporary
     failures) exits with ``EXIT_CONNECTION_LOST``; one refused because the
     event registration isn't complete exits with
-    ``EXIT_REGISTRATION_INCOMPLETE`` after printing what to do.
+    ``EXIT_REGISTRATION_INCOMPLETE`` after printing what to do; one whose
+    Official Agent Key the platform refused exits with ``EXIT_KEY_REFUSED``.
     """
     from .agent_loader import load_agent_factory
     from .models import DecisionContext
@@ -294,6 +300,7 @@ def run_tournament_worker(
         OfficialSeatAuth,
         SeatLeaseKeeper,
         SeatLeaseLost,
+        is_fatal_auth_error,
         is_registration_incomplete,
         registration_wait_message,
     )
@@ -384,6 +391,10 @@ def run_tournament_worker(
         if is_registration_incomplete(exc):
             print_line(f"{label} {registration_wait_message(exc)}")
             return EXIT_REGISTRATION_INCOMPLETE
+        if is_fatal_auth_error(exc):
+            # The key itself was refused (e.g. rotated while running).
+            print_line(f"{label} {exc}")
+            return EXIT_KEY_REFUSED
         if _is_transient(exc):
             if not getattr(game, "contacted", False):
                 print_line(f"{label} couldn't reach the game because of a temporary problem ({exc}); trying again shortly")

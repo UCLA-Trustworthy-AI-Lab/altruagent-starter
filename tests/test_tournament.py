@@ -22,6 +22,7 @@ from altruagent.models import OfficialAssignment, SeatGrant
 from altruagent.official import AUTHENTICATE_PATH, OfficialAgentClient, OfficialAgentError
 from altruagent.supervisor import (
     ALL_KINDS,
+    KEY_REFUSED_MESSAGE,
     MIN_CONNECT_WINDOW_SECONDS,
     MISSING_POLLS_BEFORE_STOP,
     NOT_CONNECTED_RETRY_SECONDS,
@@ -44,6 +45,7 @@ from altruagent.supervisor import (
 from altruagent.runner import TRANSIENT_GIVE_UP_SECONDS, DecisionError
 from altruagent.worker import (
     EXIT_CONNECTION_LOST,
+    EXIT_KEY_REFUSED,
     EXIT_MATCH_FAILURE,
     EXIT_NOT_CONNECTED,
     EXIT_REGISTRATION_INCOMPLETE,
@@ -1672,3 +1674,58 @@ def test_the_game_session_counts_as_reached_only_after_gameapi_answers(monkeypat
     assert game.contacted is False
     game.get_state()
     assert game.contacted is True
+
+
+# -- a key that stopped being accepted (rotated or revoked) while running --------------------
+
+KEY_REFUSED = OfficialAgentError(
+    "The Official Agent Key was not accepted. Check that your agent is set to Self-hosted ...",
+    status_code=401, error_code="invalid_official_agent_key", detail="Invalid official agent key",
+)
+
+
+def test_worker_refused_the_key_says_so_and_exits_with_its_own_code(capsys):
+    # Was: "unexpected error: OfficialAgentError(...)" and exit 2, retried with backoff.
+    code, runs, officials, clock = _clocked_worker(KEY_REFUSED)
+
+    assert code == EXIT_KEY_REFUSED and runs == [] and clock.sleeps == []
+    assert officials[0].grants == ["seat-1"]
+    out = capsys.readouterr().out
+    assert "The Official Agent Key was not accepted." in out and "unexpected error" not in out
+
+
+def test_worker_refused_the_key_during_play_exits_with_its_own_code():
+    def regrant_refused(game, context, contestant):
+        game.contacted = True
+        raise KEY_REFUSED
+
+    code, _, _, _ = _clocked_worker(_grant(), run_game_fn=regrant_refused)
+
+    assert code == EXIT_KEY_REFUSED
+
+
+def test_a_failed_session_mint_is_not_a_refused_key():
+    code, _, _, _ = _clocked_worker(MINT_FAILURE)
+
+    assert code == EXIT_NOT_CONNECTED
+
+
+def test_after_a_refused_key_no_new_game_is_started_and_it_is_said_once():
+    h = Harness([a("seat-1"), a("seat-2"), a("seat-3")])
+    h.tick()
+    h.factory.processes[0].finish(EXIT_KEY_REFUSED)
+    h.factory.processes[1].finish(EXIT_KEY_REFUSED)
+
+    h.tick()
+    h.official.listings = [[a("seat-1"), a("seat-2"), a("seat-3"), a("seat-4")]]
+    for _ in range(10):
+        h.tick(advance=120.0)  # well past every retry pause
+
+    assert h.started() == ["seat-1", "seat-2", "seat-3"]  # seat-4 and the retries never start
+    assert h.log.count(KEY_REFUSED_MESSAGE) == 1
+    assert "put your new key in .env" in KEY_REFUSED_MESSAGE.lower() and "restart" in KEY_REFUSED_MESSAGE
+    assert not h.factory.processes[2].terminated  # a game already running keeps playing
+    h.factory.processes[2].finish(EXIT_SUCCESS)
+    h.tick()
+    assert h.log[-1] == "Match finished."  # not "Waiting for your next game...": none will start
+    assert WAITING_MESSAGE not in h.log

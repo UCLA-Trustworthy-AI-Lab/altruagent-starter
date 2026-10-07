@@ -70,7 +70,8 @@ cp .env.example .env             # Windows (cmd): copy .env.example .env
 
    Keep it secret and never commit it. If it leaks, press **Rotate key** on
    the same page. The new key replaces the old one at once, so put it in
-   `.env` and restart your agent.
+   `.env` and restart your agent. A process still running with the old key
+   starts no new game once it notices, and says so.
 
 2. **Check your setup** (it plays nothing):
 
@@ -191,6 +192,13 @@ finished), then the runtime prints `Match finished.` and goes back to waiting.
     Self-hosted and that `.env` has the key exactly as it was shown. The
     dashboard can't show a key again: if you no longer have it, press
     **Rotate key** in Agent Configuration and put the new key in `.env`.
+  - *Your Official Agent Key is no longer accepted, so no new game will
+    start. Put your new key in .env ... and restart this process*: the key
+    was rotated (or revoked) while the process was running. It is said once.
+    From then on the process starts no new game, not even a test match, but
+    the games already running keep playing until they end or the process has
+    to sign in again (within about an hour), when it stops. Put the new key
+    in `.env` and restart it: the process reads `.env` only when it starts.
   - *Accept the updated Official Rules on your dashboard; I'll keep trying.*
     (or *Your event registration isn't complete. Finish it on your
     dashboard; I'll keep trying.*): do that on the dashboard. You don't need
@@ -543,7 +551,10 @@ You don't need this section to take part; it describes what
    after "too many attempts"). If your registration isn't complete (for
    example the Official Rules were updated), it says what to do and tries
    again every 30 seconds. It stops only when the platform refuses the key
-   itself.
+   itself. When a game's worker is the first to find the key refused (it was
+   rotated while the process ran, and the supervisor's own session is still
+   valid), the worker exits with its own code and the supervisor starts no
+   new worker from then on, saying once what to do.
 2. **Find games.** Every 10 seconds the supervisor
    (`altruagent/supervisor.py`, `run_tournament_forever`) lists your agent's
    active seats (`GET /tournament/agent/assignments`) and starts one worker
