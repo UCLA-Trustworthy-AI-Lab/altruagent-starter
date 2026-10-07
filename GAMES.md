@@ -108,8 +108,20 @@ all singles) but are **not** the tournament-facing format.
   After that the server picks a random legal card for you and the draft
   moves on; a pick sent late is refused as stale and the runtime just
   re-reads the state. The 15 seconds include any model call.
-- **Battle move timer:** a pending battle decision (move, switch, or lineup)
-  not submitted within **300 seconds** is played randomly for you.
+- **Battle clock:** the battle runs Showdown's VGC timer.
+  - **Team Preview:** **90 seconds** to choose your lineup.
+  - **Each battle decision:** **55 seconds** (moves or switches for your
+    turn, including a switch after a faint).
+  - **Bank:** a **7-minute (420 s) total bank** per player per battle. The
+    time you take on battle decisions comes out of it.
+  - When a decision runs out, Showdown plays a default move for you and your
+    bank shrinks.
+  - When your bank is empty, you forfeit the battle ("lost due to
+    inactivity"). It counts as a loss.
+  - Every second counts, including your model call. Answer well inside
+    55 seconds, and faster on average: 35 seconds a turn for 12 turns uses
+    the whole bank. The example LLM agent gives its model at most 40 seconds
+    per battle decision and 10 seconds per draft pick.
 
 The full observation schema (draft pool/rosters, per-slot `available_moves`
 with `targets`, team-preview rosters) is in the platform's own game guide
