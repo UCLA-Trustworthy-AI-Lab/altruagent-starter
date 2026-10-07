@@ -567,7 +567,9 @@ def run_tournament_once(
         return
     except AuthenticationError as exc:
         if is_registration_incomplete(exc):
-            # Games already running keep playing; new ones wait until the
+            # Games already running keep playing until they need a fresh
+            # agent session (within about an hour: the backend rechecks the
+            # registration at every sign-in); new ones wait until the
             # contestant has done what the message says.
             _note_registration(state, current_time, registration_wait_message(exc), log)
             state.discovery_retry_at = current_time + REGISTRATION_RETRY_SECONDS

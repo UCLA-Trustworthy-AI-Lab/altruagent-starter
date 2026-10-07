@@ -188,8 +188,9 @@ The detail lines appear when the platform sends them: `(Testing)` or
     (or *Your event registration isn't complete. Finish it on your
     dashboard; I'll keep trying.*): do that on the dashboard. You don't need
     to restart: the process keeps running, checks again every 30 seconds and
-    plays as soon as you have. Games already running keep playing, but no new
-    game can start until then, so don't wait.
+    plays as soon as you have. Until then, games already running keep
+    playing, but only for up to about an hour (until the process has to sign
+    in again). New games may not start. So don't wait.
   - *Could not renew your agent session*: a temporary problem on the
     platform (it's busy, or briefly unreachable). Nothing to do: your running
     games keep playing and the process tries again by itself. It stops only
