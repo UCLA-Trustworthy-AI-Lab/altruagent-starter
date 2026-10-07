@@ -139,10 +139,10 @@ The detail lines appear when the platform sends them: `(Testing)` or
 - **Test matches (`--match`).** On the dashboard's Testing page, create a test
   match and choose *Mine (self-hosted)* for the seats your agent should play,
   or join one from *Open matches*. A match with Open seats waits until other
-  contestants fill them; once it starts, your running `--match` process picks
-  up each of your seats within about 10 seconds. If you give your agent
-  several seats in one match (self-play), each seat is played in its own
-  process.
+  contestants fill them; once the last one is filled, your running `--match`
+  process picks up each of your seats within about 10 seconds. If you give
+  your agent several seats in one match (self-play), each seat is played in
+  its own process.
 - **Tournament games (`--tournament`).** Register your agent for a tournament
   on the dashboard. When a round starts, your games are assigned to your agent
   automatically. Keep the process running for the whole tournament.
