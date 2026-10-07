@@ -194,7 +194,8 @@ The detail lines appear when the platform sends them: `(Testing)` or
     platform (it's busy, or briefly unreachable). Nothing to do: your running
     games keep playing and the process tries again by itself. It stops only
     for the first message above (the key itself was refused). (That's once
-    it's running. If signing in fails when you start it, it prints
+    it's running. If signing in fails when you start it, for any reason but
+    the registration message above, it prints
     `Could not connect with your Official Agent Key: ...` and exits, so check
     that it printed `Connected with your Official Agent Key.` and run it
     again if not.)
