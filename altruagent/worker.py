@@ -33,7 +33,7 @@ from .client import AltruAgentClient
 from .errors import AuthenticationError, PlatformError, is_transient_error
 from .mcp_game import MCPGameSession
 from .models import Match
-from .runner import DecisionError, UnsupportedGameFlowError
+from .runner import DecisionError, UnsupportedGameFlowError, _is_transient
 from .runner import run_match as _default_run_match
 
 if TYPE_CHECKING:
@@ -60,6 +60,11 @@ EXIT_NOT_CONNECTED = 4
 # complete (for example the Official Rules were updated and must be accepted
 # again). The worker has printed what to do; the supervisor keeps trying.
 EXIT_REGISTRATION_INCOMPLETE = 5
+# Tournament workers only: the worker reached its game, then every call failed
+# for a temporary reason for runner.TRANSIENT_GIVE_UP_SECONDS (a lasting
+# outage or a dropped connection), so the runner gave up. Not the agent's
+# fault: the supervisor picks the game up again soon if it had been playing.
+EXIT_CONNECTION_LOST = 6
 
 # Before the game is reached, a temporary failure to get the seat's grant is
 # retried inside the worker (no new process, no new agent): after about 3 s,
@@ -216,8 +221,10 @@ def run_tournament_worker(
     A temporary failure to get the first grant is retried here for up to
     ``FIRST_GRANT_RETRY_SECONDS`` (``run_game`` retries temporary failures
     during play itself). A worker that never reached its game because of a
-    temporary problem exits with ``EXIT_NOT_CONNECTED``; one refused because
-    the event registration isn't complete exits with
+    temporary problem exits with ``EXIT_NOT_CONNECTED``; one that reached it
+    and then lost the connection for good (``run_game`` gave up on temporary
+    failures) exits with ``EXIT_CONNECTION_LOST``; one refused because the
+    event registration isn't complete exits with
     ``EXIT_REGISTRATION_INCOMPLETE`` after printing what to do.
     """
     from .agent_loader import load_agent_factory
@@ -324,9 +331,12 @@ def run_tournament_worker(
         if is_registration_incomplete(exc):
             print(f"{label} {registration_wait_message(exc)}")
             return EXIT_REGISTRATION_INCOMPLETE
-        if not getattr(game, "contacted", False) and is_transient_error(exc):
-            print(f"{label} couldn't reach the game because of a temporary problem ({exc}); trying again shortly")
-            return EXIT_NOT_CONNECTED
+        if _is_transient(exc):
+            if not getattr(game, "contacted", False):
+                print(f"{label} couldn't reach the game because of a temporary problem ({exc}); trying again shortly")
+                return EXIT_NOT_CONNECTED
+            print(f"{label} lost the connection to the game ({exc}); reconnecting shortly")
+            return EXIT_CONNECTION_LOST
         if isinstance(exc, _MATCH_SCOPED_ERRORS):
             print(f"{label} match failed: {exc}")
             return EXIT_MATCH_FAILURE

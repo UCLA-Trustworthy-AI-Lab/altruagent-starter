@@ -29,7 +29,9 @@ from typing import TYPE_CHECKING, Callable, Collection
 
 from .errors import AuthenticationError, PlatformError
 from .official import is_fatal_auth_error, is_registration_incomplete, new_execution_id, registration_wait_message
+from .runner import TRANSIENT_GIVE_UP_SECONDS
 from .worker import (
+    EXIT_CONNECTION_LOST,
     EXIT_NOT_CONNECTED,
     EXIT_REGISTRATION_INCOMPLETE,
     EXIT_SEAT_BUSY,
@@ -245,14 +247,21 @@ WAITING_MESSAGE = "Waiting for your next game..."
 # re-authenticated session); a seat another live runtime keeps renewing
 # just stays busy.
 SEAT_BUSY_RETRY_SECONDS = 35.0
-# A seat whose worker keeps failing fast (a game the server lost answers
-# SESSION_NOT_FOUND until the platform closes it, which takes a few minutes)
-# is retried less and less often: the cooldown doubles with each failure in a
-# row, up to this. A finished match or a seat_busy resets it.
+# A seat whose worker keeps failing (a game the server lost answers
+# SESSION_NOT_FOUND until the platform closes it, which takes a few minutes;
+# an agent that crashes on the same state again) is retried less and less
+# often: the cooldown doubles with each failure in a row, up to this. A
+# finished match or a seat_busy resets it, and a worker that ran at least this
+# long before failing starts a new count.
 SEAT_FAILURE_BACKOFF_MAX_SECONDS = 600.0
-# A worker that ran at least this long was playing, not failing fast: its
-# failure (after the in-game retries gave up) starts a new count, and the game
-# is picked up again after RESTART_AFTER_PLAY_SECONDS, not a minute or more.
+# A worker that lost the connection to its game (EXIT_CONNECTION_LOST: the
+# in-game retries gave up after runner.TRANSIENT_GIVE_UP_SECONDS) after
+# playing for at least WORKER_PLAYED_SECONDS is picked up again after
+# RESTART_AFTER_PLAY_SECONDS, not a minute or more, and starts a new count.
+# The reason decides it, not only the time: an agent that crashes, or a
+# worker that never reached its game, keeps the doubling cooldown however
+# long it ran. A worker that lost the connection almost at once also does,
+# so a game that keeps failing can't cost a new seat grant every ~100 s.
 WORKER_PLAYED_SECONDS = 30.0
 RESTART_AFTER_PLAY_SECONDS = 10.0
 # A worker that never reached its game because of a temporary problem
@@ -473,9 +482,11 @@ def run_tournament_once(
 
     1. Reap finished workers (a failure puts that seat in cooldown; it is
        retried later, which re-requests its grant — the reconnect path).
-       Each fast failure in a row doubles that seat's cooldown, up to
-       ``SEAT_FAILURE_BACKOFF_MAX_SECONDS``; a worker that had been playing
-       for ``WORKER_PLAYED_SECONDS`` starts a new count and is replaced after
+       Each failure in a row doubles that seat's cooldown, up to
+       ``SEAT_FAILURE_BACKOFF_MAX_SECONDS`` (a worker that ran that long
+       first starts a new count). A worker that lost the connection to its
+       game (``EXIT_CONNECTION_LOST``) after playing for
+       ``WORKER_PLAYED_SECONDS`` starts a new count and is replaced after
        ``RESTART_AFTER_PLAY_SECONDS``. A worker that never reached its game
        because of a temporary problem (``EXIT_NOT_CONNECTED``) is replaced
        after ``NOT_CONNECTED_RETRY_SECONDS`` while the connect window is open.
@@ -527,15 +538,21 @@ def run_tournament_once(
             state.failed_until[seat_id] = current_time + NOT_CONNECTED_RETRY_SECONDS
             log("Couldn't reach that game yet (a temporary problem); trying again now.")
         else:
-            if ran >= WORKER_PLAYED_SECONDS:
+            if exitcode == EXIT_CONNECTION_LOST and ran >= TRANSIENT_GIVE_UP_SECONDS + WORKER_PLAYED_SECONDS:
                 failures = 1  # it was playing: a new failure, not one more in a row
                 wait = RESTART_AFTER_PLAY_SECONDS
             else:
-                failures = state.seat_failures.get(seat_id, 0) + 1
+                # An agent error, a failure before the game was reached (the
+                # connect window has closed), or a connection lost almost at
+                # once: one more in a row, unless the worker ran a long while.
+                long_run = exitcode != EXIT_NOT_CONNECTED and ran >= SEAT_FAILURE_BACKOFF_MAX_SECONDS
+                failures = 1 if long_run else state.seat_failures.get(seat_id, 0) + 1
                 wait = min(max(SEAT_FAILURE_BACKOFF_MAX_SECONDS, cooldown_seconds), cooldown_seconds * 2 ** (failures - 1))
             state.seat_failures[seat_id] = failures
             state.failed_until[seat_id] = current_time + wait
-            log(f"Match ended with an error (exit code {exitcode}); retrying that game in {wait:.0f}s if it is still assigned.")
+            why = ("Lost the connection to that game for a while" if exitcode == EXIT_CONNECTION_LOST
+                   else f"Match ended with an error (exit code {exitcode})")
+            log(f"{why}; retrying that game in {wait:.0f}s if it is still assigned.")
         if len(state.registry) == 0:
             log(WAITING_MESSAGE)
 

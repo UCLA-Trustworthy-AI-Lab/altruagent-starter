@@ -41,7 +41,9 @@ from altruagent.supervisor import (
     run_tournament_once,
     tournament_waiting_warning,
 )
+from altruagent.runner import TRANSIENT_GIVE_UP_SECONDS
 from altruagent.worker import (
+    EXIT_CONNECTION_LOST,
     EXIT_MATCH_FAILURE,
     EXIT_NOT_CONNECTED,
     EXIT_REGISTRATION_INCOMPLETE,
@@ -990,10 +992,36 @@ def test_worker_temporary_failure_before_reaching_the_game_is_not_connected():
     assert code == EXIT_NOT_CONNECTED and officials[0].closed
 
 
-def test_worker_temporary_failure_after_reaching_the_game_is_a_match_failure():
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(MCPToolError("MCP tool 'wait_for_update' failed: ReadTimeout('')", status_code=None,
+                                  error_code=None), id="no-answer"),
+        pytest.param(MCPToolError("waiting already", status_code=None, error_code="TOO_MANY_WAITS"),
+                     id="too-many-waits"),
+    ],
+)
+def test_worker_that_lost_the_connection_after_reaching_the_game_exits_connection_lost(error, capsys):
+    # run_game gave up after 90 s of temporary failures. The supervisor needs
+    # to know why (a lost connection, not an agent error) to restart it soon.
     def failing(game, context, contestant):
         game.contacted = True  # GameAPI answered at least once
-        raise MCPToolError("MCP tool 'wait_for_update' failed: ReadTimeout('')", status_code=None, error_code=None)
+        raise error
+
+    code, _, _ = _worker(run_game_fn=failing)
+
+    assert code == EXIT_CONNECTION_LOST
+    assert "lost the connection to the game" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("contacted", [False, True])
+def test_worker_whose_call_the_server_cant_handle_is_a_match_failure(contacted):
+    # An isError answer (arguments the server rejected, or its tool crashed)
+    # isn't a connection problem, before or after reaching the game.
+    def failing(game, context, contestant):
+        game.contacted = contacted
+        raise MCPToolError("MCP tool 'play_action' failed at the protocol level: 1 validation error",
+                           status_code=None, error_code=None, protocol_error=True)
 
     code, _, _ = _worker(run_game_fn=failing)
 
@@ -1089,7 +1117,7 @@ def test_a_game_that_was_playing_is_picked_up_again_within_seconds_and_its_count
     h.tick()
     for _ in range(5):
         h.clock["t"] += 300.0  # plays for five minutes, then the worker gives up on a long outage
-        h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+        h.factory.processes[-1].finish(EXIT_CONNECTION_LOST)
         h.tick(advance=0.0)
         absences.append(h.state.failed_until["seat-1"] - h.clock["t"])
         h.clock["t"] = h.state.failed_until["seat-1"]
@@ -1098,14 +1126,14 @@ def test_a_game_that_was_playing_is_picked_up_again_within_seconds_and_its_count
     assert absences == [RESTART_AFTER_PLAY_SECONDS] * 5
     assert h.state.seat_failures == {"seat-1": 1}
     assert len(h.factory.processes) == 6
-    assert "retrying that game in 10s" in "\n".join(h.log)
+    assert "Lost the connection to that game for a while; retrying that game in 10s" in "\n".join(h.log)
 
 
 def test_a_fast_failure_right_after_a_long_run_continues_the_doubling_from_one():
     h = Harness([a("seat-1")])
     h.tick()
-    h.clock["t"] += WORKER_PLAYED_SECONDS
-    h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+    h.clock["t"] += TRANSIENT_GIVE_UP_SECONDS + WORKER_PLAYED_SECONDS
+    h.factory.processes[-1].finish(EXIT_CONNECTION_LOST)
     h.tick(advance=0.0)
     h.clock["t"] = h.state.failed_until["seat-1"]
     h.tick(advance=0.0)  # restarted; this one fails at once
@@ -1114,6 +1142,81 @@ def test_a_fast_failure_right_after_a_long_run_continues_the_doubling_from_one()
 
     assert h.state.seat_failures == {"seat-1": 2}
     assert h.state.failed_until["seat-1"] - h.clock["t"] == 120.0
+
+
+def _run_workers(h, seconds, run_for, exitcode, poll=10.0):
+    """Poll every ``poll`` seconds for ``seconds``; each worker started runs
+    ``run_for`` seconds, then exits with ``exitcode``. Returns the clock times
+    at which workers started."""
+    starts, running = [], None
+    while h.clock["t"] < seconds:
+        before = len(h.factory.processes)
+        h.tick(advance=poll)
+        if len(h.factory.processes) > before:
+            starts.append(h.clock["t"])
+            running = (h.factory.processes[-1], h.clock["t"])
+        if running and h.clock["t"] - running[1] >= run_for:
+            running[0].finish(exitcode)
+            running = None
+    return starts
+
+
+@pytest.mark.parametrize("run_for", [30.0, 60.0, 100.0])
+@pytest.mark.parametrize("exitcode", [EXIT_MATCH_FAILURE, EXIT_UNEXPECTED])
+def test_an_agent_that_keeps_crashing_during_the_game_is_retried_less_and_less_often(exitcode, run_for):
+    # Was: any worker that ran 30 s or more was restarted after 10 s, whatever
+    # the reason, so an agent that crashed 30 s into each restart was started
+    # (each start one new seat grant) about 72 times an hour.
+    h = Harness([a("seat-1")])
+
+    starts = _run_workers(h, 3600.0, run_for, exitcode)
+
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert gaps[:4] == [run_for + wait + 10.0 for wait in (60.0, 120.0, 240.0, 480.0)]
+    assert len(starts) <= 9
+
+
+def test_a_connection_lost_almost_at_once_is_retried_less_and_less_often():
+    # The worker reached the game, then every call failed until the in-game
+    # retries gave up (about 100 s). Restarting it every 10 s would cost a
+    # new seat grant every ~110 s for as long as the game is broken.
+    h = Harness([a("seat-1")])
+
+    starts = _run_workers(h, 3600.0, TRANSIENT_GIVE_UP_SECONDS + 10.0, EXIT_CONNECTION_LOST)
+
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert gaps[:3] == [100.0 + wait + 10.0 for wait in (60.0, 120.0, 240.0)]
+    assert len(starts) <= 9
+
+
+def test_after_the_connect_window_a_worker_that_never_gets_in_is_retried_less_and_less_often():
+    # A real EXIT_NOT_CONNECTED worker has already retried its grant for a
+    # minute or more. Was: after the window closed it still counted as
+    # "playing" (it ran 30 s or more), so it was replaced every 80-90 s forever.
+    h = Harness([tournament_game()])  # window: MIN_CONNECT_WINDOW_SECONDS from the first listing
+
+    starts = _run_workers(h, 3600.0, 70.0, EXIT_NOT_CONNECTED)
+
+    window_end = starts[0] + MIN_CONNECT_WINDOW_SECONDS
+    in_window = [t for t in starts if t < window_end]
+    gaps = [later - earlier for earlier, later in zip(in_window, in_window[1:])]
+    assert gaps and set(gaps) == {80.0}  # replaced in the poll that notices the exit
+    late = [t for t in starts if t >= window_end]
+    late_gaps = [later - earlier for earlier, later in zip(late, late[1:])]
+    assert late_gaps[:3] == [70.0 + wait + 10.0 for wait in (120.0, 240.0, 480.0)]
+    assert len(starts) <= 12
+
+
+def test_an_agent_error_after_a_long_healthy_run_starts_a_new_count():
+    h = Harness([a("seat-1")])
+    h.state.seat_failures["seat-1"] = 3  # earlier trouble in this game
+    h.tick()
+    h.clock["t"] += SEAT_FAILURE_BACKOFF_MAX_SECONDS  # then ten minutes of play
+    h.factory.processes[-1].finish(EXIT_MATCH_FAILURE)
+    h.tick(advance=0.0)
+
+    assert h.state.seat_failures == {"seat-1": 1}
+    assert h.state.failed_until["seat-1"] - h.clock["t"] == 60.0
 
 
 def test_a_worker_turned_away_by_its_registration_is_retried_every_30s_without_counting():
