@@ -8,16 +8,20 @@ exactly once, after a 401 — so the retry policy stays in one place, and
 gameplay code (``MCPGameSession``, ``run_game``) never knows which strategy
 is in use.
 
-- ``ApiKeyAuth`` — the default, and the exact pre-existing behavior: a
-  registered agent's long-lived ``sk_agent_...`` key, exchanged for a JWT via
-  ``POST /auth/agent/login``.
-- ``SeatGrantAuth`` — one self-hosted Testing seat, claimed with a one-time
-  ``seatclaim_...`` token via
-  ``POST /tournament/agent/test-matches/seats/claim`` (Agent_ACP
-  backend/src/routes/tournament.ts). The first ``login()`` binds the seat to
-  a random per-process ``claim_key``; every later ``login()`` repeats the
-  same request with the same token + key, which the platform treats as a
-  renewal of that same seat's (short-lived) GameAPI authorization.
+- ``ApiKeyAuth`` — RETIRED: a platform agent's long-lived ``sk_agent_...``
+  key, exchanged for a JWT via ``POST /auth/agent/login``. The platform turned
+  platform agents off and answers HTTP 410 ``platform_agents_retired``; this
+  strategy then raises ``AuthenticationError`` with a notice pointing to the
+  Official Agent Key.
+- ``SeatGrantAuth`` — RETIRED: one self-hosted Testing seat, claimed with a
+  one-time ``seatclaim_...`` token via
+  ``POST /tournament/agent/test-matches/seats/claim``. Testing now uses the
+  Official Agent Key too, and the platform answers HTTP 410
+  ``claim_codes_retired``, which this strategy reports with the same kind of
+  notice.
+
+Agents connect with ``altruagent.official`` (``OfficialAgentClient``,
+``OfficialSeatAuth``), run by ``python -m agent --tournament``/``--match``.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import httpx
 from ._responses import _parse_error_body, _parse_json_body
 from .errors import AuthenticationError, PlatformError
 from .models import SeatGrant
+from .notices import CLAIM_CODES_RETIRED_NOTICE, PLATFORM_KEY_RETIRED_NOTICE
 
 SEAT_CLAIM_PATH = "/tournament/agent/test-matches/seats/claim"
 SEAT_CLAIM_TOKEN_PREFIX = "seatclaim_"
@@ -44,10 +49,12 @@ class AuthStrategy(Protocol):
 
 
 class ApiKeyAuth:
-    """A registered agent's API key -> ``POST /auth/agent/login`` -> JWT.
+    """RETIRED. A platform agent's API key -> ``POST /auth/agent/login`` -> JWT.
 
     The platform issues no refresh token, so "renewing" is just logging in
-    again with the same key.
+    again with the same key. The platform now answers 410
+    ``platform_agents_retired``, reported as ``AuthenticationError`` with
+    ``altruagent.notices.PLATFORM_KEY_RETIRED_NOTICE``.
     """
 
     def __init__(self, api_key: str) -> None:
@@ -68,6 +75,8 @@ class ApiKeyAuth:
         if response.status_code != 200:
             parsed = _parse_error_body(response)
             message = parsed["detail"] or parsed["error"] or "Login failed."
+            if response.status_code == 410 or parsed["error"] == "platform_agents_retired":
+                message = PLATFORM_KEY_RETIRED_NOTICE
             raise AuthenticationError(
                 message,
                 status_code=response.status_code,
@@ -126,6 +135,7 @@ _CLAIM_ERROR_MESSAGES = {
         "This test match is still waiting for its open seats to be filled. "
         "Keep this process running; it claims the seat as soon as the match fills."
     ),
+    "claim_codes_retired": CLAIM_CODES_RETIRED_NOTICE,
 }
 
 
@@ -142,7 +152,9 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 class SeatGrantAuth:
-    """Authorization for exactly one self-hosted Testing seat.
+    """RETIRED (the platform answers 410 ``claim_codes_retired``; Testing now
+    uses the Official Agent Key). Authorization for exactly one self-hosted
+    Testing seat.
 
     Holds the one-time ``claim_token``, a ``claim_key`` generated here (256
     bits from ``secrets``, never shown, never written anywhere) that stays

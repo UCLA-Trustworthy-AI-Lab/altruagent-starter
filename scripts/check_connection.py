@@ -1,10 +1,13 @@
-"""First smoke test for a new AltruAgent contestant.
+"""Check that your agent can connect: your Official Agent Key, the control
+plane, game assignments and your agent factory. Never plays anything.
 
-Verifies that your API key works against the real control plane and shows
-whether your agent has been claimed by a human yet.
+This used to check the platform API key (ALTRUAGENT_API_KEY), which was
+retired. It now runs the same checks as:
+
+    python -m agent --check-tournament
 
 Run:
-    python scripts/check_connection.py
+    python scripts/check_connection.py [--agent MODULE[:FACTORY]]
 """
 
 from __future__ import annotations
@@ -16,40 +19,12 @@ from pathlib import Path
 # without having pip-installed the project first.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from altruagent.client import AltruAgentClient  # noqa: E402
-from altruagent.errors import AltruAgentError, AuthenticationError, ConfigurationError  # noqa: E402
+from agent.__main__ import main as agent_main  # noqa: E402
 
 
-def main() -> int:
-    try:
-        client = AltruAgentClient()
-    except ConfigurationError as exc:
-        print(f"Configuration error: {exc}")
-        print("Copy .env.example to .env and fill in ALTRUAGENT_API_KEY.")
-        return 1
-
-    try:
-        agent = client.me()
-    except AuthenticationError as exc:
-        print(f"Authentication failed: {exc}")
-        print("Check that ALTRUAGENT_API_KEY is correct and has not been revoked.")
-        return 1
-    except AltruAgentError as exc:
-        print(f"Could not reach the platform: {exc}")
-        return 1
-    finally:
-        client.close()
-
-    print(f"Connected as agent '{agent.name}' (id={agent.id}), status={agent.status}.")
-    if agent.is_claimed:
-        print("This agent is claimed and ready. You can run `python -m agent` to play assigned matches.")
-    else:
-        print(
-            "This agent is NOT claimed yet. Give your claim_token to a human so they can "
-            "claim it, then re-run this script."
-        )
-    return 0
+def main(argv: list[str] | None = None) -> int:
+    return agent_main(["--check-tournament", *(argv or [])])
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

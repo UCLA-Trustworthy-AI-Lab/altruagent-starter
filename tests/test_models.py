@@ -12,6 +12,7 @@ from altruagent.models import (
     Match,
     Message,
     NextAction,
+    OfficialAssignment,
     Tournament,
     TournamentViewer,
 )
@@ -586,3 +587,61 @@ def test_tournament_viewer_from_dict_defaults():
 def test_message_from_dict_prefers_platform_seq_over_legacy_index():
     assert Message.from_dict({"seq": 14, "index": 2}).index == 14
     assert Message.from_dict({"index": 2}).index == 2
+
+
+# -- OfficialAssignment ------------------------------------------------------------
+
+
+def test_official_assignment_parses_the_base_fields_only_from_an_older_backend():
+    assignment = OfficialAssignment.from_dict({
+        "match_id": "m-1", "seat_id": "s-1", "game_type": "werewolf", "seat_position": 2,
+        "seat_count": 7, "match_status": "starting", "seat_status": "pending",
+    })
+
+    assert (assignment.match_id, assignment.seat_id, assignment.game_type) == ("m-1", "s-1", "werewolf")
+    assert (assignment.context, assignment.tournament_id, assignment.tournament_name) == (None, None, None)
+    assert (assignment.round_label, assignment.opponents, assignment.connect_deadline_at) == (None, (), None)
+
+
+def test_official_assignment_parses_the_tournament_fields():
+    assignment = OfficialAssignment.from_dict({
+        "match_id": "m-1", "seat_id": "s-1", "context": "tournament", "tournament_id": "t-1",
+        "tournament_name": "Fall Cup", "round_label": "Final", "opponents": [{"name": "Alpha"}],
+        "connect_deadline_at": "2026-10-16T15:04:00Z",
+    })
+
+    assert assignment.context == "tournament"
+    assert (assignment.tournament_id, assignment.tournament_name, assignment.round_label) == ("t-1", "Fall Cup", "Final")
+    assert assignment.opponents == ("Alpha",)
+    assert assignment.connect_deadline_at == "2026-10-16T15:04:00Z"
+
+
+@pytest.mark.parametrize(
+    "opponents, expected",
+    [
+        ([{"name": "A"}, "B", {"name": ""}, {"name": None}, {}, 7, None, {"name": "C", "id": "x"}], ("A", "B", "C")),
+        ({"name": "A"}, ()),
+        ("Alpha", ()),
+        (None, ()),
+    ],
+)
+def test_official_assignment_tolerates_odd_opponent_lists(opponents, expected):
+    assignment = OfficialAssignment.from_dict({"match_id": "m", "seat_id": "s", "opponents": opponents})
+
+    assert assignment.opponents == expected
+
+
+def test_official_assignment_ignores_non_text_optional_fields():
+    assignment = OfficialAssignment.from_dict({
+        "match_id": "m", "seat_id": "s", "context": 3, "tournament_id": None, "tournament_name": "  ",
+        "round_label": ["x"], "connect_deadline_at": 1760000000,
+    })
+
+    assert (assignment.context, assignment.tournament_id, assignment.tournament_name) == (None, None, None)
+    assert (assignment.round_label, assignment.connect_deadline_at) == (None, None)
+
+
+def test_official_assignment_is_hashable_with_opponents():
+    assignment = OfficialAssignment.from_dict({"match_id": "m", "seat_id": "s", "opponents": [{"name": "A"}]})
+
+    assert hash(assignment) == hash(OfficialAssignment.from_dict({"match_id": "m", "seat_id": "s", "opponents": ["A"]}))

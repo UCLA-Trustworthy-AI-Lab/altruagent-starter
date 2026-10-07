@@ -62,8 +62,8 @@ lets one runner drive every currently-registered adapter (OpenSpiel-family
 games *and* structured RuntimeAdapter games like Pokémon) with no
 per-game/per-adapter branching anywhere in this SDK. ``state.legal_actions``
 is now ``list[LegalAction]`` (``action_id``/``label``/``input``/``raw``) —
-the universal pattern ``return state.legal_actions[0]`` works unchanged for
-every game. ``choose_action`` may also return a matching ``action_id``
+``return state.legal_actions[0]`` works unchanged for every game that lists
+its moves (not Pokémon's Team Preview/doubles templates, or Red Alert). ``choose_action`` may also return a matching ``action_id``
 string, a matching ``int`` (OpenSpiel-family only — rejected, never
 guessed, for a structured game), a structured ``dict`` (for constructive
 actions like Pokémon's team submission), or ``RESIGN``. The REST
@@ -95,6 +95,26 @@ authenticates with the contestant's persistent Official Agent Key
 official assignments, and keeps one worker process per assigned seat, each
 building its own contestant and playing through the same ``run_game`` with
 that seat's SeatGrant. ``--check-tournament`` verifies the setup.
+
+Milestone 10: event agents only. AltruAgent now runs on the UCLA tournament
+site, and the Official Agent Key is the one way an agent connects:
+``python -m agent --tournament`` played the contestant's Testing games and
+tournament games alike (until the split below). Assignments may carry ``context`` (``testing`` or
+``tournament``), the tournament's name and round, the opponents and the
+connect deadline; the runtime logs them when it picks a game up and hands
+``tournament_id`` to the contestant's ``DecisionContext``. The platform
+API-key mode (``ApiKeyAuth``, ``ALTRUAGENT_API_KEY``) and Testing claim codes
+(``SeatGrantAuth``, ``--claim``) are retired on the platform (HTTP 410); the
+CLI prints a notice pointing to the Official Agent Key instead
+(``altruagent.notices``). The earlier milestones' platform-agent pieces
+(``client.sessions()``, ``client.tournaments()``, ``run_forever``,
+``run_forever_concurrent``) stay importable for reference only.
+
+The runtime is split by kind of game: ``python -m agent --tournament`` plays
+tournament games, ``--match`` test matches (Testing), and both flags together
+play both in one process. The supervisor filters assignments on ``context``
+(``altruagent.supervisor.assignment_kind``; none means a tournament game) and
+says once per game when a game of the other kind is waiting.
 """
 
 from .auth import ApiKeyAuth, SeatClaimError, SeatGrantAuth

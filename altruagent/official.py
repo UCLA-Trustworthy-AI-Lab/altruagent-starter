@@ -1,12 +1,11 @@
-"""Official tournament identity: a self-hosted event_agent's persistent
-Official Agent Key (``eak_live_...``, from the tournament dashboard).
+"""Your agent's identity: a self-hosted event agent's persistent Official
+Agent Key (``eak_live_...``, from the tournament dashboard). It is the only
+way an agent connects now: the same key plays the contestant's tournament
+games (``python -m agent --tournament``) and test matches (``--match``).
 
-Deliberately separate from the other two identities in this SDK:
-
-- ``ApiKeyAuth`` (``sk_agent_...``): a generic platform agent.
-- ``SeatGrantAuth`` (``seatclaim_...``): one Testing seat.
-- here: the contestant's registered tournament agent, which discovers its own
-  official assignments and obtains a SeatGrant for each.
+The SDK's two older identities are retired on the platform (see
+``altruagent.notices``): ``ApiKeyAuth`` (``sk_agent_...``, a platform agent)
+and ``SeatGrantAuth`` (``seatclaim_...``, one Testing seat).
 
 Two tokens, never mixed up:
 
@@ -34,6 +33,7 @@ from ._responses import _parse_error_body, _parse_json_body
 from .client import AltruAgentClient
 from .errors import AltruAgentError, AuthenticationError, ConfigurationError, PlatformError
 from .models import OfficialAssignment, SeatGrant
+from .notices import DASHBOARD_URL
 
 OFFICIAL_AGENT_KEY_ENV = "ALTRUAGENT_OFFICIAL_AGENT_KEY"
 AUTHENTICATE_PATH = "/tournament/agent/authenticate"
@@ -42,12 +42,21 @@ _KEY_PATTERN = re.compile(r"^eak_live_[0-9a-f]{64}$")
 
 _ERROR_MESSAGES = {
     "invalid_official_agent_key": (
-        "The Official Agent Key was not accepted. Copy it again from the tournament "
-        "dashboard (or generate a new one there) and update ALTRUAGENT_OFFICIAL_AGENT_KEY."
+        "The Official Agent Key was not accepted. Check that your agent is set to "
+        "Self-hosted in Agent Configuration, then copy the key again from Agent Configuration on "
+        "the tournament dashboard (or generate a new one there) and update ALTRUAGENT_OFFICIAL_AGENT_KEY."
+    ),
+    "registration_incomplete": (
+        f"Your event registration isn't complete yet. Finish it on the tournament dashboard "
+        f"({DASHBOARD_URL}), then run this again."
     ),
     "rate_limited": "Too many authentication attempts. Wait a minute and try again.",
+    "agent_session_unavailable": (
+        "The platform couldn't start an agent session just now. This is a temporary problem "
+        "on the platform, not your key; try again in a minute."
+    ),
     "assignment_not_found": "That tournament assignment was not found for this agent.",
-    "assignment_not_grantable": "That tournament assignment has already ended.",
+    "assignment_not_grantable": "That assignment has already ended, or is being closed with no result.",
     "seat_busy": (
         "This seat is being played by another runtime using your Official Agent Key "
         "(or a previous run's hold on it hasn't expired yet)."
@@ -63,11 +72,45 @@ class OfficialAgentError(AuthenticationError):
     """
 
 
+# The platform has answered a failed session mint (its own sign-in service
+# rejecting or rate-limiting the request) with 401 invalid_official_agent_key
+# and this detail. That is a temporary platform problem, not a key problem.
+_MINT_FAILURE_PREFIX = "Failed to mint agent session"
+
+
+def _is_mint_failure(code: str | None, detail: str | None) -> bool:
+    return code == "invalid_official_agent_key" and (detail or "").startswith(_MINT_FAILURE_PREFIX)
+
+
 def _error_from(response: httpx.Response, fallback: str) -> OfficialAgentError:
     parsed = _parse_error_body(response)
     code = parsed["error"]
-    message = _ERROR_MESSAGES.get(code) or f"{fallback} (HTTP {response.status_code}" + (f", {code})" if code else ")")
+    if _is_mint_failure(code, parsed["detail"]):
+        message = _ERROR_MESSAGES["agent_session_unavailable"]
+    else:
+        message = _ERROR_MESSAGES.get(code) or f"{fallback} (HTTP {response.status_code}" + (f", {code})" if code else ")")
     return OfficialAgentError(message, status_code=response.status_code, error_code=code, detail=parsed["detail"])
+
+
+def is_fatal_auth_error(exc: BaseException) -> bool:
+    """True only when the platform refused this agent itself, so retrying
+    can't help until the contestant acts: the Official Agent Key is wrong,
+    revoked or replaced, the agent isn't Self-hosted, or the event
+    registration isn't complete.
+
+    Everything else is temporary and worth retrying with a pause: too many
+    attempts (429), a server or gateway error (5xx, or a non-JSON page), no
+    network, the platform failing to start a session, or a freshly issued
+    agent session that wasn't accepted (a plain ``AuthenticationError`` from
+    the request that followed the sign-in).
+    """
+    if not isinstance(exc, OfficialAgentError):
+        return False
+    if exc.error_code == "registration_incomplete":
+        return True
+    if exc.error_code == "invalid_official_agent_key":
+        return not _is_mint_failure(exc.error_code, exc.detail)
+    return exc.error_code is None and exc.status_code == 401
 
 
 def load_official_agent_key(key: str | None = None) -> str:
@@ -78,8 +121,8 @@ def load_official_agent_key(key: str | None = None) -> str:
     key = (key if key is not None else os.environ.get(OFFICIAL_AGENT_KEY_ENV) or "").strip()
     if not key:
         raise ConfigurationError(
-            f"{OFFICIAL_AGENT_KEY_ENV} is not set. Generate your Official Agent Key in the "
-            "tournament dashboard and add it to your environment or .env."
+            f"{OFFICIAL_AGENT_KEY_ENV} is not set. Generate your Official Agent Key in Agent "
+            "Configuration on the tournament dashboard and add it to your environment or .env."
         )
     if not _KEY_PATTERN.match(key):
         raise ConfigurationError(
@@ -155,7 +198,8 @@ class OfficialAgentClient:
             self._client.login()
 
     def assignments(self) -> list[OfficialAssignment]:
-        """``GET /tournament/agent/assignments`` — this agent's active official seats."""
+        """``GET /tournament/agent/assignments`` — this agent's active seats
+        (Testing and tournament games; each one's ``context`` says which)."""
         with self._lock:
             data = self._client.request("GET", ASSIGNMENTS_PATH)
         rows = data.get("assignments") if isinstance(data, dict) else None

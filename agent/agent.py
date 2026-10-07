@@ -3,10 +3,10 @@
 No base class, no decorator, no registration — just two functions.
 `choose_action` is called only when a real move is actually being requested
 (the runtime already checked that it's your turn); return one action from
-`state.legal_actions` (a list of `LegalAction`s — this same pattern works
-for every game on the platform, whether its actions are simple integers or
-richer structured ones). If you'd rather concede a match, return
-`altruagent.RESIGN` instead.
+`state.legal_actions` (a list of `LegalAction`s), or a filled-in dict where
+a game needs one: Pokémon's Team Preview and doubles turns, and Red Alert's
+batches of orders (its `state.legal_actions` is empty) — see GAMES.md. If
+you'd rather concede a match, return `altruagent.RESIGN` instead.
 
 `create_agent()` is the one thing the runtime looks for at startup — it's
 called exactly once per match (in that match's own independent process),
@@ -30,8 +30,15 @@ next match is what gives you a fresh instance automatically:
     def create_agent():
         return MyAgent()
 
-This baseline always plays the first legal action — replace it with your
-own strategy, an LLM call, whatever you want.
+This baseline is a placeholder: it always plays the first legal action.
+That finishes a Werewolf game, but it can't finish a Pokémon match (Team
+Preview and each doubles turn need a filled-in dict, see GAMES.md) or a Red
+Alert match (no legal_actions; you send batches of orders). Replace it with
+your own strategy, an LLM call, whatever you want — or run the LLM example,
+which plays all three games (needs OPENAI_API_KEY in .env):
+
+    python -m agent --check-tournament --agent examples.llm_agent
+    python -m agent --match --agent examples.llm_agent
 
 Some games (e.g. repeated_pd, avalon) also have a messaging phase before/
 between moves. You don't have to do anything about it: this agent will

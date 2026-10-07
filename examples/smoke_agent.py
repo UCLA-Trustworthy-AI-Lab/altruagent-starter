@@ -3,7 +3,8 @@
 Plays every phase of `pokemon_vgc_doubles_draft` (draft -> Team Preview ->
 doubles battle) and all of Werewolf by building the simplest valid action
 from what GameAPI offers, so a live self-hosted test match can run end to
-end. No LLM, no API keys, no randomness, no memory between turns.
+end. No LLM, no API keys, no randomness, no memory between turns. It does
+not play Red Alert (no `legal_actions` there; see `llm_agent.py`).
 
 - Anything enumerable (Pokémon draft picks, every Werewolf action):
   `state.legal_actions[0]`, exactly like `basic_agent.py`.
@@ -22,9 +23,9 @@ Both Pokémon templates arrive as a single legal action whose
 A template that doesn't have the expected shape raises `SmokeAgentError`
 (the runner reports it as a DecisionError) rather than sending a guess.
 
-Run it for one claimed test-match seat with:
+Run it for your test matches (add --tournament for your tournament games):
 
-    python -m agent --claim seatclaim_... --agent examples.smoke_agent
+    python -m agent --match --agent examples.smoke_agent
 """
 
 from altruagent import DecisionContext, GameState, LegalAction

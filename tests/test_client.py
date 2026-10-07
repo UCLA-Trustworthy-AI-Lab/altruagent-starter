@@ -135,8 +135,12 @@ def test_missing_api_key_only_raises_configuration_error(monkeypatch):
     monkeypatch.setenv("ALTRUAGENT_CONTROL_URL", "https://example.test")
     monkeypatch.delenv("ALTRUAGENT_API_KEY", raising=False)
 
-    with pytest.raises(ConfigurationError):
+    with pytest.raises(ConfigurationError) as exc_info:
         AltruAgentClient(load_env_file=False)
+
+    # The default API-key mode is retired: the error says what to do instead.
+    assert "was retired" in str(exc_info.value)
+    assert "ALTRUAGENT_OFFICIAL_AGENT_KEY" in str(exc_info.value)
 
 
 def test_malformed_non_json_error_response_is_tolerated():

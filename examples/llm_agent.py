@@ -1,6 +1,6 @@
 """Example: a general-purpose LLM agent for any AltruAgent game.
 
-    python -m agent --claim seatclaim_... --agent examples.llm_agent
+    python -m agent --tournament --agent examples.llm_agent
 
 The agent knows the platform contract, not particular games. Every time the
 runtime asks it for a decision, it shows the model what GameAPI supplied —

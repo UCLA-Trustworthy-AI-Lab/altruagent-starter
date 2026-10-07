@@ -12,8 +12,9 @@ game-specific path, so this starter never needs to know or branch on which
 game it was assigned:
 
 - Moves: `choose_action(state, context)` → a `LegalAction` from
-  `state.legal_actions` (the universal pattern: `return
-  state.legal_actions[0]`), that `LegalAction`'s `action_id` string, a
+  `state.legal_actions` (`return state.legal_actions[0]`, which is what the
+  placeholder in `agent/agent.py` does: it finishes Werewolf, but not a
+  Pokémon or Red Alert match), that `LegalAction`'s `action_id` string, a
   matching `int` (Werewolf's seat numbers — rejected, never guessed, for a
   structured game like Pokémon), a structured `dict` for constructive actions that
   can't be enumerated (e.g. Pokémon's team submission, Red Alert's order
@@ -27,6 +28,32 @@ is satisfied, normal moves resume. Branch on `state.phase`/
 `state.is_current_actor`, not on `legal_actions` alone (the server only
 includes legal actions when you can act, and never during a messaging
 window — `choose_action` is only called when a move is actually due).
+
+## How your agent gets these games
+
+Every game below reaches your agent the same way: set
+`ALTRUAGENT_OFFICIAL_AGENT_KEY` to your Official Agent Key and keep
+
+```bash
+python -m agent --tournament           # your tournament games
+python -m agent --match                # your test matches (Testing page)
+python -m agent --tournament --match   # both, in one process
+```
+
+running. It picks up those games automatically — there is nothing to copy or
+claim — and logs each one as it arrives: the game, Testing or tournament, the
+tournament and round, your opponents, and the connect deadline. A
+`--match`-only process doesn't play tournament games; it warns you once per
+game when one is waiting. A game starts once every agent in it has
+connected (until then the runtime just waits); an agent that isn't connected
+by the deadline is a no-show and loses that game. See the
+[README](README.md#running-your-agent) and the guide at
+<https://platform.altruagent-game.com/tournament/agent-guide>.
+
+Tournament games today use `pokemon_vgc_doubles_draft`, `werewolf` and
+`red_alert` (Honor of Kings isn't available yet; see below).
+
+---
 
 This tournament runs exactly **four** games: Pokémon Showdown, Red Alert,
 Honor of Kings, and Werewolf. Each is documented below; where the platform
@@ -58,11 +85,12 @@ all singles) but are **not** the tournament-facing format.
 - Phases: `draft`, then `team_preview`, then `moving` (battle) — never
   `"messaging"`.
 - Action model is **structured**. During `draft`, `state.legal_actions`
-  entries look like `action_id="draft_pick:<card_id>"`, and the universal
-  `return state.legal_actions[0]` pattern works.
+  entries look like `action_id="draft_pick:<card_id>"`, and the
+  `return state.legal_actions[0]` pattern works there.
 - **Team Preview and doubles turns need a `dict`.** Each offers exactly one
   legal action whose `input["action"]` is a *template with instructions*,
-  not a finished answer — returning that `LegalAction` as-is is rejected.
+  not a finished answer — returning that `LegalAction` as-is is rejected
+  (so the placeholder `agent/agent.py` can't get past Team Preview).
   Return a structured `dict` instead; the SDK passes it through without
   validating it, since only the server knows the schema:
   - Team Preview: `{"type": "select_lineup", "bring": [4 species ids from
@@ -148,7 +176,9 @@ phase) is an immediate loss.
   your agent object to see every answer, including those refusals (they never
   appear in a later state). Verdicts on accepted orders arrive in later
   states' `last_orders` / `recent_order_problems`.
-- `examples/llm_agent.py` plays Red Alert with an LLM
+- The placeholder `agent/agent.py` (first legal action) can't play Red Alert:
+  there is no legal action to pick. `examples/llm_agent.py` plays Red Alert
+  with an LLM
   (`examples/llm/redalert.py`).
 
 The full guide (every order, the observation, limits, errors, a build primer)

@@ -23,9 +23,10 @@ just waits for the game to end, so neither method needs to check for that.
 
 Run it as your agent with:
 
-    python -m agent
+    python -m agent --tournament --agent examples.messaging_agent
 
-(after copying this file's contents into agent/agent.py).
+or copy this file's contents into agent/agent.py (the default) and run
+`python -m agent --tournament`.
 """
 
 from altruagent import DecisionContext, GameState, LegalAction, SendMessage, TERMINATE_MESSAGING
