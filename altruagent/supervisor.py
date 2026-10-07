@@ -337,16 +337,33 @@ def _format_wait(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
-def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | None = None) -> list[str]:
+def _kind_label(assignment: "OfficialAssignment") -> str:
+    context = (assignment.context or "").strip().lower()
+    return {"testing": " (Testing)", "tournament": " (tournament)"}.get(context, "")
+
+
+def _players_note(players: int, player_count: int | None) -> str:
+    """How many of a match's players this runtime picked up at once, when more
+    than one (self-play, or several players in one test match)."""
+    if players <= 1:
+        return ""
+    if player_count == players:
+        return f", self-play: your agent plays all {players} players"
+    if isinstance(player_count, int) and player_count > players:
+        return f", your agent plays {players} of the {player_count} players"
+    return f", your agent plays {players} players"
+
+
+def describe_assignment(assignment: "OfficialAssignment", *, now: datetime | None = None,
+                        players: int = 1) -> list[str]:
     """The lines logged when a game is picked up: the game, then (when the
     server sent them) Testing vs tournament, the tournament and round, the
     opponents, and the connect deadline with the time left. Never prints ids
-    or tokens.
+    or tokens. ``players``: how many of the match's players were picked up
+    together (one set of lines for all of them).
     """
     game = _clean(assignment.game_type) or "unknown game"
-    context = (assignment.context or "").strip().lower()
-    kind = {"testing": " (Testing)", "tournament": " (tournament)"}.get(context, "")
-    lines = [f"Match assigned: {game}{kind}"]
+    lines = [f"Match assigned: {game}{_kind_label(assignment)}{_players_note(players, assignment.seat_count)}"]
 
     name, round_label = _clean(assignment.tournament_name), _clean(assignment.round_label)
     if name and round_label:
@@ -429,6 +446,14 @@ class TournamentState:
         # clock) the next assignment listing may try again.
         self.auth_failures = 0
         self.discovery_retry_at: float | None = None
+        # The assignment each seat's worker was started for, while the seat is
+        # listed or has a worker: which match (and game) a worker belongs to.
+        self.seat_games: dict[str, "OfficialAssignment"] = {}
+        # Seats whose last worker stopped before its game ended (an error, a
+        # lost connection, no way in yet, an incomplete registration) and
+        # that have no worker now. If the match ends before a new worker
+        # finishes it, the runtime says so, once per match.
+        self.stopped: dict[str, "OfficialAssignment"] = {}
 
 
 def _auth_retry_delay(exc: AuthenticationError, failures: int) -> float:
@@ -492,7 +517,11 @@ def run_tournament_once(
        because of a temporary problem (``EXIT_NOT_CONNECTED``) is replaced
        after ``NOT_CONNECTED_RETRY_SECONDS`` while the connect window is open.
        One turned away by an incomplete registration is retried every
-       ``REGISTRATION_RETRY_SECONDS``.
+       ``REGISTRATION_RETRY_SECONDS``. A worker that stopped with an error is
+       said to have stopped while the match continues, never that the match
+       ended; ``WAITING_MESSAGE`` follows only exits after which nothing of
+       that game is pending here. A match whose players this runtime plays
+       (self-play) gets one "Match finished." when the last of them is done.
     2. List this agent's active assignments. A transient control-plane
        failure is logged and the tick skipped (the runtime keeps waiting).
        So is a temporary failure to sign in again (``is_fatal_auth_error``
@@ -501,18 +530,42 @@ def run_tournament_once(
        Official Rules) is not fatal either: the runtime says what to do and
        keeps trying every ``REGISTRATION_RETRY_SECONDS``. Only a refusal of
        the key itself propagates — it would affect every seat.
-    3. Start one worker per listed seat of a kind in ``kinds``
+    3. A seat whose worker had stopped (``TournamentState.stopped``) and that
+       has left the list: its match ended without that worker; said once per
+       match. Then start one worker per listed seat of a kind in ``kinds``
        (``assignment_kind``: ``TESTING`` and/or ``TOURNAMENT``) that has none
        and isn't cooling down, logging what was picked up
-       (``describe_assignment``). A game of another kind is not played; it
-       gets one warning or note per game (``_note_other_kind``).
+       (``describe_assignment``, once per match however many of its players
+       start). A game of another kind is not played; it gets one warning or
+       note per game (``_note_other_kind``).
     4. Stop workers whose seat has left the list for
        ``MISSING_POLLS_BEFORE_STOP`` consecutive listings. Every listed seat
        counts here, whatever its kind: ``kinds`` only decides which games
        are started, never stops one already being played.
     """
     current_time = now()
-    for seat_id, exitcode in state.registry.reap_finished().items():
+    # Several of a match's players can be played by this runtime (self-play):
+    # what is said about one of them is said once per match and tick.
+    said: set[tuple[str, str]] = set()
+
+    def match_of(seat_id: str) -> str:
+        assignment = state.seat_games.get(seat_id)
+        return (assignment.match_id if assignment is not None else "") or seat_id
+
+    def say(seat_id: str, line: str) -> None:
+        if (match_of(seat_id), line) not in said:
+            said.add((match_of(seat_id), line))
+            log(line)
+
+    def say_waiting() -> None:  # at most once per tick
+        if ("", WAITING_MESSAGE) not in said:
+            said.add(("", WAITING_MESSAGE))
+            log(WAITING_MESSAGE)
+
+    reaped = state.registry.reap_finished()
+    finished: list[str] = []  # matches with a player that finished, in order
+    idle = False  # whether "Waiting for your next game..." fits these exits
+    for seat_id, exitcode in reaped.items():
         state.missing_polls.pop(seat_id, None)
         started = state.started_at.pop(seat_id, None)
         ran = current_time - started if started is not None else 0.0
@@ -521,23 +574,30 @@ def run_tournament_once(
         # one is retried (re-granted) only if it's still assigned afterwards.
         state.failed_until[seat_id] = current_time + cooldown_seconds
         connect_by = state.connect_by[seat_id][1] if seat_id in state.connect_by else None
+        if exitcode not in (EXIT_SUCCESS, EXIT_SEAT_BUSY) and seat_id in state.seat_games:
+            state.stopped[seat_id] = state.seat_games[seat_id]
         if exitcode == EXIT_SUCCESS:
             state.seat_failures.pop(seat_id, None)
-            log("Match finished.")
+            if match_of(seat_id) not in finished:
+                finished.append(match_of(seat_id))
+            idle = True
         elif exitcode == EXIT_SEAT_BUSY:
             state.seat_failures.pop(seat_id, None)
             state.failed_until[seat_id] = current_time + SEAT_BUSY_RETRY_SECONDS
-            log(f"Another runtime is playing this match with your Official Agent Key; checking again in {SEAT_BUSY_RETRY_SECONDS:.0f}s.")
+            say(seat_id, f"Another runtime is playing this match with your Official Agent Key; checking again in "
+                         f"{SEAT_BUSY_RETRY_SECONDS:.0f}s.")
+            idle = True
         elif exitcode == EXIT_REGISTRATION_INCOMPLETE:
             # The worker printed what to do; nothing is counted against the game.
             state.failed_until[seat_id] = current_time + REGISTRATION_RETRY_SECONDS
-            log(f"That game can't start until your registration is complete; checking again in "
-                f"{REGISTRATION_RETRY_SECONDS:.0f}s.")
+            say(seat_id, f"That game can't start until your registration is complete; checking again in "
+                         f"{REGISTRATION_RETRY_SECONDS:.0f}s.")
+            idle = True
         elif exitcode == EXIT_NOT_CONNECTED and connect_by is not None and current_time < connect_by:
             # Nothing was played yet and the connect window is open: try again
             # right away, however often it happened, so a hiccup isn't a no-show.
             state.failed_until[seat_id] = current_time + NOT_CONNECTED_RETRY_SECONDS
-            log("Couldn't reach that game yet (a temporary problem); trying again now.")
+            say(seat_id, "Couldn't reach that game yet (a temporary problem); trying again now.")
         else:
             if exitcode == EXIT_CONNECTION_LOST and ran >= TRANSIENT_GIVE_UP_SECONDS + WORKER_PLAYED_SECONDS:
                 failures = 1  # it was playing: a new failure, not one more in a row
@@ -551,11 +611,26 @@ def run_tournament_once(
                 wait = min(max(SEAT_FAILURE_BACKOFF_MAX_SECONDS, cooldown_seconds), cooldown_seconds * 2 ** (failures - 1))
             state.seat_failures[seat_id] = failures
             state.failed_until[seat_id] = current_time + wait
-            why = ("Lost the connection to that game for a while" if exitcode == EXIT_CONNECTION_LOST
-                   else f"Match ended with an error (exit code {exitcode})")
-            log(f"{why}; retrying that game in {wait:.0f}s if it is still assigned.")
-        if len(state.registry) == 0:
-            log(WAITING_MESSAGE)
+            if exitcode == EXIT_CONNECTION_LOST:
+                say(seat_id, f"Lost the connection to that game for a while; retrying that game in {wait:.0f}s "
+                             "if it is still assigned.")
+            elif exitcode == EXIT_NOT_CONNECTED:  # and the connect window has closed
+                say(seat_id, f"Couldn't reach that game (a temporary problem); retrying in {wait:.0f}s "
+                             "if it is still assigned.")
+            else:
+                # The game itself goes on (its timers may play for the agent).
+                say(seat_id, f"Your agent's process for this match stopped with an error (exit code {exitcode}); "
+                             f"the match continues. Retrying in {wait:.0f}s if it is still assigned.")
+    active_matches = {match_of(seat_id) for seat_id in state.registry.keys()}
+    for match in finished:
+        # The match is over: a player of it that had stopped earlier needs no
+        # word of its own.
+        for seat_id in [s for s in state.stopped if match_of(s) == match]:
+            del state.stopped[seat_id]
+        if match not in active_matches:  # said once, when its last player here is done
+            log("Match finished.")
+    if reaped and idle and len(state.registry) == 0:
+        say_waiting()
 
     if state.discovery_retry_at is not None and current_time < state.discovery_retry_at:
         return
@@ -599,7 +674,22 @@ def run_tournament_once(
         del state.seat_failures[seat_id]
     for seat_id in [s for s in state.connect_by if s not in listed and not state.registry.is_active(s)]:
         del state.connect_by[seat_id]
-    session_token = getattr(official, "session_token", None)
+    # A game whose worker had stopped (and wasn't started again) has ended:
+    # say so once per match, or nothing would mark the end of it.
+    ended = [s for s in state.stopped if s not in listed and not state.registry.is_active(s)]
+    for seat_id in ended:
+        assignment = state.stopped.pop(seat_id)
+        game = _clean(assignment.game_type)
+        say(seat_id, f"Your {game + ' ' if game else ''}match{_kind_label(assignment)} has ended while your "
+                     "agent's process for it was stopped.")
+    if ended and len(state.registry) == 0:
+        say_waiting()
+    for seat_id in [s for s in state.seat_games if s not in listed and not state.registry.is_active(s)]:
+        del state.seat_games[seat_id]
+
+    # The seats to start now, grouped by match: one set of lines per match,
+    # however many of its players this runtime plays (self-play).
+    to_start: dict[str, list["OfficialAssignment"]] = {}
     for assignment in assignments:
         seat_id = assignment.seat_id
         if not seat_id or state.registry.is_active(seat_id):
@@ -613,17 +703,24 @@ def run_tournament_once(
         retry_at = state.failed_until.get(seat_id)
         if retry_at is not None and current_time < retry_at:
             continue
-        worker_input = TournamentWorkerInput(
-            seat_id=seat_id, match_id=assignment.match_id, game_type=assignment.game_type,
-            agent_spec=agent_spec, execution_id=state.execution_id,
-            tournament_id=assignment.tournament_id,
-            agent_session=session_token() if callable(session_token) else None,
-        )
-        process = process_factory(target=_tournament_process_entry, args=(worker_input,), daemon=True)
-        process.start()
-        state.registry.start(seat_id, process)
-        state.started_at[seat_id] = current_time
-        for line in describe_assignment(assignment, now=wall_now()):
+        to_start.setdefault(assignment.match_id or seat_id, []).append(assignment)
+    session_token = getattr(official, "session_token", None)
+    for group in to_start.values():
+        for assignment in group:
+            seat_id = assignment.seat_id
+            worker_input = TournamentWorkerInput(
+                seat_id=seat_id, match_id=assignment.match_id, game_type=assignment.game_type,
+                agent_spec=agent_spec, execution_id=state.execution_id,
+                tournament_id=assignment.tournament_id,
+                agent_session=session_token() if callable(session_token) else None,
+            )
+            process = process_factory(target=_tournament_process_entry, args=(worker_input,), daemon=True)
+            process.start()
+            state.registry.start(seat_id, process)
+            state.started_at[seat_id] = current_time
+            state.seat_games[seat_id] = assignment
+            state.stopped.pop(seat_id, None)
+        for line in describe_assignment(group[0], now=wall_now(), players=len(group)):
             log(line)
         log("Starting match...")
 
@@ -633,12 +730,13 @@ def run_tournament_once(
             continue
         state.missing_polls[seat_id] = state.missing_polls.get(seat_id, 0) + 1
         if state.missing_polls[seat_id] >= MISSING_POLLS_BEFORE_STOP:
+            say(seat_id, "Match is no longer assigned; stopped its worker.")
             state.registry.terminate(seat_id, shutdown_join_timeout)
             state.missing_polls.pop(seat_id, None)
             state.started_at.pop(seat_id, None)
-            log("Match is no longer assigned; stopped its worker.")
+            state.seat_games.pop(seat_id, None)
             if len(state.registry) == 0:
-                log(WAITING_MESSAGE)
+                say_waiting()
 
 
 def run_tournament_forever(

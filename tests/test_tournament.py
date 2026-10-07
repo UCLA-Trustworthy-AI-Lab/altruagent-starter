@@ -314,7 +314,7 @@ def test_failed_worker_is_retried_after_cooldown_reconnect_path():
     h.tick(advance=1.0)   # reaped -> cooldown
     h.tick(advance=10.0)  # still cooling down
     assert h.started() == ["seat-1"]
-    assert "retrying that game" in h.log[2]
+    assert "Retrying in 30s" in h.log[2]
 
     h.tick(advance=30.0)  # cooldown over, still assigned -> new worker (re-grant)
     assert h.started() == ["seat-1", "seat-1"]
@@ -332,7 +332,7 @@ def test_a_seat_that_keeps_failing_is_retried_less_and_less_often():
         h.clock["t"] = h.state.failed_until["seat-1"]  # wait it out; the next tick starts a new worker
 
     assert waits == [60.0, 120.0, 240.0, 480.0, SEAT_FAILURE_BACKOFF_MAX_SECONDS, SEAT_FAILURE_BACKOFF_MAX_SECONDS]
-    assert "retrying that game in 120s" in "\n".join(h.log)
+    assert "Retrying in 120s" in "\n".join(h.log)
 
 
 def test_a_finished_match_resets_the_seat_backoff_and_a_seat_that_left_is_forgotten():
@@ -396,6 +396,162 @@ def test_authentication_failure_propagates():
 
     with pytest.raises(AuthenticationError):
         h.tick()
+
+
+# -- what the runtime says about a game's process --------------------------------------------
+
+STOPPED_WITH_ERROR = ("Your agent's process for this match stopped with an error (exit code 1); "
+                      "the match continues. Retrying in 60s if it is still assigned.")
+
+
+def players(count, *, mine=None, game_type="werewolf", context="testing", match_id="m-1"):
+    """``mine`` (default: all ``count``) assignments for one match of ``count`` players."""
+    return [OfficialAssignment(match_id=match_id, seat_id=f"{match_id}-p{i}", game_type=game_type,
+                               seat_position=i, seat_count=count, match_status="in_progress",
+                               seat_status="pending", context=context)
+            for i in range(count if mine is None else mine)]
+
+
+def test_an_agent_error_says_the_process_stopped_and_the_match_continues():
+    # Was: "Match ended with an error (exit code 1); ..." then "Waiting for
+    # your next game..." while the match was still being played.
+    h = Harness([a("seat-1")])
+    h.tick()
+    h.factory.processes[0].finish(EXIT_MATCH_FAILURE)
+
+    h.tick()
+
+    assert h.log[2:] == [STOPPED_WITH_ERROR]
+    assert not any("Match ended" in line for line in h.log)
+
+
+def test_a_match_that_ends_while_its_process_is_stopped_is_said_once():
+    # Was: nothing at all when the match ended (e.g. the placeholder in Red Alert).
+    h = Harness(players(2, game_type="red_alert"), players(2, game_type="red_alert"), [])
+    h.tick()
+    for process in h.factory.processes:
+        process.finish(EXIT_MATCH_FAILURE)
+    h.tick()  # both stopped; the match goes on (still listed)
+    assert h.log[-1] == STOPPED_WITH_ERROR and h.log.count(STOPPED_WITH_ERROR) == 1
+
+    h.tick()  # the match is over: no longer listed
+
+    assert h.log[-2:] == ["Your red_alert match (Testing) has ended while your agent's process for it was stopped.",
+                          WAITING_MESSAGE]
+    h.tick()
+    assert h.log.count(WAITING_MESSAGE) == 1
+
+
+def test_a_game_never_reached_after_its_connect_window_is_not_called_an_error():
+    h = Harness([a("seat-1")])
+    h.tick()
+    h.clock["t"] += MIN_CONNECT_WINDOW_SECONDS
+    h.factory.processes[0].finish(EXIT_NOT_CONNECTED)
+
+    h.tick()
+
+    assert h.log[-1] == "Couldn't reach that game (a temporary problem); retrying in 60s if it is still assigned."
+
+
+def test_waiting_is_said_once_when_one_match_finishes_and_another_ended_without_its_process():
+    h = Harness([a("seat-1"), a("seat-2")], [a("seat-1"), a("seat-2")], [a("seat-1")])
+    h.tick()
+    h.factory.processes[1].finish(EXIT_MATCH_FAILURE)
+    h.tick()
+    h.factory.processes[0].finish(EXIT_SUCCESS)
+
+    h.tick()  # seat-1's match finished; seat-2's match ended while its process was stopped
+
+    assert h.log[-3:] == ["Match finished.", WAITING_MESSAGE,
+                          "Your pokemon_vgc_doubles_draft match has ended while your agent's process for it was stopped."]
+
+
+def test_a_stopped_process_that_was_started_again_and_finished_says_nothing_more():
+    h = Harness([a("seat-1")], [a("seat-1")], [a("seat-1")], [], cooldown=10.0)
+    h.tick()
+    h.factory.processes[0].finish(EXIT_MATCH_FAILURE)
+    h.tick()
+    h.tick(advance=10.0)  # started again
+    h.factory.processes[1].finish(EXIT_SUCCESS)
+
+    h.tick()
+    h.tick()
+
+    assert h.log[-2:] == ["Match finished.", WAITING_MESSAGE]
+    assert not any("has ended while" in line for line in h.log)
+
+
+def test_one_player_that_stopped_in_a_self_play_match_that_finished_says_nothing_more():
+    h = Harness(players(3), players(3), [])
+    h.tick()
+    h.factory.processes[0].finish(EXIT_MATCH_FAILURE)
+    h.tick()
+    for process in h.factory.processes[1:3]:
+        process.finish(EXIT_SUCCESS)
+
+    h.tick()
+    h.tick()
+
+    assert h.log[-2:] == ["Match finished.", WAITING_MESSAGE]
+    assert not any("has ended while" in line for line in h.log)
+
+
+def test_a_self_play_pickup_is_one_line_not_one_per_player():
+    h = Harness(players(7))
+
+    h.tick()
+
+    assert len(h.factory.processes) == 7
+    assert h.log == ["Match assigned: werewolf (Testing), self-play: your agent plays all 7 players",
+                     "Starting match..."]
+
+
+def test_a_pickup_of_some_of_the_players_says_how_many():
+    h = Harness(players(4, mine=2))
+
+    h.tick()
+
+    assert h.log == ["Match assigned: werewolf (Testing), your agent plays 2 of the 4 players", "Starting match..."]
+
+
+def test_a_self_play_finish_is_one_line_not_one_per_player():
+    # Was: 7 x ("Match finished.", "Waiting for your next game...").
+    h = Harness(players(7), players(7), [])
+    h.tick()
+    for process in h.factory.processes[:3]:
+        process.finish(EXIT_SUCCESS)
+    h.tick()  # 3 of 7 done: the match isn't over for this runtime yet
+    assert "Match finished." not in h.log
+    for process in h.factory.processes[3:]:
+        process.finish(EXIT_SUCCESS)
+
+    h.tick()
+
+    assert h.log[2:] == ["Match finished.", WAITING_MESSAGE]
+
+
+def test_players_held_by_another_copy_are_said_once_per_match():
+    h = Harness(players(4))
+    h.tick()
+    for process in h.factory.processes:
+        process.finish(EXIT_SEAT_BUSY)
+
+    h.tick()
+
+    busy = [line for line in h.log if line.startswith("Another runtime is playing this match")]
+    assert len(busy) == 1 and h.log[-1] == WAITING_MESSAGE
+
+
+def test_a_self_play_match_no_longer_assigned_says_so_once():
+    h = Harness(players(3), [], [])
+    h.tick()
+
+    for _ in range(MISSING_POLLS_BEFORE_STOP):
+        h.tick()
+
+    assert all(p.terminated for p in h.factory.processes)
+    assert h.log.count("Match is no longer assigned; stopped its worker.") == 1
+    assert h.log[-1] == WAITING_MESSAGE and h.log.count(WAITING_MESSAGE) == 1
 
 
 # -- signing in again during a run (the agent session lasts about an hour) ------------------

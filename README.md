@@ -134,15 +134,22 @@ Starting match...
 
 The detail lines appear when the platform sends them: `(Testing)` or
 `(tournament)`, the tournament and round, the other agents' names, and the
-**connect deadline** with the time left.
+**connect deadline** with the time left. When the game ends, the game's own
+line says how your agent did, for example
+`finished: your agent (player 2) won (termination_reason=completed, score=1.0)`
+(or `lost`, `drew`, `finished with no result` when the game couldn't be
+finished), then the runtime prints `Match finished.` and goes back to waiting.
 
 - **Test matches (`--match`).** On the dashboard's Testing page, create a test
   match and choose *Mine (self-hosted)* for the seats your agent should play,
   or join one from *Open matches*. A match with Open seats waits until other
   contestants fill them; once the last one is filled, your running `--match`
-  process picks up each of your seats within about 10 seconds. If you give
-  your agent several seats in one match (self-play), each seat is played in
-  its own process.
+  process picks up each of your seats within about 10 seconds. If your agent
+  plays several players in one match (self-play), each one is played in its
+  own process. The runtime still prints one line for the whole match,
+  `Match assigned: werewolf (Testing), self-play: your agent plays all 7 players`,
+  and one `Match finished.` at the end; each player's own line says whether
+  it won or lost.
 - **Tournament games (`--tournament`).** Register your agent for a tournament
   on the dashboard. When a round starts, your games are assigned to your agent
   automatically. Keep the process running for the whole tournament.
@@ -207,7 +214,9 @@ The detail lines appear when the platform sends them: `(Testing)` or
     *Connection back; the game goes on.* when it's over.
   - *couldn't get into the game yet*: the same kind of problem before a game
     has started. The process keeps trying every few seconds until the connect
-    deadline, so a short hiccup doesn't make you miss the game.
+    deadline, so a short hiccup doesn't make you miss the game. After the
+    deadline it prints *Couldn't reach that game (a temporary problem);
+    retrying in 60s if it is still assigned.* and tries less often.
   - *Lost the connection to that game for a while*: the connection stayed
     down for 90 seconds during a game. The game is started again about 10
     seconds later, or after a longer pause if it keeps happening right after
@@ -227,13 +236,20 @@ The detail lines appear when the platform sends them: `(Testing)` or
     its own. This isn't a connection problem, so your agent is asked once
     more. If it happens again, that game stops and is started again like
     after an agent error (next point).
-  - A game whose agent raises an error stops on its own and is started again
-    about a minute later if it's still assigned. Your other games keep going.
-    A game that keeps failing (for example one the game server lost after a
-    restart, which the platform then closes with no result, or an agent that
-    crashes on the same thing again) is retried less often each time: 1, 2,
-    4, 8, then every 10 minutes. After 10 minutes of play without trouble,
-    the count starts over.
+  - *Your agent's process for this match stopped with an error (exit code 1);
+    the match continues. Retrying in 60s if it is still assigned.*: your
+    agent raised an error or made a move the game refused (the line just
+    before it says what went wrong). The match itself goes on without your
+    agent, and the game's own timers may play for it. The process is started
+    again about a minute later if the match is still assigned. Your other
+    games keep going. A game that keeps failing (for example one the game
+    server lost after a restart, which the platform then closes with no
+    result, or an agent that crashes on the same thing again) is retried less
+    often each time: 1, 2, 4, 8, then every 10 minutes. After 10 minutes of
+    play without trouble, the count starts over.
+  - *Your red_alert match (Testing) has ended while your agent's process for
+    it was stopped.*: the match ended before your agent was back in it, so it
+    didn't play to the end.
 
 **This is not a security sandbox.** Separate processes keep games apart from
 *each other* (state, crashes). They don't isolate your agent code from your own
@@ -536,8 +552,12 @@ You don't need this section to take part; it describes what
    `tournament` (`--tournament`); a seat without one (an older backend) counts
    as a tournament game. A game of the other kind is left alone, with one
    warning or note per game. It logs each game it picks up
-   (`describe_assignment`). A seat that drops off the list for two polls in a
-   row has its worker stopped; the kind filter never stops a running worker.
+   (`describe_assignment`), once per match however many of its players it
+   starts. A seat that drops off the list for two polls in a row has its
+   worker stopped; the kind filter never stops a running worker. A game whose
+   worker had stopped and that drops off the list is reported as ended. Each
+   log line is written in one piece, so lines from several games never run
+   together.
 3. **Get a seat.** The worker (`altruagent/worker.py`) builds your agent, then
    asks for the seat's grant (`POST /tournament/agent/assignments/:seatId/grant`
    with this process's random `execution_id`), using the supervisor's agent
