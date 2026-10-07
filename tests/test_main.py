@@ -164,6 +164,12 @@ def test_games_md_says_a_werewolf_resign_takes_only_that_player_out():
     assert "takes only you out; the game goes on" in werewolf
     assert "whichever\n  side wins" in werewolf
     assert "same-side teammates" not in werewolf
+    # The runtime watches the rest of the game, and a choice aimed at a
+    # resigner is handed back.
+    assert "waits for the game to end" in werewolf
+    assert "The starter stops playing that game" not in werewolf
+    assert "handed back: whoever chose them" in " ".join(werewolf.split())
+    assert "a day on which someone resigns does not" in " ".join(werewolf.split())
 
 
 def test_readme_says_waiting_uses_no_ai_tokens():

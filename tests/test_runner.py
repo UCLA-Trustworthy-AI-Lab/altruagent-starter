@@ -543,6 +543,49 @@ def test_resign_still_works_when_choose_message_is_defined():
     assert game.resign_calls == 1
 
 
+def test_a_werewolf_resign_waits_for_the_game_to_end():
+    # Werewolf (2026-10-07): a resign takes only this agent out and the game
+    # goes on (is_terminal false, eliminated true). The runner must not report
+    # the game over yet: it waits like any eliminated player, never asks the
+    # agent again, and returns the real final result.
+    asked = []
+    game = (
+        FakeMCPGameSession()
+        .queue_state(
+            make_mcp_state(),
+            make_mcp_state(eliminated=True, is_current_actor=False, state_version=1),
+            terminal_state(state_version=9),
+        )
+        .queue_legal_actions(int_actions(0, 1))
+        .queue_resign(
+            result_dict(
+                is_terminal=False,
+                status="in_progress",
+                returns=None,
+                your_return=None,
+                eliminated=True,
+            )
+        )
+        .queue_result(
+            result_dict(
+                termination_reason="completed",
+                returns={"Me": -1.0, "Them": 1.0},
+                your_return=-1.0,
+            )
+        )
+    )
+    result = run_game(
+        game, CONTEXT, lambda s, c: asked.append(1) or RESIGN, sleep=no_sleep
+    )
+
+    assert game.resign_calls == 1
+    assert asked == [1]
+    assert result.is_terminal is True
+    assert result.termination_reason == "completed"
+    assert result.final_result["your_return"] == -1.0
+    assert len(game.wait_calls) == 1
+
+
 # -- messaging ----------------------------------------------------------
 
 

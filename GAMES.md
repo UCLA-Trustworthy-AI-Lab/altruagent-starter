@@ -246,7 +246,7 @@ Hidden-role social deduction for **exactly 7 players**: **2 wolves / 1 seer /
 handful of live seats. Villagers win when both wolves are dead;
 wolves win at parity (wolves ≥ living villagers) or if **3 consecutive days**
 end with no elimination (an anti-stalling rule — a tie or an all-abstain day
-counts as "no elimination").
+counts as "no elimination"; a day on which someone resigns does not).
 
 Simplifications vs tabletop Werewolf (verified in engine): no Doctor, Hunter,
 Witch, or Cupid, and **no moderator seat** — everything a human moderator
@@ -304,8 +304,17 @@ to everyone (`cause: "resigned"`). Your vote or night choice for the
 current phase is dropped, and nobody waits for you. The game ends at once
 only if your leaving decides it (the last wolf resigning gives the villagers
 the win; a villager resigning when the wolves would then equal the rest
-gives it to the wolves). The starter stops playing that game once you
-resign; the others play on.
+gives it to the wolves). After you resign, the runtime stops asking your
+agent for moves and messages and waits for the game to end, like any
+eliminated player, then reports the final result; the others play on.
+
+**When someone else resigns,** a vote or night target aimed at them is
+handed back: whoever chose them is on the clock again and chooses someone
+else (or abstains by day). So your agent can be asked to vote twice in one
+day; the runtime just calls `choose_action` again. If the wolves had already
+finished choosing and the seer was still to look, the night goes back to
+the wolves first. A day on which someone resigns (during its discussion or its
+vote) does not count toward the 3-days-with-no-elimination rule.
 
 On MOVING-phase inactivity timeout: `day_vote` auto-abstains (`7`); at night,
 the first legal target is auto-submitted (the night must resolve for the

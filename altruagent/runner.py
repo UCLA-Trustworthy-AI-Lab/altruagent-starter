@@ -710,6 +710,17 @@ class _TransientRetry:
         self._tool_failure_retried = False
 
 
+def _resign_left_game_running(result: Any) -> bool:
+    """Whether a ``resign`` answer says the game goes on without this agent.
+
+    Werewolf (since 2026-10-07): a resign takes one player out and the other
+    six play on, so the answer has ``is_terminal: false`` (and ``eliminated:
+    true``). Every other game ends on a resign, and so does an answer without
+    ``is_terminal``.
+    """
+    return isinstance(result, dict) and result.get("is_terminal") is False
+
+
 def _terminal_game_state(last_state: GameState, result: dict) -> GameState:
     """Merge a ``get_result()``/``resign()`` result (authoritative for
     ``returns``/``termination_reason``, confirmed absent from ``get_state()``/
@@ -750,7 +761,10 @@ def run_game(
        is only a fallback when it didn't), invoke ``choose_action``, validate
        the result, and submit it (``play_action`` for a matched/structured
        action, ``resign`` for ``RESIGN``). ``play_action``'s result carries
-       the post-move state, which becomes the next state directly.
+       the post-move state, which becomes the next state directly. A resign
+       that ends the game returns at once; in Werewolf, where it takes only
+       this agent out and the game goes on, the runner re-reads the state
+       (now ``eliminated``) and waits for the end as in step 3.
     6. Else (not this agent's turn): ``wait_for_update`` — returns as soon as
        anything changes, or after ``WAIT_FOR_UPDATE_TIMEOUT_SECONDS`` with
        the unchanged state (the loop just waits again). Against a server without that tool,
@@ -931,23 +945,27 @@ def run_game(
                     )
                 state = wait(state, _last_message_seq(state))
                 continue
+            left_the_game = False
             try:
                 if decision is RESIGN:
                     result = game.resign()
-                    return _terminal_game_state(state, result)
-                # Only passed when the contestant supplied one, so agents
-                # that never use WithReasoning send exactly what they did before.
-                reasoning = (
-                    {"reasoning_summary": decision.reasoning_summary}
-                    if decision.reasoning_summary
-                    else {}
-                )
-                result = game.play_action(
-                    action_id=decision.action_id,
-                    action=decision.action,
-                    state_version=state.state_version,
-                    **reasoning,
-                )
+                    if not _resign_left_game_running(result):
+                        return _terminal_game_state(state, result)
+                    left_the_game = True
+                else:
+                    # Only passed when the contestant supplied one, so agents
+                    # that never use WithReasoning send exactly what they did before.
+                    reasoning = (
+                        {"reasoning_summary": decision.reasoning_summary}
+                        if decision.reasoning_summary
+                        else {}
+                    )
+                    result = game.play_action(
+                        action_id=decision.action_id,
+                        action=decision.action,
+                        state_version=state.state_version,
+                        **reasoning,
+                    )
             except AltruAgentError as exc:
                 code = exc.error_code if isinstance(exc, MCPToolError) else None
                 recovered = code in _RACE_ERROR_CODES or (
@@ -986,6 +1004,12 @@ def run_game(
                     continue
                 raise
             retry.succeeded()
+            if left_the_game:
+                # Werewolf: the resign took only this agent out and the game
+                # goes on. The fresh state says `eliminated`, so the loop just
+                # waits for the end (step 3) and returns the final result.
+                state = read(game.get_state)
+                continue
             if isinstance(result, dict):
                 _report_result(result_hook, result, context)
             # While the game continues, play_action returns the post-move
