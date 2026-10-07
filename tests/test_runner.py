@@ -944,6 +944,19 @@ def test_game_already_complete_race_treated_as_natural_completion():
     assert result.termination_reason == "completed"
 
 
+def test_the_final_state_keeps_the_servers_whole_result():
+    # get_result also says how this agent did (your_return, the game's own
+    # per-player result, the winner): the worker reports won/lost from it.
+    answer = result_dict(termination_reason="completed", winner_agent_id="agent-1",
+                         result={"seats": {"agent-1": {"outcome": "win"}}})
+    game = FakeMCPGameSession().queue_state(terminal_state()).queue_result(answer)
+
+    final = run_game(game, CONTEXT, lambda s, c: s.legal_actions[0], sleep=no_sleep)
+
+    assert final.final_result == answer
+    assert make_mcp_state().final_result is None
+
+
 def test_action_runtime_unavailable_becomes_unsupported_game_flow_error():
     game = (
         FakeMCPGameSession()

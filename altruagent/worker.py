@@ -168,6 +168,62 @@ def run_worker(
             client.close()
 
 
+# How a game's last line names this agent's result. The game's own result for
+# this player comes first (Werewolf), then the winner (Pokémon, Red Alert),
+# then the score, read the way the platform reads it: above 0.5 a win, below
+# a loss, exactly 0.5 a draw.
+_OUTCOME_WORDS = {"win": "won", "loss": "lost", "draw": "drew", "resigned": "resigned", "timed_out": "timed out"}
+
+
+def _number(value) -> float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _score(final_state, agent_id: str) -> float | None:
+    result = getattr(final_state, "final_result", None) or {}
+    score = _number(result.get("your_return"))
+    if score is None:
+        score = _number((getattr(final_state, "returns", None) or {}).get(agent_id))
+    return score
+
+
+def game_outcome(final_state, agent_id: str) -> str | None:
+    """This agent's result in a finished game: ``"won"``, ``"lost"``,
+    ``"drew"``, ``"resigned"``, ``"timed out"``, ``"no result"`` (the server
+    couldn't finish the game), or ``None`` when the server didn't say."""
+    result = getattr(final_state, "final_result", None) or {}
+    structured = result.get("result")
+    players = structured.get("seats") if isinstance(structured, dict) else None
+    mine = players.get(agent_id) if isinstance(players, dict) else None
+    if isinstance(mine, dict) and mine.get("outcome") in _OUTCOME_WORDS:
+        return _OUTCOME_WORDS[mine["outcome"]]
+    if result.get("status") == "failed" or result.get("failure_reason"):
+        return "no result"
+    winner = result.get("winner_agent_id")
+    if winner:
+        return "won" if winner == agent_id else "lost"
+    score = _score(final_state, agent_id)
+    if score is None:
+        return None
+    return "won" if score > 0.5 else "lost" if score < 0.5 else "drew"
+
+
+def finished_line(final_state, agent_id: str, seat_position: int | None = None) -> str:
+    """The worker's last line for a game that ended: how this agent did, when
+    the server said, then the technical detail. For example
+    ``finished: your agent (player 2) won (termination_reason=completed, score=1.0)``."""
+    score = _score(final_state, agent_id)
+    detail = f"termination_reason={getattr(final_state, 'termination_reason', None)}" + (
+        f", score={score}" if score is not None else "")
+    outcome = game_outcome(final_state, agent_id)
+    if outcome is None:
+        return f"finished ({detail})"
+    if outcome == "no result":
+        return f"finished with no result ({detail})"
+    player = f" (player {seat_position + 1})" if isinstance(seat_position, int) else ""
+    return f"finished: your agent{player} {outcome} ({detail})"
+
+
 class TournamentWorkerInput(NamedTuple):
     """Primitive, picklable description of one assigned seat (a Testing or
     tournament game). Carries no credential: the worker reads the Official
@@ -308,11 +364,7 @@ def run_tournament_worker(
             seat_position=grant.seat_position,
         )
         final_state = run_game_fn(game, context, contestant)
-        score = (final_state.returns or {}).get(grant.agent_id)
-        print_line(
-            f"{label} finished termination_reason={final_state.termination_reason}"
-            + (f" score={score}" if score is not None else "")
-        )
+        print_line(f"{label} {finished_line(final_state, grant.agent_id, grant.seat_position)}")
         return EXIT_SUCCESS
     except KeyboardInterrupt:
         print_line(f"{label} interrupted, stopping")

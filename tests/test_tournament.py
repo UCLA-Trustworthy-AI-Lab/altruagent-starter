@@ -900,8 +900,64 @@ def test_worker_grants_the_seat_and_plays_it_through_run_game(capsys):
         "game-1", "synthetic-1", 1, "pokemon_vgc_doubles_draft")
     assert officials[0].grants == ["seat-1"] and officials[0].closed
     out = capsys.readouterr().out
-    assert "finished termination_reason=normal score=1.0" in out
+    assert "finished: your agent (player 2) won (termination_reason=normal, score=1.0)" in out
     assert "seat-jwt" not in out
+
+
+def _finish_line(capsys, termination_reason="completed", returns=None, final_result=None):
+    def fake_run_game(game, context, contestant):
+        return types.SimpleNamespace(termination_reason=termination_reason, returns=returns,
+                                     final_result=final_result)
+
+    code = run_tournament_worker(TournamentWorkerInput("seat-1", "match-1", "werewolf", SPEC, EXEC),
+                                 official_factory=lambda: FakeWorkerOfficial(None), run_game_fn=fake_run_game)
+    assert code == EXIT_SUCCESS
+    (line,) = [line for line in capsys.readouterr().out.splitlines() if " finished" in line]
+    return line.split("] ", 1)[1]
+
+
+def test_worker_says_won_or_lost_from_the_games_own_result_werewolf(capsys):
+    # Werewolf's returns are keyed by player name, not by agent id, so the
+    # finished line used to say nothing about the result.
+    result = {"returns": {"Player 1": -1.0, "Player 2": 1.0}, "your_return": 1.0, "status": "completed",
+              "result": {"winning_team": "wolves", "seats": {"synthetic-1": {"outcome": "win", "team": "wolves"}}}}
+
+    line = _finish_line(capsys, returns=result["returns"], final_result=result)
+
+    assert line == "finished: your agent (player 2) won (termination_reason=completed, score=1.0)"
+
+
+def test_worker_says_lost_from_the_winner_pokemon_and_red_alert(capsys):
+    result = {"returns": {"other": 1.0, "synthetic-1": 0.0}, "your_return": 0.0, "status": "completed",
+              "winner_agent_id": "other"}
+
+    line = _finish_line(capsys, returns=result["returns"], final_result=result)
+
+    assert line == "finished: your agent (player 2) lost (termination_reason=completed, score=0.0)"
+
+
+def test_worker_says_a_draw_from_an_even_score(capsys):
+    result = {"returns": {"other": 0.5, "synthetic-1": 0.5}, "your_return": 0.5, "status": "completed",
+              "winner_agent_id": None}
+
+    line = _finish_line(capsys, termination_reason="time_limit", returns=result["returns"], final_result=result)
+
+    assert line == "finished: your agent (player 2) drew (termination_reason=time_limit, score=0.5)"
+
+
+def test_worker_says_no_result_for_a_game_the_server_could_not_finish(capsys):
+    result = {"returns": None, "your_return": None, "status": "failed", "winner_agent_id": None,
+              "failure_reason": "battle_room_timeout"}
+
+    line = _finish_line(capsys, termination_reason="error", final_result=result)
+
+    assert line == "finished with no result (termination_reason=error)"
+
+
+def test_worker_without_a_known_result_just_says_finished(capsys):
+    line = _finish_line(capsys, termination_reason="normal", returns={})
+
+    assert line == "finished (termination_reason=normal)"
 
 
 def test_worker_hands_the_tournament_id_to_the_contestant():
