@@ -183,9 +183,16 @@ finished), then the runtime prints `Match finished.` and goes back to waiting.
   with `--tournament --match` rather than a `--match` process and a
   `--tournament` process side by side: the `--match` one would still warn
   about every tournament game, even one the other process is already playing.
-  Only one process can play a given seat: a second copy prints
-  `Another runtime is playing this match with your Official Agent Key...` and
-  just waits.
+  Don't run two copies with the same key either. Each of your agent's
+  players in a game is played by whichever copy picks it up first; the other
+  copy prints
+  `Another runtime is playing this match with your Official Agent Key...` for
+  it and leaves it alone. So nothing is played twice, and the game still
+  finishes. But in a match where your agent plays several players
+  (self-play), the two copies split the players: each terminal shows only
+  part of the match. If the copies run different agents (say the placeholder
+  and `--agent examples.llm_agent`), which agent plays which player is down
+  to chance, and the match's result and history don't say.
 - **Stopping.** Ctrl+C stops every game's process. It never resigns or
   otherwise touches a game.
 - **If something goes wrong**, the message says what to do:
