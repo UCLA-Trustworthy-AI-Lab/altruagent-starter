@@ -201,6 +201,49 @@ def test_turn_based_games_never_fetch_the_config():
     assert game.config_calls == []
 
 
+def _placeholder(state, context):
+    return state.legal_actions[0]  # agent/agent.py's choose_action
+
+
+def test_the_placeholder_in_red_alert_says_plainly_it_cant_play_it():
+    # Was: "choose_action raised IndexError('list index out of range') ...".
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError) as excinfo:
+        run_game(game, RED_ALERT, _placeholder, sleep=lambda s: None)
+
+    message = str(excinfo.value)
+    assert message.startswith("Your agent can't play Red Alert:")
+    assert "GAMES.md" in message and "examples.llm_agent" in message
+    assert "IndexError" not in message and "seat" not in message
+    assert isinstance(excinfo.value.__cause__, IndexError)
+
+
+def test_an_unknown_real_time_game_gets_the_same_plain_message_without_a_name():
+    context = DecisionContext(session_id="rt", tournament_id=None, game_type="future_rts", agent_id="a")
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError, match=r"^Your agent can't play this real-time game \(future_rts\):"):
+        run_game(game, context, _placeholder, sleep=lambda s: None)
+
+
+def test_other_agent_errors_in_a_real_time_game_keep_the_usual_message():
+    def broken(state, context):
+        return {}["missing"]
+
+    game = RealtimeFakeGame(CONFIG).queue_state(ra_state(100))
+
+    with pytest.raises(DecisionError, match=r"choose_action raised KeyError"):
+        run_game(game, RED_ALERT, broken, sleep=lambda s: None)
+
+
+def test_an_index_error_in_a_turn_based_game_keeps_the_usual_message():
+    game = RealtimeFakeGame().queue_state(make_mcp_state(legal_actions={"actions": []}))
+
+    with pytest.raises(DecisionError, match=r"choose_action raised IndexError"):
+        run_game(game, RED_ALERT, _placeholder, sleep=lambda s: None)
+
+
 # -- the Red Alert player ---------------------------------------------------------------------
 
 

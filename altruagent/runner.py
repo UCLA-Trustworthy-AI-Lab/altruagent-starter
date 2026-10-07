@@ -382,10 +382,32 @@ def _default_choose_message(state: GameState, context: DecisionContext) -> Messa
     return TERMINATE_MESSAGING
 
 
+# Display names for the "can't play" message below, by game type. Wording
+# only: the runner never plays a game differently because of its name.
+_GAME_NAMES = {"red_alert": "Red Alert"}
+
+
+def _cant_play_realtime_message(context: DecisionContext) -> str:
+    """What an agent that picks from ``state.legal_actions`` (like the
+    placeholder ``agent/agent.py``) is told in a real-time game, where that
+    list is empty: plainly that it can't play the game, and where to look,
+    instead of a raw ``IndexError``."""
+    game_type = context.game_type or ""
+    name = _GAME_NAMES.get(game_type) or (f"this real-time game ({game_type})" if game_type else "this real-time game")
+    return (
+        f"Your agent can't play {name}: it picks its move from state.legal_actions, which is empty "
+        "in a real-time game (a move there is a batch of orders your agent writes itself). The "
+        "placeholder agent/agent.py works this way. See GAMES.md, or run with --agent "
+        "examples.llm_agent, which can play it."
+    )
+
+
 def _invoke_decision(decision_fn: DecisionFn, state: GameState, context: DecisionContext) -> Any:
     try:
         return decision_fn(state, context)
     except Exception as exc:
+        if isinstance(exc, IndexError) and not state.legal_actions and _is_realtime(state):
+            raise DecisionError(_cant_play_realtime_message(context)) from exc
         raise DecisionError(
             f"choose_action raised {exc!r} for session {context.session_id!r}."
         ) from exc

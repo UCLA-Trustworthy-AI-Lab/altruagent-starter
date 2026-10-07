@@ -195,8 +195,9 @@ phase) is an immediate loss.
   appear in a later state). Verdicts on accepted orders arrive in later
   states' `last_orders` / `recent_order_problems`.
 - The placeholder `agent/agent.py` (first legal action) can't play Red Alert:
-  there is no legal action to pick. `examples/llm_agent.py` plays Red Alert
-  with an LLM
+  there is no legal action to pick. If you run it anyway, its process for the
+  match prints `Your agent can't play Red Alert: ...` and stops; the match
+  goes on without it. `examples/llm_agent.py` plays Red Alert with an LLM
   (`examples/llm/redalert.py`).
 
 The full guide (every order, the observation, limits, errors, a build primer)
