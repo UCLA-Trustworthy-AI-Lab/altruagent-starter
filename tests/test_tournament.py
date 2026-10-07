@@ -575,7 +575,7 @@ def test_real_client_session_refresh_failure_keeps_games_running(answer):
 
     assert not worker.terminated and h.state.registry.pids().keys() == {"seat-1"}
     assert any("Could not renew your agent session" in line for line in h.log)
-    assert not any("copy the key again" in line for line in h.log)
+    assert not any("Rotate key" in line for line in h.log)
 
     backend.refresh = None  # the platform recovers
     h.tick(advance=120.0)

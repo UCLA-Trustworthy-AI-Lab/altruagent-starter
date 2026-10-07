@@ -192,6 +192,16 @@ def test_invalid_key_message_mentions_self_hosted():
     assert "Self-hosted" in str(exc_info.value)
 
 
+def test_invalid_key_message_names_the_rotate_button_not_copying_again():
+    # The dashboard shows a key once; while one exists it offers only Rotate/Revoke.
+    with pytest.raises(OfficialAgentError) as exc_info:
+        official(Backend(key_valid=False)).authenticate()
+
+    message = str(exc_info.value)
+    assert "Rotate key" in message
+    assert "copy the key again" not in message and "generate a new one" not in message
+
+
 def test_incomplete_registration_is_explained():
     def backend(request):
         return httpx.Response(403, json={"error": "registration_incomplete", "detail": "rules", "next_step": "rules"})
@@ -237,7 +247,7 @@ def test_a_failed_session_mint_is_reported_as_temporary_not_as_a_bad_key():
 
     assert error.error_code == "invalid_official_agent_key"  # the platform's code is kept as sent
     assert "temporary" in str(error) and "not your key" in str(error)
-    assert "copy the key again" not in str(error)
+    assert "Rotate key" not in str(error)
     assert not is_fatal_auth_error(error)
 
 

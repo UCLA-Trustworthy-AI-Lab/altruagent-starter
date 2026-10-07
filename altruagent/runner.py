@@ -296,9 +296,9 @@ class DecisionError(RunnerError):
     exactly what's accepted), or produced an action/message the server
     rejected as invalid (bad recipients/content, word/length cap, chat quota
     exceeded, malformed structured action — see ``_MESSAGE_SCOPED_ERROR_CODES``/
-    ``_ACTION_SCOPED_ERROR_CODES``). Fails fast, on purpose — a deterministic
-    contestant bug should be visible immediately during local development,
-    not silently retried on the next cycle.
+    ``_ACTION_SCOPED_ERROR_CODES``). Fails fast, on purpose: the worker exits
+    so a deterministic contestant bug is visible immediately; the supervisor
+    retries the seat later with a growing pause.
     """
 
 

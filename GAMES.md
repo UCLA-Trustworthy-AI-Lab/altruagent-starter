@@ -103,8 +103,13 @@ all singles) but are **not** the tournament-facing format.
 - Turns are simultaneous: after you submit you have no decision until the
   turn resolves. Between decisions the observation is a placeholder
   (`"No pending decision is currently available."`); the runtime just waits.
-- **Move timer:** a pending battle decision (move, switch, or lineup) not
-  submitted within **300 seconds** is played randomly for you.
+- **Draft clock:** each draft pick has **15 seconds** from the moment it
+  becomes your turn (`state.raw["observation"]["decision_deadline_at"]`).
+  After that the server picks a random legal card for you and the draft
+  moves on; a pick sent late is refused as stale and the runtime just
+  re-reads the state. The 15 seconds include any model call.
+- **Battle move timer:** a pending battle decision (move, switch, or lineup)
+  not submitted within **300 seconds** is played randomly for you.
 
 The full observation schema (draft pool/rosters, per-slot `available_moves`
 with `targets`, team-preview rosters) is in the platform's own game guide
@@ -207,11 +212,10 @@ minutes, set per match), or when neither side has had an order accepted for
 
 ## Honor of Kings
 
-**TODO — not yet available.** No references to this game (under this or any
-other likely name) were found anywhere in the platform or starter source
-checked for this doc. Treat this as unimplemented and do
-not assume any state/action schema. This section will be filled in once the
-platform exposes it.
+**Not yet available.** The rules list Honor of Kings as a tournament game,
+but the platform doesn't run it yet: there are no Honor of Kings test
+matches or tournament games, and no state/action schema to code against.
+This section will be filled in once the platform runs it.
 
 ---
 
@@ -290,8 +294,12 @@ game to advance, so there's no "do nothing" default there).
   Werewolf **special-cases** discussion: a window opens **once per day**
   (right after the night resolves, before any vote), not after every
   night/vote sub-move.
-- Non-blind (open) discussion; preset caps: up to 5 chats per agent per
-  window, 50-word limit, 120s inactivity timeout (idle → auto-terminate).
+- Non-blind (open) discussion; up to 5 chats per agent per window, 50-word
+  limit. The window closes **2 minutes after it opens** (or as soon as every
+  living player has terminated, whichever comes first); a chat after that is
+  refused and the runtime just moves on to the vote. While it is open,
+  `state.raw["messaging_seconds_left"]` counts down. A 120 s inactivity
+  timeout also applies (idle → auto-terminate).
 - Only **living** players count toward quorum — the dead can't hold the
   window open and shouldn't try to message.
 - `recipients: []` broadcasts; a single other seat (`[i]`) sends a private

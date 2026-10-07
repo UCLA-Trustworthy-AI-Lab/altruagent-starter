@@ -43,8 +43,11 @@ _KEY_PATTERN = re.compile(r"^eak_live_[0-9a-f]{64}$")
 _ERROR_MESSAGES = {
     "invalid_official_agent_key": (
         "The Official Agent Key was not accepted. Check that your agent is set to "
-        "Self-hosted in Agent Configuration, then copy the key again from Agent Configuration on "
-        "the tournament dashboard (or generate a new one there) and update ALTRUAGENT_OFFICIAL_AGENT_KEY."
+        "Self-hosted in Agent Configuration on the tournament dashboard, and that "
+        "ALTRUAGENT_OFFICIAL_AGENT_KEY holds the key exactly as it was shown when you generated it. "
+        "The dashboard can't show a key again: if you no longer have it, press Rotate key in "
+        "Agent Configuration (or Generate Official Agent Key if you have no key), put the new key "
+        "in ALTRUAGENT_OFFICIAL_AGENT_KEY, and restart."
     ),
     "registration_incomplete": (
         f"Your event registration isn't complete yet. Finish it on the tournament dashboard "
