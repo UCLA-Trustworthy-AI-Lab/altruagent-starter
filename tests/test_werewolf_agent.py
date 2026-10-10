@@ -1,0 +1,260 @@
+"""Tests for the Werewolf agent (agent/werewolf/) and its offline simulator (sim/)."""
+
+from __future__ import annotations
+
+import random
+
+import pytest
+
+from altruagent import TERMINATE_MESSAGING, DecisionContext, SendMessage
+from altruagent.models import GameState
+from agent.agent import Agent, create_agent
+from agent.werewolf import WerewolfAgent
+from agent.werewolf.beliefs import infer
+from agent.werewolf.chat_llm import make_polisher
+from agent.werewolf.parsing import ChatFacts, Resolver, Snapshot, parse_dead, parse_private, parse_votes, read_message
+from sim.werewolf_sim import BASELINES, Game, ours, run_matchup
+
+PLAYERS = [{"position": i, "name": f"Player{i}", "agent_id": f"a{i}"} for i in range(7)]
+RESOLVER = Resolver(PLAYERS, 7)
+
+
+def ctx(seat: int) -> DecisionContext:
+    return DecisionContext(session_id="w", tournament_id=None, game_type="werewolf", agent_id=f"a{seat}", seat_position=seat)
+
+
+def state(
+    me: int,
+    observation: str,
+    *,
+    sub_phase: str = "day_vote",
+    legal: list[int] | None = None,
+    phase: str = "moving",
+    alive: list[int] | None = None,
+    dead: list[dict] | None = None,
+    votes: list[dict] | None = None,
+    messages: list[tuple[int, str]] = (),
+    day: int = 1,
+) -> GameState:
+    alive = list(range(7)) if alive is None else alive
+    raw = {
+        "session_id": "w",
+        "game_type": "werewolf",
+        "phase": phase,
+        "is_current_actor": legal is not None,
+        "state_version": 3,
+        "observation": observation,
+        "your_position": me,
+        "players": PLAYERS,
+        "eliminated": False,
+        "game_state": {"phase": sub_phase, "day": day, "alive": [f"Player{i}" for i in alive], "dead": dead or [],
+                       "vote_history": votes or []},
+        "new_messages": [{"seq": n + 1, "sender": s, "recipients": [], "content": text, "type": "chat"}
+                         for n, (s, text) in enumerate(messages)],
+    }
+    if legal is not None:
+        raw["legal_actions"] = {"state_version": 3, "actions": [{"action_id": str(a), "label": f"Player{a}", "input": {}} for a in legal]}
+    return GameState.from_mcp_state(raw)
+
+
+def snap(me: int = 6, role: str | None = "villager", **kw) -> Snapshot:
+    base = dict(me=me, n_players=7, names={}, alive=set(range(7)), dead={}, role=role, partners=set(), seer_results={},
+                day=1, sub_phase="day_vote", votes=[])
+    base.update(kw)
+    return Snapshot(**base)
+
+
+# -- parsing ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("observation, role", [
+    ("You are Player2. Your role: villager.", "villager"),
+    ("You are Player2. Your role is Werewolf.", "wolf"),
+    ("You are the seer.", "seer"),
+    ("role: WOLF", "wolf"),
+])
+def test_role_is_read_from_varied_wordings(observation, role):
+    assert parse_private({}, observation, 2, RESOLVER)[0] == role
+
+
+@pytest.mark.parametrize("observation", [
+    "You are Player2. Your role: wolf. Your fellow wolf is Player5.",
+    "Your role: werewolf. The wolves are Player2 and Player5.",
+    "Your role: wolf. Partner: Player 5",
+])
+def test_wolf_partner_is_read(observation):
+    assert parse_private({}, observation, 2, RESOLVER)[1] == {5}
+
+
+def test_wolf_partner_ignores_event_sentences():
+    obs = "Your role: wolf. Your teammate is Player4. Player1 was killed by the wolves."
+    assert parse_private({}, obs, 2, RESOLVER)[1] == {4}
+
+
+@pytest.mark.parametrize("observation, expected", [
+    ("Your role: seer. Night 1: you investigated Player3: wolf.", {3: "wolf"}),
+    ("Your role: seer. You investigated Player3. Player3 is a villager.", {3: "villager"}),
+    ("Your role: seer. Investigation results: Player1 -> not a wolf; Player4 -> werewolf", {1: "villager", 4: "wolf"}),
+])
+def test_seer_results_are_read(observation, expected):
+    assert parse_private({}, observation, 2, RESOLVER)[2] == expected
+
+
+def test_structured_private_fields_win():
+    raw = {"private": {"role": "seer", "investigations": {"Player4": "wolf"}}}
+    role, partners, results = parse_private(raw, "", 2, RESOLVER)
+    assert (role, results) == ("seer", {4: "wolf"})
+
+
+def test_dead_and_vote_history_shapes():
+    dead = parse_dead({"dead": [{"name": "Player3", "role": "seer", "cause": "night_kill", "day": 2}, "Player1"]}, RESOLVER)
+    assert dead[3].role == "seer" and dead[3].cause == "night_kill" and dead[1].role is None
+    votes = parse_votes([{"day": 1, "votes": {"Player0": "Player3", "Player1": "abstain"}},
+                         {"day": 2, "voter": "Player2", "target": 7}], RESOLVER)
+    assert [(v.day, v.voter, v.target) for v in votes] == [(1, 0, 3), (1, 1, None), (2, 2, None)]
+
+
+def test_display_names_are_resolved():
+    resolver = Resolver([{"position": 0, "name": "Alpha"}, {"position": 1, "name": "Beta"}], 7)
+    facts = ChatFacts()
+    read_message(facts, 1, "I am the seer. Alpha is a wolf, vote Alpha.", [], 1, 6, resolver)
+    assert facts.claimed_results == {1: {0: "wolf"}} and facts.intents_on(1) == {1: 0}
+
+
+def test_chat_claims_accusations_and_negation():
+    facts = ChatFacts()
+    read_message(facts, 4, "I'm the Seer. I checked Player2: wolf. Player5 is not a wolf.", [], 1, 6, RESOLVER)
+    read_message(facts, 1, "I'm voting Player4, they seem suspicious.", [], 1, 6, RESOLVER)
+    read_message(facts, 3, "I am not the seer, just a villager.", [], 1, 6, RESOLVER)
+    assert facts.seer_claims == {4: 1}
+    assert facts.claimed_results[4] == {2: "wolf", 5: "villager"}
+    assert facts.intents_on(1) == {1: 4}
+    assert 3 in facts.villager_claims and 3 not in facts.seer_claims
+
+
+# -- beliefs ------------------------------------------------------------------------------------
+
+
+def test_a_lone_seer_claim_makes_its_wolf_target_the_top_suspect():
+    facts = ChatFacts()
+    read_message(facts, 5, "I am the seer. Player0 is a wolf.", [], 1, 6, RESOLVER)
+    p = infer(snap(), facts).p_wolf
+    assert max(range(6), key=p.get) == 0
+    assert p[5] < p[0]
+
+
+def test_seer_knowledge_is_certain():
+    p = infer(snap(me=2, role="seer", seer_results={4: "wolf", 1: "villager"}), ChatFacts()).p_wolf
+    assert p[4] == pytest.approx(1.0) and p[1] == pytest.approx(0.0) and p[2] == 0.0
+
+
+def test_a_rival_seer_claim_is_a_wolf_to_the_real_seer():
+    facts = ChatFacts()
+    read_message(facts, 3, "I am the seer, Player2 is a wolf.", [], 1, 2, RESOLVER)
+    p = infer(snap(me=2, role="seer", seer_results={0: "villager"}), facts).p_wolf
+    assert p[3] > 0.85 and p[3] == max(p.values())
+
+
+# -- decisions ----------------------------------------------------------------------------------
+
+
+def test_seer_votes_its_known_wolf():
+    agent = WerewolfAgent(rng=random.Random(0))
+    s = state(2, "You are Player2. Your role: seer. Night 1: you investigated Player4: wolf.", legal=[0, 1, 3, 4, 5, 6, 7])
+    assert agent.choose_action(s, ctx(2)).action_id == "4"
+
+
+def test_wolf_never_votes_its_partner_by_default_and_never_abstains():
+    agent = WerewolfAgent(rng=random.Random(0))
+    s = state(2, "Your role: wolf. Your fellow wolf is Player0.", legal=[0, 1, 3, 4, 5, 6, 7])
+    assert agent.choose_action(s, ctx(2)).action_id not in ("0", "7")
+
+
+def test_wolf_kills_the_seer_claimant():
+    agent = WerewolfAgent(rng=random.Random(0))
+    talk = state(2, "Your role: wolf. Your fellow wolf is Player0.", phase="messaging",
+                 messages=[(5, "I am the seer. Player3 is a villager.")])
+    agent.choose_message(talk, ctx(2))
+    night = state(2, "Your role: wolf. Your fellow wolf is Player0.", sub_phase="night_wolf", legal=[1, 3, 4, 5, 6])
+    assert agent.choose_action(night, ctx(2)).action_id == "5"
+
+
+def test_role_and_partner_come_from_the_night_actions_when_the_observation_is_unreadable(capsys):
+    agent = WerewolfAgent(rng=random.Random(0))
+    night = state(2, "(something unexpected)", sub_phase="night_wolf", legal=[1, 3, 4, 5, 6])
+    agent.choose_action(night, ctx(2))
+    assert "WARNING" in capsys.readouterr().out
+    vote = state(2, "(something unexpected)", legal=[0, 1, 3, 4, 5, 6, 7])
+    assert agent.choose_action(vote, ctx(2)).action_id != "0"  # Player0 is the inferred partner
+
+
+def test_seer_claims_when_it_found_a_wolf_and_messages_respect_limits():
+    agent = WerewolfAgent(rng=random.Random(0))
+    s = state(2, "Your role: seer. Night 1: you investigated Player4: wolf.", phase="messaging")
+    message = agent.choose_message(s, ctx(2))
+    assert isinstance(message, SendMessage) and "Seer" in message.content and "Player4" in message.content
+    assert len(message.content.split()) <= 45 and not message.recipients
+
+
+def test_chat_ends_once_nothing_new_happens():
+    agent = WerewolfAgent(rng=random.Random(0))
+    s = state(6, "Your role: villager.", phase="messaging")
+    assert isinstance(agent.choose_message(s, ctx(6)), SendMessage)
+    assert agent.choose_message(s, ctx(6)) is TERMINATE_MESSAGING
+    assert agent.choose_message(s, ctx(6)) is TERMINATE_MESSAGING
+
+
+def test_wolf_whispers_to_its_partner_once_a_day():
+    agent = WerewolfAgent(rng=random.Random(0))
+    s = state(2, "Your role: wolf. Your fellow wolf is Player0.", phase="messaging")
+    first = agent.choose_message(s, ctx(2))
+    assert isinstance(first, SendMessage) and first.recipients == [0]
+    second = agent.choose_message(s, ctx(2))
+    assert isinstance(second, SendMessage) and not second.recipients
+
+
+# -- LLM polish ---------------------------------------------------------------------------------
+
+
+class FakeProvider:
+    def __init__(self, text):
+        self.text = text
+
+    def complete_structured(self, messages, schema_name, schema, timeout=None):
+        assert "wolf" not in messages[1]["content"].lower() or "Draft" in messages[1]["content"]
+        return {"message": self.text}
+
+
+@pytest.mark.parametrize("rewrite, accepted", [
+    ("Trust me, Player3 is our best lynch today. I'm voting Player3.", True),
+    ("Let's all vote Player4.", False),  # new player, dropped target
+    ("I am the seer and I'm voting Player3.", False),  # invented a seer claim
+])
+def test_polish_keeps_the_plan(rewrite, accepted):
+    draft = "Villager here. I'm voting Player3. Their play looks off to me."
+    out = make_polisher(FakeProvider(rewrite))(draft, {"intent": "vote", "vote": 3})
+    assert out == (rewrite if accepted else draft)
+
+
+# -- router & simulator -------------------------------------------------------------------------
+
+
+def test_router_sends_werewolf_to_the_werewolf_agent(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    agent = create_agent()
+    assert isinstance(agent, Agent)
+    s = state(2, "Your role: villager.", legal=[0, 1, 3, 4, 5, 6, 7])
+    agent.choose_action(s, ctx(2))
+    assert isinstance(agent._delegate, WerewolfAgent)
+
+
+@pytest.mark.parametrize("baseline", list(BASELINES))
+def test_simulated_games_finish_without_errors(baseline):
+    wins, _ = run_matchup(ours, BASELINES[baseline], hero_seats=2, games=15, seed=3)
+    assert wins["all"][1] == 30
+
+
+def test_full_self_play_game_finishes():
+    rng = random.Random(5)
+    result = Game([ours(rng) for _ in range(7)], rng).play()
+    assert result.winner in ("wolves", "village")

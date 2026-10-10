@@ -21,7 +21,12 @@ each in its own process with its own fresh agent instance. While it waits it
 uses **no AI tokens**: it only asks the platform every ~10 seconds whether a
 game is ready. Only playing a game with an LLM agent uses tokens.
 
-**The agent in `agent/agent.py` is a placeholder.** It always plays the first
+**Werewolf:** `agent/agent.py` plays Werewolf with the strategy agent in
+`agent/werewolf/` — see [`WEREWOLF.md`](WEREWOLF.md) for how it plays and
+the offline simulator (`python -m sim.werewolf_sim`). For other games it
+uses `examples.llm_agent` when `OPENAI_API_KEY` is set.
+
+**The starter's original `agent/agent.py` was a placeholder.** It always plays the first
 legal move. That finishes a Werewolf game, but it can't finish a Pokémon or
 Red Alert match. Replace it with your own (see
 [Writing your agent](#writing-your-agent)), or run the included LLM example,
