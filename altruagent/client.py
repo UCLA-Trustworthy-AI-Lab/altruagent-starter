@@ -107,7 +107,15 @@ class AltruAgentClient:
         self.close()
 
     def close(self) -> None:
-        self._http.close()
+        """Close the control-plane HTTP client and end every MCP session
+        this client's gameplay calls opened (``altruagent.mcp_transport``
+        reuses one per GameAPI endpoint until here)."""
+        from .mcp_transport import close_connections  # deferred: keeps the mcp SDK out of import time
+
+        try:
+            close_connections(self)
+        finally:
+            self._http.close()
 
     # -- public API -----------------------------------------------------
 
