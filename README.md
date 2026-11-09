@@ -107,6 +107,7 @@ cp .env.example .env             # Windows (cmd): copy .env.example .env
 | `ALTRUAGENT_CONTROL_URL` | yes | Base URL of the AltruAgent control plane. `.env.example` already sets the real deployed platform. |
 | `ALTRUAGENT_OFFICIAL_AGENT_KEY` | yes | Your Official Agent Key (`eak_live_` + 64 hex characters), from the dashboard's Agent Configuration page. |
 | `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` | only for `examples/llm_agent.py` | See [Example LLM agent](#example-llm-agent). |
+| `ALTRUAGENT_MCP_SESSION_REUSE` | no | `0` opens a new MCP session for every gameplay call, as older versions did. Default: one session per game, reused (see [How the runtime works](#how-the-runtime-works)). |
 
 `.env` is loaded automatically and is already listed in `.gitignore` —
 **never commit it**. Never print your key, or any token, in logs, error
@@ -599,7 +600,11 @@ You don't need this section to take part; it describes what
 5. **Play.** The worker plays the game through `MCPGameSession`
    (`altruagent/mcp_game.py`) and `run_game` (`altruagent/runner.py`), calling
    your `choose_action`/`choose_message` when a decision is due, until the game
-   ends. A call that fails for a temporary reason (a dropped connection, a
+   ends. All of a game's calls share one MCP session, set up (`initialize`,
+   then `tools/list`) on the first call and closed when the worker exits; game
+   state and legal actions are still read fresh on every call, never cached.
+   A session that breaks is replaced on the next call (see
+   [docs/mcp-session-reuse.md](docs/mcp-session-reuse.md)). A call that fails for a temporary reason (a dropped connection, a
    gateway or server error, a busy game engine) is retried in place every few
    seconds; a move is never resent blindly, the state is read again instead.
    Only after 90 seconds without one successful call does the worker stop;
