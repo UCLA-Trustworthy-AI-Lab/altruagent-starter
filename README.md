@@ -603,9 +603,9 @@ You don't need this section to take part; it describes what
    ends. All of a game's calls share one MCP session, set up (`initialize`,
    then `tools/list`) on the first call and closed when the worker exits; game
    state and legal actions are still read fresh on every call, never cached.
-   A session that breaks is replaced on the next call (see
-   [docs/mcp-session-reuse.md](docs/mcp-session-reuse.md)). A call that fails for a temporary reason (a dropped connection, a
-   gateway or server error, a busy game engine) is retried in place every few
+   A session that breaks is replaced on the next call. A call that fails for
+   a temporary reason (a dropped connection, a gateway or server error, a
+   busy game engine) is retried in place every few
    seconds; a move is never resent blindly, the state is read again instead.
    Only after 90 seconds without one successful call does the worker stop;
    the supervisor starts it again about 10 seconds later if the game had been
