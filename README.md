@@ -469,10 +469,6 @@ complete, copy-pasteable starting points.
 - `examples/smoke_agent.py` — valid, deterministic moves for Pokémon and
   Werewolf (no strategy; not Red Alert), handy for checking your setup end to
   end with a test match.
-- `examples/werewolf_agent.py` — a Werewolf agent with real rules and no AI
-  model (no API key, no tokens): it never abstains, votes for the most
-  suspected player, investigates as the seer, never votes for its wolf ally,
-  and speaks once per discussion window. A baseline to beat.
 - `examples/llm_agent.py` — a general LLM agent that plays all three games
   (below).
 
