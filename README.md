@@ -471,6 +471,9 @@ complete, copy-pasteable starting points.
   end with a test match.
 - `examples/llm_agent.py` — a general LLM agent that plays all three games
   (below).
+- `examples/werewolf_llm_agent.py` — the LLM agent above plus a Werewolf
+  strategy you write in plain text: edit `examples/werewolf_strategy.md` to
+  change how it plays, no code needed.
 
 Run any of them with `--agent`, for example
 `python -m agent --match --agent examples.smoke_agent`.
