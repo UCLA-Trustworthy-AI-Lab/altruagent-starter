@@ -310,10 +310,13 @@ Platform game id / launch preset: `werewolf`
 
 ### Overview
 
-Hidden-role social deduction for **exactly 7 players**: **2 wolves / 1 seer /
-4 plain villagers**, assigned randomly at session creation. Players are
+Hidden-role social deduction for **7 to 16 players**. The standard table is
+**7: 2 wolves / 1 seer / 4 plain villagers**; Testing can pick 7 to 16, and a
+one-table class tournament seats everyone (the default roles grow with the
+table: 3 wolves and 1 seer at 12 to 15, 4 wolves at 16; organizers may set
+their own). Roles are assigned randomly at session creation. Players are
 **eliminated** as the game goes — by the third day you may be down to a
-handful of live seats. Villagers win when both wolves are dead;
+handful of live seats. Villagers win when every wolf is dead;
 wolves win at parity (wolves ≥ living villagers) or if **3 consecutive days**
 end with no elimination (an anti-stalling rule — a tie or an all-abstain day
 counts as "no elimination"; a day on which someone resigns does not).
@@ -321,7 +324,7 @@ counts as "no elimination"; a day on which someone resigns does not).
 Simplifications vs tabletop Werewolf (verified in engine): no Doctor, Hunter,
 Witch, or Cupid, and **no moderator seat** — everything a human moderator
 would do (dealing roles, resolving the night kill, tallying votes, rejecting
-illegal targets) is the engine itself, so all 7 seats are agents.
+illegal targets) is the engine itself, so every seat is an agent.
 
 ### Round structure
 
@@ -342,8 +345,10 @@ seer targeted the same night still gets that night's investigation.
 ### Agent interaction
 
 Actions are **seat numbers**, not an indexed table of combinations: action
-`3` always means "Player3," in every phase; `7` means **abstain**
-(day-vote only). Track two separate phase fields: the platform's `phase`
+`3` always means "Player3," in every phase; **abstain** (day-vote only) is
+the action after the last seat: `7` at a table of seven, `12` at twelve,
+`14` at fourteen. At a bigger table `7` is Player7, so **find abstain by its
+label `Abstain`, never by the number.** Track two separate phase fields: the platform's `phase`
 (`"messaging"` / `"moving"`, decides which endpoint to call) and the
 engine's sub-phase, surfaced in `state.raw["game_state"]["phase"]`
 (`"night_wolf"` / `"night_seer"` / `"day_vote"` / `None` when terminal,
@@ -351,9 +356,9 @@ decides what the action integer means).
 
 | Sub-phase | Who acts | `legal_actions` | Meaning |
 |---|---|---|---|
-| `night_wolf` | Living wolves, one at a time | Living non-wolf seats | Seat to kill. A wolf acting alone (ally already dead) just chooses; a 2-wolf disagreement is a tie broken **toward the lower seat number**, deterministically. |
-| `night_seer` | The seer only | Living seats except self | Seat to investigate — result (`wolf`/`villager`) lands only in your own `observation`, nowhere else. |
-| `day_vote` | Every living player, one at a time | Living seats except self, plus `7` | Seat to lynch, or `7` = abstain. **Plurality wins; a tie or all-abstain lynches nobody.** Votes are hidden until every living player has voted, then the full tally is public. |
+| `night_wolf` | Living wolves, one at a time | Living non-wolf seats | Seat to kill. The most-named target dies; a tie (with two wolves, any disagreement) is broken **toward the lower seat number**, deterministically. A wolf acting alone just chooses. |
+| `night_seer` | The seer(s), one at a time | Living seats except self | Seat to investigate — result (`wolf`/`villager`) lands only in your own `observation`, nowhere else (with two seers, neither sees the other's results). |
+| `day_vote` | Every living player, one at a time | Living seats except self, plus abstain | Seat to lynch, or the action labelled `Abstain` (`7` at seven players). **Plurality wins; a tie or all-abstain lynches nobody.** Votes are hidden until every living player has voted, then the full tally is public. |
 
 `legal_actions` is `[]` whenever it isn't your turn, including throughout
 `day_vote` (the engine hands out day-vote turns one seat at a time) — an
@@ -387,7 +392,7 @@ none, nobody is killed that night. A day on which someone resigns (during
 its discussion or its vote) does not count toward the
 3-days-with-no-elimination rule.
 
-On MOVING-phase inactivity timeout: `day_vote` auto-abstains (`7`); at night,
+On MOVING-phase inactivity timeout: `day_vote` auto-abstains; at night,
 the first legal target is auto-submitted (the night must resolve for the
 game to advance, so there's no "do nothing" default there).
 

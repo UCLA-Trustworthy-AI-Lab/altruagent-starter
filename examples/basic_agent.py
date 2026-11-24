@@ -3,7 +3,7 @@
 This is what you get by default — no messaging, no per-match state, just a
 function that returns `state.legal_actions[0]`. It is a placeholder: it
 finishes a Werewolf game (each `LegalAction.action_id` is a seat number as
-a string, "7" = abstain) and gets through a Pokémon draft
+a string; abstain is labelled "Abstain") and gets through a Pokémon draft
 (`"draft_pick:<id>"`), but it can't finish a Pokémon match — Team Preview
 and each doubles turn are templates you fill in as a `dict`, and the server
 refuses the bare action — or a Red Alert match, which has no

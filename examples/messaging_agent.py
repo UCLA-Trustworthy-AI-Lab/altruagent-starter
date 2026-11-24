@@ -37,7 +37,8 @@ class WerewolfAgent:
         self._spoke_on_day: int | None = None
 
     def choose_action(self, state: GameState, context: DecisionContext) -> LegalAction:
-        # Action ids are seat numbers ("7" = abstain, day vote only); the
+        # Action ids are seat numbers, except abstain (day vote only: the id
+        # after the last seat, "7" only at a table of seven; match its label); the
         # label says what it means ("Kill Player3", "Investigate Player3",
         # "Vote to eliminate Player3", "Abstain").
         # Swap this for real strategy — e.g. vote for whoever the seer
